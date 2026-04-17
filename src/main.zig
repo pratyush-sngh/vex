@@ -1,0 +1,253 @@
+const std = @import("std");
+const KVStore = @import("engine/kv.zig").KVStore;
+const GraphEngine = @import("engine/graph.zig").GraphEngine;
+const Server = @import("server/tcp.zig").Server;
+const ScaleMode = @import("server/tcp.zig").ScaleMode;
+const CommandHandler = @import("command/handler.zig").CommandHandler;
+const KeysMode = @import("command/handler.zig").KeysMode;
+const snapshot = @import("storage/snapshot.zig");
+const aof_mod = @import("storage/aof.zig");
+const AOF = aof_mod.AOF;
+const span = @import("perf/span.zig");
+
+const DEFAULT_HOST = "0.0.0.0";
+const DEFAULT_PORT: u16 = 6380;
+const DEFAULT_DATA_DIR = "data";
+
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
+
+    const config = parseArgs(init);
+    var prof_state: span.Profile = undefined;
+    var prof: ?*span.Profile = null;
+    if (config.profile) {
+        prof_state = span.Profile.init(io, config.profile_every);
+        prof = &prof_state;
+    }
+
+    var kv = KVStore.init(allocator, io);
+    defer kv.deinit();
+
+    var graph = GraphEngine.init(allocator);
+    defer graph.deinit();
+
+    // ── Persistence setup ────────────────────────────────────────────
+    std.Io.Dir.cwd().createDirPath(io, config.data_dir) catch |err| {
+        log("fatal: cannot create data directory '{s}': {s}", .{ config.data_dir, @errorName(err) });
+        return;
+    };
+
+    const snapshot_path = try std.fmt.allocPrint(allocator, "{s}/zigraph.zdb", .{config.data_dir});
+    defer allocator.free(snapshot_path);
+    const aof_path = try std.fmt.allocPrint(allocator, "{s}/zigraph.aof", .{config.data_dir});
+    defer allocator.free(aof_path);
+
+    var aof_instance: ?AOF = null;
+    var replayed: u64 = 0;
+    if (!config.no_persistence) {
+        snapshot.load(io, allocator, &kv, &graph, snapshot_path) catch |err| {
+            log("warning: snapshot load failed: {s}", .{@errorName(err)});
+        };
+
+        var aof_tmp = AOF.init(io, aof_path, snapshot_path) catch |err| {
+            log("fatal: cannot open AOF '{s}': {s}", .{ aof_path, @errorName(err) });
+            return;
+        };
+        aof_tmp.prof = prof;
+        aof_instance = aof_tmp;
+        defer if (aof_instance) |*a| a.deinit();
+
+        var replay_db = std.atomic.Value(u8).init(0);
+        var replay_handler = CommandHandler.init(allocator, io, &kv, &graph, null, &replay_db, config.keys_mode);
+        replayed = aof_mod.replayFile(io, allocator, aof_path, &replay_handler) catch |err| blk: {
+            log("warning: AOF replay failed: {s}", .{@errorName(err)});
+            break :blk @as(u64, 0);
+        };
+        if (config.scale_mode == .scaled and config.engine_threads > 1) {
+            var i: usize = 1;
+            while (i < config.engine_threads) : (i += 1) {
+                const shard_aof_path = try std.fmt.allocPrint(allocator, "{s}.shard{d}", .{ aof_path, i });
+                defer allocator.free(shard_aof_path);
+                const n = aof_mod.replayFile(io, allocator, shard_aof_path, &replay_handler) catch 0;
+                replayed += n;
+            }
+        }
+    }
+
+    printBanner(config.port, kv.dbsize(), graph.nodeCount(), replayed);
+
+    var server = try Server.init(
+        allocator,
+        io,
+        &kv,
+        &graph,
+        if (aof_instance) |*a| a else null,
+        config.host,
+        config.port,
+        config.keys_mode,
+        prof,
+        config.scale_mode,
+        config.engine_threads,
+        config.cluster_config,
+    );
+    if (config.reactor) {
+        try server.runReactor(config.workers);
+    } else {
+        try server.run();
+    }
+}
+
+const Config = struct {
+    host: []const u8,
+    port: u16,
+    data_dir: []const u8,
+    keys_mode: KeysMode,
+    profile: bool,
+    profile_every: u64,
+    scale_mode: ScaleMode,
+    engine_threads: usize,
+    cluster_config: ?[]const u8,
+    no_persistence: bool,
+    reactor: bool,
+    workers: usize,
+};
+
+fn parseArgs(init: std.process.Init) Config {
+    var host: []const u8 = DEFAULT_HOST;
+    var port: u16 = DEFAULT_PORT;
+    var data_dir: []const u8 = DEFAULT_DATA_DIR;
+    var keys_mode: KeysMode = .strict;
+    var profile = false;
+    var profile_every: u64 = 100_000;
+    var scale_mode: ScaleMode = .scaled;
+    var engine_threads: usize = 1;
+    var cluster_config: ?[]const u8 = null;
+    var no_persistence = false;
+    var reactor = false;
+    var workers: usize = 4;
+
+    var it = std.process.Args.Iterator.init(init.minimal.args);
+    defer it.deinit();
+    _ = it.skip();
+
+    while (it.next()) |arg_z| {
+        const arg = std.mem.sliceTo(arg_z, 0);
+        if (std.mem.eql(u8, arg, "--port") or std.mem.eql(u8, arg, "-p")) {
+            if (it.next()) |p| {
+                port = std.fmt.parseInt(u16, std.mem.sliceTo(p, 0), 10) catch DEFAULT_PORT;
+            }
+        } else if (std.mem.eql(u8, arg, "--host") or std.mem.eql(u8, arg, "-h")) {
+            if (it.next()) |h| {
+                host = std.mem.sliceTo(h, 0);
+            }
+        } else if (std.mem.eql(u8, arg, "--data-dir") or std.mem.eql(u8, arg, "-d")) {
+            if (it.next()) |d| {
+                data_dir = std.mem.sliceTo(d, 0);
+            }
+        } else if (std.mem.eql(u8, arg, "--keys-mode")) {
+            if (it.next()) |m| {
+                const mode = std.mem.sliceTo(m, 0);
+                if (std.mem.eql(u8, mode, "autoscan")) {
+                    keys_mode = .autoscan;
+                } else {
+                    keys_mode = .strict;
+                }
+            }
+        } else if (std.mem.eql(u8, arg, "--profile")) {
+            profile = true;
+        } else if (std.mem.eql(u8, arg, "--profile-every")) {
+            if (it.next()) |n| {
+                profile_every = std.fmt.parseInt(u64, std.mem.sliceTo(n, 0), 10) catch profile_every;
+            }
+        } else if (std.mem.eql(u8, arg, "--mode")) {
+            if (it.next()) |m| {
+                const mode = std.mem.sliceTo(m, 0);
+                if (std.mem.eql(u8, mode, "cluster")) {
+                    scale_mode = .cluster;
+                } else {
+                    scale_mode = .scaled;
+                }
+            }
+        } else if (std.mem.eql(u8, arg, "--engine-threads")) {
+            if (it.next()) |n| {
+                engine_threads = std.fmt.parseInt(usize, std.mem.sliceTo(n, 0), 10) catch 1;
+            }
+        } else if (std.mem.eql(u8, arg, "--cluster-config")) {
+            if (it.next()) |p| {
+                cluster_config = std.mem.sliceTo(p, 0);
+            }
+        } else if (std.mem.eql(u8, arg, "--no-persistence")) {
+            no_persistence = true;
+        } else if (std.mem.eql(u8, arg, "--reactor")) {
+            reactor = true;
+        } else if (std.mem.eql(u8, arg, "--workers")) {
+            if (it.next()) |n| {
+                workers = std.fmt.parseInt(usize, std.mem.sliceTo(n, 0), 10) catch 4;
+            }
+        }
+    }
+
+    return .{
+        .host = host,
+        .port = port,
+        .data_dir = data_dir,
+        .keys_mode = keys_mode,
+        .profile = profile,
+        .profile_every = profile_every,
+        .scale_mode = scale_mode,
+        .engine_threads = engine_threads,
+        .cluster_config = cluster_config,
+        .no_persistence = no_persistence,
+        .reactor = reactor,
+        .workers = workers,
+    };
+}
+
+fn printBanner(port: u16, kv_keys: usize, graph_nodes: usize, aof_replayed: u64) void {
+    const banner =
+        \\
+        \\    ______ _                       _     
+        \\   |___  /(_)                     | |    
+        \\      / /  _   __ _  _ __   __ _  | |__  
+        \\     / /  | | / _` || '__| / _` | | '_ \ 
+        \\    / /__ | || (_| || |   | (_| | | |_) |
+        \\   /_____||_| \__, ||_|    \__,_| | .__/ 
+        \\               __/ |              | |    
+        \\              |___/               |_|    
+        \\
+        \\   Key-Value Store + Graph Database
+        \\   Redis Protocol Compatible | v0.1.0
+        \\
+    ;
+    std.debug.print("{s}", .{banner});
+    std.debug.print("   Listening on port {d}\n", .{port});
+    std.debug.print("   Connect with: redis-cli -p {d}\n", .{port});
+
+    if (kv_keys > 0 or graph_nodes > 0 or aof_replayed > 0) {
+        std.debug.print("   Restored {d} keys, {d} nodes", .{ kv_keys, graph_nodes });
+        if (aof_replayed > 0) {
+            std.debug.print(" (+{d} AOF commands)", .{aof_replayed});
+        }
+        std.debug.print("\n", .{});
+    }
+    std.debug.print("\n", .{});
+}
+
+fn log(comptime fmt: []const u8, args: anytype) void {
+    std.debug.print("[zigraph] " ++ fmt ++ "\n", args);
+}
+
+test {
+    _ = @import("server/resp.zig");
+    _ = @import("engine/kv.zig");
+    _ = @import("engine/concurrent_kv.zig");
+    _ = @import("server/event_loop.zig");
+    _ = @import("server/worker.zig");
+    _ = @import("engine/graph.zig");
+    _ = @import("engine/query.zig");
+    _ = @import("command/handler.zig");
+    _ = @import("storage/snapshot.zig");
+    _ = @import("storage/aof.zig");
+    _ = @import("perf/span.zig");
+}

@@ -1,0 +1,31 @@
+services:
+  redis:
+    image: redis:8.0.3
+    container_name: redis-compare
+    command: ["redis-server", "--appendonly", "no", "--save", ""]
+    ports:
+      # Host ports avoid clashing with a local Redis on 6379
+      - "16379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    volumes:
+      - redis_compare_data:/data
+
+  zigraph:
+    build:
+      context: .
+      dockerfile: Dockerfile.zigraph
+    container_name: zigraph-compare
+    command: ["--port", "6380", "--data-dir", "/data", "--no-persistence", "--reactor", "--workers", "6"]
+    ports:
+      # Host port avoids clashing with a local zigraph / dev server on 6380
+      - "16380:6380"
+    volumes:
+      - zigraph_compare_data:/data
+
+volumes:
+  redis_compare_data:
+  zigraph_compare_data:

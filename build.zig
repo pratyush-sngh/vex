@@ -1,0 +1,80 @@
+const std = @import("std");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    // Vendored from https://github.com/ThobiasKnudsen/verztable v0.1.0 (Zig module only; upstream build pulls C++ benches).
+    const verztable_mod = b.createModule(.{
+        .root_source_file = b.path("vendor/verztable/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const exe = b.addExecutable(.{
+        .name = "zigraph",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    b.installArtifact(exe);
+
+    const run_cmd = b.addRunArtifact(exe);
+    run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        run_cmd.addArgs(args);
+    }
+    const run_step = b.step("run", "Run zigraph server");
+    run_step.dependOn(&run_cmd.step);
+
+    // Single test root: main.zig's test block imports all modules (Zig 0.16 module paths).
+    const test_step = b.step("test", "Run all unit tests");
+    const unit_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(unit_tests).step);
+
+    const hashmap_bench = b.addExecutable(.{
+        .name = "hashmap_bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/hashmap_bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "verztable", .module = verztable_mod },
+            },
+        }),
+    });
+    const run_hashmap_bench = b.addRunArtifact(hashmap_bench);
+    if (b.args) |args| run_hashmap_bench.addArgs(args);
+    const bench_hashmap_step = b.step("bench-hashmap", "Benchmark std vs verztable string maps");
+    bench_hashmap_step.dependOn(&run_hashmap_bench.step);
+
+    const persistence_bench = b.addExecutable(.{
+        .name = "persistence_bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench/persistence_bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "app", .module = b.createModule(.{
+                    .root_source_file = b.path("src/root.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                }) },
+            },
+        }),
+    });
+    const run_persistence_bench = b.addRunArtifact(persistence_bench);
+    if (b.args) |args| run_persistence_bench.addArgs(args);
+    const bench_persistence_step = b.step("bench-persistence", "Benchmark snapshot and AOF persistence paths");
+    bench_persistence_step.dependOn(&run_persistence_bench.step);
+}

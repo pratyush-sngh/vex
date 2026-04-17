@@ -1,0 +1,25 @@
+FROM debian:bookworm-slim AS builder
+
+RUN apt-get update -qq && apt-get install -y -qq curl xz-utils ca-certificates > /dev/null 2>&1 \
+    && arch="$(dpkg --print-architecture)" \
+    && if [ "$arch" = "arm64" ]; then zig_pkg="zig-aarch64-linux-0.16.0-dev.3153+d6f43caad"; else zig_pkg="zig-x86_64-linux-0.16.0-dev.3153+d6f43caad"; fi \
+    && curl -sL "https://ziglang.org/builds/${zig_pkg}.tar.xz" | tar xJ -C /opt \
+    && ln -s "/opt/${zig_pkg}/zig" /usr/local/bin/zig \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY . .
+RUN zig build -Doptimize=ReleaseFast
+
+FROM debian:bookworm-slim
+RUN useradd -m -u 10001 zigraph
+WORKDIR /app
+
+COPY --from=builder /app/zig-out/bin/zigraph /usr/local/bin/zigraph
+
+RUN mkdir -p /data && chown -R zigraph:zigraph /data
+USER zigraph
+
+EXPOSE 6380
+ENTRYPOINT ["/usr/local/bin/zigraph"]
+CMD ["--port", "6380", "--data-dir", "/data"]

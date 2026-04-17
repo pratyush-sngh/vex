@@ -1,0 +1,9 @@
+.git
+.gitignore
+.zig-cache
+zig-out
+zig-pkg
+zig-x86_64-linux-*
+tools/compare-client/compare-client
+data
+tmp

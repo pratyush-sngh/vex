@@ -1,0 +1,12 @@
+.zig-cache/
+zig-out/
+zig-pkg/
+vendor/
+data/
+*.o
+*.a
+.DS_Store
+.claude/
+tools/compare-client/compare-client
+zig-x86_64-linux-*/
+zig-aarch64-linux-*/
