@@ -150,7 +150,7 @@ pub const Profile = struct {
         const job_overhead_avg_us = avg(jons, jon);
 
         std.debug.print(
-            "[zigraph-profile] cmds={d} parse={d:.2}us queue_wait={d:.2}us exec={d:.2}us write={d:.2}us batch_wait={d:.2}us job_oh={d:.2}us avg_batch={d:.1} aof={d:.2}us lock={d:.2}us\n",
+            "[vex-profile] cmds={d} parse={d:.2}us queue_wait={d:.2}us exec={d:.2}us write={d:.2}us batch_wait={d:.2}us job_oh={d:.2}us avg_batch={d:.1} aof={d:.2}us lock={d:.2}us\n",
             .{ cmd_count, parse_avg_us, queue_wait_avg_us, exec_avg_us, write_avg_us, batch_wait_avg_us, job_overhead_avg_us, avg_batch_size, aof_avg_us, lock_wait_avg_us },
         );
         _ = self.io;

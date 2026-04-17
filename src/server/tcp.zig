@@ -1620,5 +1620,5 @@ fn writeAll(fd: posix.socket_t, data: []const u8) void {
 }
 
 fn log(comptime fmt: []const u8, args: anytype) void {
-    std.debug.print("[zigraph] " ++ fmt ++ "\n", args);
+    std.debug.print("[vex] " ++ fmt ++ "\n", args);
 }

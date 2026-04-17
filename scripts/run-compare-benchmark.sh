@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Redis vs Zigraph: bring up docker-compose.compare.yml and run a fixed benchmark matrix.
+# Redis vs Vex: bring up docker-compose.compare.yml and run a fixed benchmark matrix.
 # Exits non-zero on first failure. Requires: docker, go, nc (netcat).
 
 set -euo pipefail
@@ -21,7 +21,7 @@ for _ in $(seq 1 120); do
   sleep 0.5
 done
 
-echo "[compare] wait for Zigraph TCP..."
+echo "[compare] wait for Vex TCP..."
 for _ in $(seq 1 90); do
   if echo -en '*1\r\n$4\r\nPING\r\n' | nc -w 1 127.0.0.1 16380 2>/dev/null | head -c 1 | grep -q .; then
     break
@@ -44,7 +44,7 @@ run -n 20000 -c 32 -warmup 1000 -runs 3 -timeout 50s
 
 echo ""
 echo "[compare] container status:"
-docker ps -a --format '{{.Names}}\t{{.Status}}' | grep -E 'redis-compare|zigraph-compare' || true
+docker ps -a --format '{{.Names}}\t{{.Status}}' | grep -E 'redis-compare|vex-compare' || true
 
 echo ""
 echo "[compare] all benchmark steps completed OK."

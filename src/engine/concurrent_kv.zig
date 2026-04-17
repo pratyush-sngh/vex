@@ -325,10 +325,10 @@ test "concurrent_kv basic set/get" {
     var store = ConcurrentKV.init(std.testing.allocator, std.testing.io);
     defer store.deinit();
 
-    try store.set("name", "zigraph");
+    try store.set("name", "vex");
     const val = store.get("name") orelse return error.TestUnexpectedResult;
     defer val.deinit();
-    try std.testing.expectEqualStrings("zigraph", val.data);
+    try std.testing.expectEqualStrings("vex", val.data);
 }
 
 test "concurrent_kv delete" {

@@ -1,8 +1,8 @@
-# Zigraph
+# Vex
 
 A key-value store with graph database capabilities, written in Zig with zero dependencies. Speaks the Redis protocol (RESP), so you can connect using `redis-cli` or any Redis client library.
 
-## Why Zigraph?
+## Why Vex?
 
 - **Redis-compatible wire protocol** -- works with every Redis client in every language
 - **Graph operations built-in** -- nodes, edges, traversals, shortest path (BFS + Dijkstra)
@@ -20,7 +20,7 @@ zig build
 zig build run
 
 # Run on custom port with custom data directory
-zig build run -- --port 7379 --data-dir /var/lib/zigraph
+zig build run -- --port 7379 --data-dir /var/lib/vex
 
 # Enable KEYS auto-switch behavior on large DBs
 zig build run -- --keys-mode autoscan
@@ -35,7 +35,7 @@ zig build run -- --mode cluster --engine-threads 2 --cluster-config ./cluster.js
 zig build test
 ```
 
-## Redis vs Zigraph Comparison (Docker + Go client)
+## Redis vs Vex Comparison (Docker + Go client)
 
 Run both servers side-by-side and benchmark identical RESP workloads.
 
@@ -45,9 +45,9 @@ Run both servers side-by-side and benchmark identical RESP workloads.
 docker compose -f docker-compose.compare.yml up --build -d
 ```
 
-Services (host ports chosen so they do not collide with a typical local Redis / zigraph dev server):
+Services (host ports chosen so they do not collide with a typical local Redis / vex dev server):
 - `redis` on `127.0.0.1:16379` (maps to container `6379`)
-- `zigraph` on `127.0.0.1:16380` (maps to container `6380`)
+- `vex` on `127.0.0.1:16380` (maps to container `6380`)
 
 ### 2) Run comparison client
 
@@ -58,7 +58,7 @@ GO111MODULE=on go run . -n 5000
 GO111MODULE=on go run . -n 5000 -c 8
 # More stable comparisons: warmup + repeated runs + optional run order swap
 GO111MODULE=on go run . -n 5000 -c 8 -warmup 500 -runs 3
-GO111MODULE=on go run . -n 5000 -c 8 -warmup 500 -runs 3 -zigraph-first
+GO111MODULE=on go run . -n 5000 -c 8 -warmup 500 -runs 3 -vex-first
 ```
 
 Full regression matrix (compose up, wait for ports, several `n` / `-c` combinations):
@@ -68,8 +68,8 @@ Full regression matrix (compose up, wait for ports, several `n` / `-c` combinati
 ```
 
 What it runs:
-- On both Redis and Zigraph: `FLUSHDB`, `SET`, `GET`, `DEL`
-- On Zigraph only: `GRAPH.ADDNODE`, `GRAPH.ADDEDGE`
+- On both Redis and Vex: `FLUSHDB`, `SET`, `GET`, `DEL`
+- On Vex only: `GRAPH.ADDNODE`, `GRAPH.ADDEDGE`
 - Reports: min, p50, p95, p99, mean, max, and ops/s (median across `-runs`)
 
 Optional server-side profiling (for bottleneck breakdown):
@@ -95,7 +95,7 @@ Current `scaled` behavior:
 docker compose -f docker-compose.compare.yml down
 ```
 
-Connect with redis-cli (to the compose zigraph instance):
+Connect with redis-cli (to the compose vex instance):
 
 ```bash
 redis-cli -p 16380
@@ -126,7 +126,7 @@ redis-cli -p 16380
 
 ### Redis compatibility notes
 
-- Zigraph supports Redis-style logical DB selection via `SELECT`, with database indexes `0..15` (16 DBs).
+- Vex supports Redis-style logical DB selection via `SELECT`, with database indexes `0..15` (16 DBs).
 - Each client connection maintains its own selected DB.
 - Graph commands are DB-scoped too (node keys are namespaced by selected DB internally).
 - `KEYS` behavior is configurable:
@@ -204,11 +204,11 @@ OK
 
 ## Persistence
 
-Zigraph supports both **snapshot** and **append-only file (AOF)** persistence, similar to Redis RDB+AOF.
+Vex supports both **snapshot** and **append-only file (AOF)** persistence, similar to Redis RDB+AOF.
 
 ### How it works
 
-1. **On startup**: loads the latest snapshot (`zigraph.zdb`), then replays the AOF (`zigraph.aof`) to recover any commands since the last snapshot.
+1. **On startup**: loads the latest snapshot (`vex.zdb`), then replays the AOF (`vex.aof`) to recover any commands since the last snapshot.
 2. **During operation**: every mutating command (SET, DEL, GRAPH.ADDNODE, etc.) is appended to the AOF in binary format.
 3. **On SAVE**: writes a full binary snapshot, then truncates the AOF (since all state is now in the snapshot).
 
@@ -216,14 +216,14 @@ Zigraph supports both **snapshot** and **append-only file (AOF)** persistence, s
 
 | File | Description |
 |------|-------------|
-| `data/zigraph.zdb` | Binary snapshot (full state dump with CRC-32 integrity check) |
-| `data/zigraph.aof` | Append-only log of mutating commands |
+| `data/vex.zdb` | Binary snapshot (full state dump with CRC-32 integrity check) |
+| `data/vex.aof` | Append-only log of mutating commands |
 
 ### Configuration
 
 ```bash
 # Custom data directory (default: ./data/)
-zig build run -- --data-dir /var/lib/zigraph
+zig build run -- --data-dir /var/lib/vex
 ```
 
 ### Snapshot format

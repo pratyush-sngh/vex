@@ -2,11 +2,11 @@
 
 - **Status**: Accepted
 - **Date**: 2026-04-15
-- **Decision makers**: Zigraph maintainers
+- **Decision makers**: Vex maintainers
 
 ## Context
 
-Zigraph currently runs as a single-node process serving both key-value and graph workloads through one RESP endpoint.  
+Vex currently runs as a single-node process serving both key-value and graph workloads through one RESP endpoint.  
 Recent parallel-load testing showed pressure and instability risk when all command classes share the same mutable runtime path.
 
 We want a design that:
@@ -47,7 +47,7 @@ It does **not** claim that cluster partitioning, replication, or rebalance are i
 
 ## Compatibility Position
 
-- Zigraph remains Redis-protocol compatible for supported commands.
+- Vex remains Redis-protocol compatible for supported commands.
 - Multi-db Redis semantics (`SELECT`, 16 logical DBs) are currently out of scope and remain unsupported.
 
 ## Future Work (planned, not yet implemented)

@@ -125,7 +125,7 @@ const ReplayCounter = struct {
 
 fn benchAofAppend(io: std.Io, path: []const u8, keys: []const []const u8, vals: []const []const u8) !i64 {
     std.Io.Dir.cwd().deleteFile(io, path) catch {};
-    var aof = try aof_mod.AOF.init(io, path, "/tmp/zigraph_dummy.zdb");
+    var aof = try aof_mod.AOF.init(io, path, "/tmp/vex_dummy.zdb");
     defer aof.deinit();
     const t0 = std.Io.Clock.Timestamp.now(io, .awake);
     for (keys, vals) |k, v| {
@@ -158,8 +158,8 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("Preparing dataset: kv={d}, nodes={d}, edges={d}\n", .{ data.kv_count, data.node_count, data.edge_count });
     try populateDataset(allocator, io, &kv, &graph, data);
 
-    const snapshot_path = "/tmp/zigraph_persistence_bench.zdb";
-    const aof_path = "/tmp/zigraph_persistence_bench.aof";
+    const snapshot_path = "/tmp/vex_persistence_bench.zdb";
+    const aof_path = "/tmp/vex_persistence_bench.aof";
     defer std.Io.Dir.cwd().deleteFile(io, snapshot_path) catch {};
     defer std.Io.Dir.cwd().deleteFile(io, aof_path) catch {};
 

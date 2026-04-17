@@ -1,3 +1,3 @@
-module zigraph/tools/compare-client
+module vex/tools/compare-client
 
 go 1.22

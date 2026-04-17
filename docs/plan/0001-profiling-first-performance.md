@@ -2,7 +2,7 @@ yes# Plan: Profiling-first performance (vs Redis compare benchmark)
 
 - **Status**: Accepted — **execution pending agent mode** (Cursor rejected switching out of plan-only mode; non-markdown edits are blocked until Agent mode is enabled)
 - **Date**: 2026-04-15
-- **Goal**: Identify **actual** latency contributors before large refactors; then optimize in order of measured impact toward **Zigraph p95 ≤ 0.8 × Redis p95** on the existing compare workload (see README / `scripts/run-compare-benchmark.sh`), with **p99 + throughput** as guardrails.
+- **Goal**: Identify **actual** latency contributors before large refactors; then optimize in order of measured impact toward **Vex p95 ≤ 0.8 × Redis p95** on the existing compare workload (see README / `scripts/run-compare-benchmark.sh`), with **p99 + throughput** as guardrails.
 
 ## Why this plan exists
 
@@ -24,7 +24,7 @@ The Go compare client measures **end-to-end RTT** only. It cannot attribute time
 
 ### A2. CPU profiling (secondary, confirms cycles)
 
-- Run compare workload with **Linux `perf record -g`** inside the zigraph container (or host-attached to container PID), alongside the Go client matrix.
+- Run compare workload with **Linux `perf record -g`** inside the vex container (or host-attached to container PID), alongside the Go client matrix.
 - Keep one “golden” command mix for reproducibility.
 
 ### A3. Allocation / memcpy duplication lens (tertiary)
@@ -39,7 +39,7 @@ Update [`tools/compare-client/main.go`](../../tools/compare-client/main.go) and 
 - **Warmup** (discarded samples)
 - **p99** + **throughput** (ops/s) alongside p95
 - **Repeat runs** (e.g. 3×) report median
-- Optional **swap order** (Redis vs Zigraph first) to reduce ordering bias
+- Optional **swap order** (Redis vs Vex first) to reduce ordering bias
 
 ## Phase C — Optimization backlog (ordered only after A ranks bottlenecks)
 
@@ -75,7 +75,7 @@ Use as a menu after measurement, not as default implementation:
 
 ## Execution checklist (when Agent mode is enabled)
 
-### A1 — Zigraph server spans
+### A1 — Vex server spans
 
 1. Add [`src/perf/span.zig`](../../src/perf/span.zig) with:
    - `Profile` struct holding `std.Io` + `report_every` + atomics for: `parse_ns/n`, `locked_ns/n` (mutex + `execute` + `writeAll`), `aof_ns/n`.
@@ -91,7 +91,7 @@ Use as a menu after measurement, not as default implementation:
 
 ### A2 — `perf` script (optional doc-only or small script)
 
-- Add `scripts/profile-zigraph-perf.sh`: `docker exec` into `zigraph-compare` with `perf record -g -p 1` pattern **or** document manual steps in README (if `perf` unavailable in slim image, note host-attach).
+- Add `scripts/profile-vex-perf.sh`: `docker exec` into `vex-compare` with `perf record -g -p 1` pattern **or** document manual steps in README (if `perf` unavailable in slim image, note host-attach).
 
 ### A3 — Allocation lens (follow-up PR)
 
@@ -101,13 +101,13 @@ Use as a menu after measurement, not as default implementation:
 
 [`tools/compare-client/main.go`](../../tools/compare-client/main.go):
 
-- Flags: `-warmup`, `-runs`, `-zigraph-first` (swap Redis/Zigraph order for KV section).
+- Flags: `-warmup`, `-runs`, `-vex-first` (swap Redis/Vex order for KV section).
 - Extend `summarize` with **p99**; pass **wall ms** + `n` into summarize for **ops/s** (`n * 1000 / wallMs`).
 - `printScenario` prints p99 + throughput.
 - Warmup: run each scenario’s workload `warmup` times without recording (or discard samples).
 
 [`scripts/run-compare-benchmark.sh`](../../scripts/run-compare-benchmark.sh):
 
-- Pass e.g. `-warmup 500 -runs 3` and optionally `-zigraph-first`.
+- Pass e.g. `-warmup 500 -runs 3` and optionally `-vex-first`.
 
-[`README.md`](../../README.md): document new flags and `--profile` / `--profile-every` for zigraph.
+[`README.md`](../../README.md): document new flags and `--profile` / `--profile-every` for vex.

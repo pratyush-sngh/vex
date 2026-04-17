@@ -41,13 +41,13 @@ type benchCfg struct {
 func main() {
 	var (
 		redisAddr    = flag.String("redis", "127.0.0.1:16379", "Redis host:port")
-		zigraphAddr  = flag.String("zigraph", "127.0.0.1:16380", "Zigraph host:port")
+		vexAddr  = flag.String("vex", "127.0.0.1:16380", "Vex host:port")
 		n            = flag.Int("n", 5000, "timed operations per benchmark")
 		warmup       = flag.Int("warmup", 0, "warmup operations per benchmark run (discarded)")
 		runs         = flag.Int("runs", 1, "repeat benchmark runs and report median metrics")
 		concurrency  = flag.Int("c", 1, "parallel workers (connections) per scenario")
 		timeout      = flag.Duration("timeout", 3*time.Second, "dial/read/write timeout")
-		zigraphFirst = flag.Bool("zigraph-first", false, "run zigraph before redis for KV scenarios")
+		vexFirst = flag.Bool("vex-first", false, "run vex before redis for KV scenarios")
 	)
 	flag.Parse()
 	if *concurrency < 1 {
@@ -62,9 +62,9 @@ func main() {
 
 	targets := []target{
 		{name: "redis", addr: *redisAddr},
-		{name: "zigraph", addr: *zigraphAddr},
+		{name: "vex", addr: *vexAddr},
 	}
-	if *zigraphFirst {
+	if *vexFirst {
 		targets[0], targets[1] = targets[1], targets[0]
 	}
 
@@ -126,13 +126,13 @@ func main() {
 		fmt.Println()
 	}
 
-	// Zigraph-only graph commands.
-	fmt.Printf("Running Zigraph graph benchmark, timed_n=%d, warmup=%d, runs=%d\n\n", cfg.n, cfg.warmup, cfg.runs)
+	// Vex-only graph commands.
+	fmt.Printf("Running Vex graph benchmark, timed_n=%d, warmup=%d, runs=%d\n\n", cfg.n, cfg.warmup, cfg.runs)
 	zclients := make([]*client, 0, cfg.concurrency)
 	for i := 0; i < cfg.concurrency; i++ {
-		zc, err := newClient(*zigraphAddr, *timeout)
+		zc, err := newClient(*vexAddr, *timeout)
 		if err != nil {
-			fmt.Printf("[zigraph] connect failed: %v\n", err)
+			fmt.Printf("[vex] connect failed: %v\n", err)
 			for _, cc := range zclients {
 				cc.close()
 			}
@@ -144,7 +144,7 @@ func main() {
 		defer c.close()
 	}
 	if err := zclients[0].cmd("FLUSHDB"); err != nil {
-		fmt.Printf("[zigraph] flush failed: %v\n", err)
+		fmt.Printf("[vex] flush failed: %v\n", err)
 		os.Exit(1)
 	}
 

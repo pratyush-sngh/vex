@@ -12,14 +12,14 @@ COPY . .
 RUN zig build -Doptimize=ReleaseFast
 
 FROM debian:bookworm-slim
-RUN useradd -m -u 10001 zigraph
+RUN useradd -m -u 10001 vex
 WORKDIR /app
 
-COPY --from=builder /app/zig-out/bin/zigraph /usr/local/bin/zigraph
+COPY --from=builder /app/zig-out/bin/vex /usr/local/bin/vex
 
-RUN mkdir -p /data && chown -R zigraph:zigraph /data
-USER zigraph
+RUN mkdir -p /data && chown -R vex:vex /data
+USER vex
 
 EXPOSE 6380
-ENTRYPOINT ["/usr/local/bin/zigraph"]
+ENTRYPOINT ["/usr/local/bin/vex"]
 CMD ["--port", "6380", "--data-dir", "/data"]

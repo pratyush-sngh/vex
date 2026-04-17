@@ -487,8 +487,8 @@ pub const CommandHandler = struct {
         }
         var aw = std.Io.Writer.Allocating.init(self.allocator);
         defer aw.deinit();
-        try aw.writer.writeAll("# Zigraph\r\n");
-        try aw.writer.writeAll("zigraph_version:0.1.0\r\n");
+        try aw.writer.writeAll("# Vex\r\n");
+        try aw.writer.writeAll("vex_version:0.1.0\r\n");
         try aw.writer.print("kv_keys:{d}\r\n", .{kv_keys});
         try aw.writer.print("db_selected:{d}\r\n", .{self.selected_db.load(.monotonic)});
         try aw.writer.print("db_max:{d}\r\n", .{MAX_DATABASES});

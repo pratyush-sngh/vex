@@ -325,7 +325,7 @@ pub fn load(
 test "snapshot round-trip" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
-    const path = "/tmp/zigraph_test.zdb";
+    const path = "/tmp/vex_test.zdb";
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
     var kv = KVStore.init(allocator, io);
@@ -369,14 +369,14 @@ test "snapshot missing file returns cleanly" {
     defer kv.deinit();
     var g = GraphEngine.init(allocator);
     defer g.deinit();
-    try load(io, allocator, &kv, &g, "/tmp/nonexistent_zigraph_test.zdb");
+    try load(io, allocator, &kv, &g, "/tmp/nonexistent_vex_test.zdb");
     try std.testing.expectEqual(@as(usize, 0), kv.dbsize());
 }
 
 test "snapshot corrupted CRC" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
-    const path = "/tmp/zigraph_crc_test.zdb";
+    const path = "/tmp/vex_crc_test.zdb";
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
     var kv = KVStore.init(allocator, io);

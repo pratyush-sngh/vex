@@ -38,9 +38,9 @@ pub fn main(init: std.process.Init) !void {
         return;
     };
 
-    const snapshot_path = try std.fmt.allocPrint(allocator, "{s}/zigraph.zdb", .{config.data_dir});
+    const snapshot_path = try std.fmt.allocPrint(allocator, "{s}/vex.zdb", .{config.data_dir});
     defer allocator.free(snapshot_path);
-    const aof_path = try std.fmt.allocPrint(allocator, "{s}/zigraph.aof", .{config.data_dir});
+    const aof_path = try std.fmt.allocPrint(allocator, "{s}/vex.aof", .{config.data_dir});
     defer allocator.free(aof_path);
 
     var aof_instance: ?AOF = null;
@@ -207,16 +207,13 @@ fn parseArgs(init: std.process.Init) Config {
 fn printBanner(port: u16, kv_keys: usize, graph_nodes: usize, aof_replayed: u64) void {
     const banner =
         \\
-        \\    ______ _                       _     
-        \\   |___  /(_)                     | |    
-        \\      / /  _   __ _  _ __   __ _  | |__  
-        \\     / /  | | / _` || '__| / _` | | '_ \ 
-        \\    / /__ | || (_| || |   | (_| | | |_) |
-        \\   /_____||_| \__, ||_|    \__,_| | .__/ 
-        \\               __/ |              | |    
-        \\              |___/               |_|    
+        \\   __   __  _____ __  __
+        \\   \ \ / / | ____|\ \/ /
+        \\    \ V /  |  _|   \  /
+        \\     | |   | |___  /  \
+        \\     |_|   |_____|/_/\_\
         \\
-        \\   Key-Value Store + Graph Database
+        \\   KV + Graph Database
         \\   Redis Protocol Compatible | v0.1.0
         \\
     ;
@@ -235,7 +232,7 @@ fn printBanner(port: u16, kv_keys: usize, graph_nodes: usize, aof_replayed: u64)
 }
 
 fn log(comptime fmt: []const u8, args: anytype) void {
-    std.debug.print("[zigraph] " ++ fmt ++ "\n", args);
+    std.debug.print("[vex] " ++ fmt ++ "\n", args);
 }
 
 test {

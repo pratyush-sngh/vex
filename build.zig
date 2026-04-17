@@ -12,7 +12,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const exe = b.addExecutable(.{
-        .name = "zigraph",
+        .name = "vex",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
@@ -27,7 +27,7 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
-    const run_step = b.step("run", "Run zigraph server");
+    const run_step = b.step("run", "Run vex server");
     run_step.dependOn(&run_cmd.step);
 
     // Single test root: main.zig's test block imports all modules (Zig 0.16 module paths).

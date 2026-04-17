@@ -187,9 +187,9 @@ test "kv basic set/get" {
     var store = KVStore.init(std.testing.allocator, std.testing.io);
     defer store.deinit();
 
-    try store.set("name", "zigraph");
+    try store.set("name", "vex");
     const val = store.get("name");
-    try std.testing.expectEqualStrings("zigraph", val.?);
+    try std.testing.expectEqualStrings("vex", val.?);
 }
 
 test "kv delete" {

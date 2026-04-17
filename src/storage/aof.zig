@@ -141,7 +141,7 @@ pub fn replayFile(io: std.Io, allocator: Allocator, path: []const u8, handler: a
 test "aof write and replay" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
-    const path = "/tmp/zigraph_test.aof";
+    const path = "/tmp/vex_test.aof";
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
     {
@@ -163,7 +163,7 @@ test "aof write and replay" {
 test "aof truncate" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
-    const path = "/tmp/zigraph_trunc_test.aof";
+    const path = "/tmp/vex_trunc_test.aof";
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
     var a = try AOF.init(io, path, "/tmp/dummy.zdb");
@@ -185,7 +185,7 @@ test "aof replay missing file" {
     const allocator = std.testing.allocator;
     var exec_count: u64 = 0;
     var mock = MockHandler{ .count = &exec_count };
-    const replayed = try replayFile(io, allocator, "/tmp/nonexistent_zigraph.aof", &mock);
+    const replayed = try replayFile(io, allocator, "/tmp/nonexistent_vex.aof", &mock);
     try std.testing.expectEqual(@as(u64, 0), replayed);
 }
 

@@ -1,7 +1,7 @@
 .{
-    .name = .zigraph,
+    .name = .vex,
     .version = "0.1.0",
-    .fingerprint = 0x35e8fc48335ba65f,
+    .fingerprint = 0xe969ab1c1a56d94b,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},
     .paths = .{ "build.zig", "build.zig.zon", "src", "bench", "vendor" },
