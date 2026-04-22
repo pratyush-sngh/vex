@@ -69,6 +69,97 @@ pub const AOF = struct {
         defer _ = c.pthread_mutex_unlock(&self.mutex);
         try self.file.setLength(self.io, 0);
     }
+
+    /// Rewrite the AOF by serializing current KV + Graph state as commands.
+    /// Writes to a temp file, then atomically renames over the current AOF.
+    /// This compacts the AOF (removes redundant ops) and bounds its size.
+    pub fn rewriteFromState(
+        self: *AOF,
+        allocator: Allocator,
+        kv: *@import("../engine/kv.zig").KVStore,
+        graph: *@import("../engine/graph.zig").GraphEngine,
+    ) !void {
+        const tmp_path = try std.fmt.allocPrint(allocator, "{s}.rewrite.tmp", .{self.path});
+        defer allocator.free(tmp_path);
+
+        // Write all current state as AOF records to temp file
+        const tmp_file = try std.Io.Dir.cwd().createFile(self.io, tmp_path, .{});
+        defer tmp_file.close(self.io);
+
+        var tmp_aof = AOF{
+            .io = self.io,
+            .path = tmp_path,
+            .file = tmp_file,
+            .snapshot_path = self.snapshot_path,
+            .last_save_time = self.last_save_time,
+        };
+
+        // KV entries
+        var kv_iter = kv.map.iterator();
+        while (kv_iter.next()) |entry| {
+            if (entry.value_ptr.flags.deleted) continue;
+            if (entry.value_ptr.flags.has_ttl) {
+                var ttl_buf: [32]u8 = undefined;
+                const remaining_ms = entry.value_ptr.expires_at - kv.cached_now_ms;
+                if (remaining_ms <= 0) continue; // already expired
+                const ttl_str = std.fmt.bufPrint(&ttl_buf, "{d}", .{@divTrunc(remaining_ms, 1000)}) catch continue;
+                const args = [_][]const u8{ "SET", entry.key_ptr.*, entry.value_ptr.value, "EX", ttl_str };
+                tmp_aof.logCommand(&args);
+            } else {
+                const args = [_][]const u8{ "SET", entry.key_ptr.*, entry.value_ptr.value };
+                tmp_aof.logCommand(&args);
+            }
+        }
+
+        // Graph nodes
+        for (0..graph.node_keys.items.len) |i| {
+            if (!graph.node_alive.isSet(i)) continue;
+            const key = graph.node_keys.items[i];
+            const type_str = graph.type_intern.resolve(graph.node_type_id.items[i]);
+            const args = [_][]const u8{ "GRAPH.ADDNODE", key, type_str };
+            tmp_aof.logCommand(&args);
+
+            // Node properties
+            const pairs = graph.node_props.collectAll(@intCast(i), allocator) catch continue;
+            defer allocator.free(pairs);
+            for (pairs) |pair| {
+                const prop_args = [_][]const u8{ "GRAPH.SETPROP", key, pair.key, pair.value };
+                tmp_aof.logCommand(&prop_args);
+            }
+        }
+
+        // Graph edges
+        for (0..graph.edge_from.items.len) |i| {
+            if (!graph.edge_alive.isSet(i)) continue;
+            const from_id = graph.edge_from.items[i];
+            const to_id = graph.edge_to.items[i];
+            if (from_id >= graph.node_keys.items.len or to_id >= graph.node_keys.items.len) continue;
+            const from_key = graph.node_keys.items[from_id];
+            const to_key = graph.node_keys.items[to_id];
+            const type_str = graph.type_intern.resolve(graph.edge_type_id.items[i]);
+            var weight_buf: [32]u8 = undefined;
+            const weight_str = std.fmt.bufPrint(&weight_buf, "{d:.6}", .{graph.edge_weight.items[i]}) catch continue;
+            const args = [_][]const u8{ "GRAPH.ADDEDGE", from_key, to_key, type_str, weight_str };
+            tmp_aof.logCommand(&args);
+        }
+
+        // Atomic rename: replace old AOF with rewritten one
+        _ = c.pthread_mutex_lock(&self.mutex);
+        defer _ = c.pthread_mutex_unlock(&self.mutex);
+
+        // Close current file, rename tmp over it, reopen
+        self.file.close(self.io);
+        const old_path_z = allocator.dupeZ(u8, self.path) catch return;
+        defer allocator.free(old_path_z);
+        const tmp_path_z = allocator.dupeZ(u8, tmp_path) catch return;
+        defer allocator.free(tmp_path_z);
+        _ = c.rename(tmp_path_z, old_path_z);
+
+        self.file = std.Io.Dir.cwd().createFile(self.io, self.path, .{
+            .truncate = false,
+            .read = true,
+        }) catch return;
+    }
 };
 
 fn readFileAll(file: std.Io.File, io: std.Io, allocator: Allocator, max_len: usize) ![]u8 {

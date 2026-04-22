@@ -14,10 +14,27 @@ const DEFAULT_HOST = "0.0.0.0";
 const DEFAULT_PORT: u16 = 6380;
 const DEFAULT_DATA_DIR = "data";
 
+/// Global shutdown flag set by signal handler.
+var shutdown_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
+fn installSignalHandlers() void {
+    const c = std.c;
+    var sa: c.Sigaction = undefined;
+    @memset(@as([*]u8, @ptrCast(&sa))[0..@sizeOf(c.Sigaction)], 0);
+    sa.handler = .{ .handler = @ptrCast(&struct {
+        fn handler(_: c_int) callconv(.c) void {
+            shutdown_requested.store(true, .release);
+        }
+    }.handler) };
+    _ = c.sigaction(c.SIG.INT, &sa, null);
+    _ = c.sigaction(c.SIG.TERM, &sa, null);
+}
+
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
 
+    installSignalHandlers();
     const config = parseArgs(init);
     var prof_state: span.Profile = undefined;
     var prof: ?*span.Profile = null;
@@ -90,11 +107,30 @@ pub fn main(init: std.process.Init) !void {
         config.scale_mode,
         config.engine_threads,
         config.cluster_config,
+        config.requirepass,
+        config.maxclients,
+        config.max_client_buffer,
     );
     if (config.reactor) {
-        try server.runReactor(config.workers);
+        server.runReactor(config.workers, &shutdown_requested) catch |err| {
+            log("server error: {s}", .{@errorName(err)});
+        };
     } else {
-        try server.run();
+        server.run() catch |err| {
+            log("server error: {s}", .{@errorName(err)});
+        };
+    }
+
+    // Graceful shutdown: save state before exit
+    log("shutting down...", .{});
+    if (!config.no_persistence) {
+        if (aof_instance) |*a| {
+            snapshot.save(io, allocator, &kv, &graph, a.snapshot_path) catch |err| {
+                log("shutdown snapshot failed: {s}", .{@errorName(err)});
+            };
+            a.truncate() catch {};
+            log("state saved", .{});
+        }
     }
 }
 
@@ -111,6 +147,9 @@ const Config = struct {
     no_persistence: bool,
     reactor: bool,
     workers: usize,
+    requirepass: ?[]const u8,
+    maxclients: u32,
+    max_client_buffer: usize,
 };
 
 fn parseArgs(init: std.process.Init) Config {
@@ -126,6 +165,9 @@ fn parseArgs(init: std.process.Init) Config {
     var no_persistence = false;
     var reactor = false;
     var workers: usize = 4;
+    var requirepass: ?[]const u8 = null;
+    var maxclients: u32 = 10000;
+    var max_client_buffer: usize = 1024 * 1024; // 1MB
 
     var it = std.process.Args.Iterator.init(init.minimal.args);
     defer it.deinit();
@@ -185,6 +227,18 @@ fn parseArgs(init: std.process.Init) Config {
             if (it.next()) |n| {
                 workers = std.fmt.parseInt(usize, std.mem.sliceTo(n, 0), 10) catch 4;
             }
+        } else if (std.mem.eql(u8, arg, "--requirepass")) {
+            if (it.next()) |p| {
+                requirepass = std.mem.sliceTo(p, 0);
+            }
+        } else if (std.mem.eql(u8, arg, "--maxclients")) {
+            if (it.next()) |n| {
+                maxclients = std.fmt.parseInt(u32, std.mem.sliceTo(n, 0), 10) catch 10000;
+            }
+        } else if (std.mem.eql(u8, arg, "--max-client-buffer")) {
+            if (it.next()) |n| {
+                max_client_buffer = std.fmt.parseInt(usize, std.mem.sliceTo(n, 0), 10) catch 1024 * 1024;
+            }
         }
     }
 
@@ -201,6 +255,9 @@ fn parseArgs(init: std.process.Init) Config {
         .no_persistence = no_persistence,
         .reactor = reactor,
         .workers = workers,
+        .requirepass = requirepass,
+        .maxclients = maxclients,
+        .max_client_buffer = max_client_buffer,
     };
 }
 

@@ -33,9 +33,10 @@ const Connection = struct {
     accum_pos: usize, // FIX #1: head index — avoids memmove on consumeAccum
     write_buf: std.array_list.Managed(u8),
     write_offset: usize,
-    write_registered: bool, // FIX #2: track write interest to avoid redundant syscalls
+    write_registered: bool,
+    authenticated: bool,
 
-    fn init(allocator: Allocator, fd: i32) !*Connection {
+    fn init(allocator: Allocator, fd: i32, auth_required: bool) !*Connection {
         const conn = try allocator.create(Connection);
         conn.* = .{
             .fd = fd,
@@ -45,6 +46,7 @@ const Connection = struct {
             .write_buf = std.array_list.Managed(u8).init(allocator),
             .write_offset = 0,
             .write_registered = false,
+            .authenticated = !auth_required,
         };
         return conn;
     }
@@ -93,6 +95,10 @@ pub const Worker = struct {
     aof: ?*AOF,
     keys_mode: KeysMode,
     profile: ?*span.Profile,
+    requirepass: ?[]const u8,
+    maxclients: u32,
+    max_client_buffer: usize,
+    active_connections: *std.atomic.Value(u32),
     new_fds: [MAX_NEW_FDS]i32,
     new_fd_head: std.atomic.Value(usize),
     new_fd_tail: std.atomic.Value(usize),
@@ -109,6 +115,10 @@ pub const Worker = struct {
         aof: ?*AOF,
         keys_mode: KeysMode,
         profile: ?*span.Profile,
+        requirepass: ?[]const u8,
+        maxclients: u32,
+        max_client_buffer: usize,
+        active_connections: *std.atomic.Value(u32),
     ) !Worker {
         return .{
             .id = id,
@@ -124,6 +134,10 @@ pub const Worker = struct {
             .aof = aof,
             .keys_mode = keys_mode,
             .profile = profile,
+            .requirepass = requirepass,
+            .maxclients = maxclients,
+            .max_client_buffer = max_client_buffer,
+            .active_connections = active_connections,
             .new_fds = [_]i32{-1} ** MAX_NEW_FDS,
             .new_fd_head = std.atomic.Value(usize).init(0),
             .new_fd_tail = std.atomic.Value(usize).init(0),
@@ -191,21 +205,32 @@ pub const Worker = struct {
     }
 
     fn registerConnection(self: *Worker, fd: i32) void {
-        // FIX #6: Set TCP_NODELAY on accepted socket
         setTcpNoDelay(fd);
 
-        const conn = Connection.init(self.allocator, fd) catch {
+        // Connection limit check
+        const count = self.active_connections.fetchAdd(1, .monotonic);
+        if (count >= self.maxclients) {
+            _ = self.active_connections.fetchSub(1, .monotonic);
+            _ = std.c.write(fd, "-ERR max number of clients reached\r\n", 36);
+            _ = std.c.close(fd);
+            return;
+        }
+
+        const conn = Connection.init(self.allocator, fd, self.requirepass != null) catch {
+            _ = self.active_connections.fetchSub(1, .monotonic);
             _ = std.c.close(fd);
             return;
         };
         self.conns.put(fd, conn) catch {
             conn.deinit(self.allocator);
+            _ = self.active_connections.fetchSub(1, .monotonic);
             _ = std.c.close(fd);
             return;
         };
         self.loop.addFd(fd, @intCast(fd)) catch {
             _ = self.conns.remove(fd);
             conn.deinit(self.allocator);
+            _ = self.active_connections.fetchSub(1, .monotonic);
             _ = std.c.close(fd);
             return;
         };
@@ -216,6 +241,7 @@ pub const Worker = struct {
         if (self.conns.fetchRemove(fd)) |kv| {
             kv.value.deinit(self.allocator);
         }
+        _ = self.active_connections.fetchSub(1, .monotonic);
         _ = std.c.close(fd);
     }
 
@@ -237,7 +263,14 @@ pub const Worker = struct {
             return;
         };
 
-        // Process ALL complete commands from this read (FIX #3: batch before flush)
+        // Buffer limit check — disconnect clients sending too much unparsed data
+        if (conn.accum.items.len > self.max_client_buffer) {
+            _ = std.c.write(conn.fd, "-ERR max client buffer exceeded\r\n", 33);
+            self.closeConn(conn.fd);
+            return;
+        }
+
+        // Process ALL complete commands from this read
         while (conn.accumData().len > 0) {
             if (!self.processOneCommand(conn)) break;
         }
@@ -303,10 +336,33 @@ pub const Worker = struct {
     fn dispatchCommand(self: *Worker, conn: *Connection, args: []const []const u8) void {
         if (args.len == 0) return;
 
-        // FIX #5: Fast command dispatch via first byte + length
-        // Avoids linear chain of equalsAsciiUpper comparisons
+        // AUTH gate: reject unauthenticated commands (except AUTH and PING)
+        if (!conn.authenticated) {
+            const cmd = args[0];
+            if (equalsAsciiUpper(cmd, "AUTH")) {
+                self.handleAuth(conn, args);
+                return;
+            }
+            if (equalsAsciiUpper(cmd, "PING")) {
+                if (args.len > 1) {
+                    writeBulkTo(&conn.write_buf, args[1]);
+                } else {
+                    conn.write_buf.appendSlice("+PONG\r\n") catch {};
+                }
+                return;
+            }
+            conn.write_buf.appendSlice("-NOAUTH Authentication required.\r\n") catch {};
+            return;
+        }
+
         if (self.ckv) |ckv| {
             if (self.executeHotFast(conn, args, ckv)) return;
+        }
+
+        // Handle AUTH even when already authenticated (Redis allows re-AUTH)
+        if (args.len >= 1 and equalsAsciiUpper(args[0], "AUTH")) {
+            self.handleAuth(conn, args);
+            return;
         }
 
         if (isSelect(args)) {
@@ -315,6 +371,26 @@ pub const Worker = struct {
         }
 
         self.executeCommand(conn, args);
+    }
+
+    fn handleAuth(self: *Worker, conn: *Connection, args: []const []const u8) void {
+        if (self.requirepass == null) {
+            conn.write_buf.appendSlice("-ERR Client sent AUTH, but no password is set\r\n") catch {};
+            return;
+        }
+        if (args.len != 2) {
+            conn.write_buf.appendSlice("-ERR wrong number of arguments for 'AUTH'\r\n") catch {};
+            return;
+        }
+        const pass = self.requirepass.?;
+        const provided = args[1];
+        // Constant-time comparison to prevent timing attacks
+        if (provided.len == pass.len and constantTimeEql(provided, pass)) {
+            conn.authenticated = true;
+            conn.write_buf.appendSlice("+OK\r\n") catch {};
+        } else {
+            conn.write_buf.appendSlice("-ERR invalid password\r\n") catch {};
+        }
     }
 
     /// FIX #5: Fast command dispatch using (length, first_byte) instead of
@@ -629,6 +705,16 @@ fn writeIntTo(list: *std.array_list.Managed(u8), n: i64) void {
 fn setTcpNoDelay(fd: i32) void {
     const yes: c_int = 1;
     _ = std.c.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, @ptrCast(&yes), @sizeOf(c_int));
+}
+
+/// Constant-time byte comparison to prevent timing attacks on password check.
+fn constantTimeEql(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    var diff: u8 = 0;
+    for (a, b) |x, y| {
+        diff |= x ^ y;
+    }
+    return diff == 0;
 }
 
 fn log(comptime fmt: []const u8, args: anytype) void {

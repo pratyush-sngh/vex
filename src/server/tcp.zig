@@ -777,6 +777,10 @@ pub const Server = struct {
     scale_mode: ScaleMode,
     engine_threads: usize,
     cluster_config: ?[]const u8,
+    requirepass: ?[]const u8,
+    maxclients: u32,
+    max_client_buffer: usize,
+    active_connections: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     pub fn init(
         allocator: Allocator,
@@ -791,6 +795,9 @@ pub const Server = struct {
         scale_mode: ScaleMode,
         engine_threads: usize,
         cluster_config: ?[]const u8,
+        requirepass: ?[]const u8,
+        maxclients: u32,
+        max_client_buffer: usize,
     ) !Server {
         const resolved = try std.Io.net.IpAddress.resolve(io, host, port);
         const bind_address: std.Io.net.IpAddress = switch (resolved) {
@@ -813,6 +820,9 @@ pub const Server = struct {
             .scale_mode = scale_mode,
             .engine_threads = engine_threads,
             .cluster_config = cluster_config,
+            .requirepass = requirepass,
+            .maxclients = maxclients,
+            .max_client_buffer = max_client_buffer,
         };
     }
 
@@ -955,7 +965,7 @@ pub const Server = struct {
     }
 
     /// Multi-reactor accept loop. N worker threads each run their own event loop.
-    pub fn runReactor(self: *Server, num_workers: usize) !void {
+    pub fn runReactor(self: *Server, num_workers: usize, shutdown: *std.atomic.Value(bool)) !void {
         const Worker = @import("worker.zig").Worker;
 
         var addr = self.bind_address;
@@ -989,6 +999,10 @@ pub const Server = struct {
                 self.aof,
                 self.keys_mode,
                 self.profile,
+                self.requirepass,
+                self.maxclients,
+                self.max_client_buffer,
+                &self.active_connections,
             );
         }
 
@@ -1001,8 +1015,9 @@ pub const Server = struct {
         log("listening on :{d} (reactor, workers={d})", .{ self.listen_port, num_workers });
 
         var next_worker: usize = 0;
-        while (true) {
+        while (!shutdown.load(.acquire)) {
             const stream = net_server.accept(self.io) catch |err| {
+                if (shutdown.load(.acquire)) break;
                 log("accept error: {}", .{err});
                 continue;
             };

@@ -76,6 +76,7 @@ pub const CommandHandler = struct {
         if (std.mem.eql(u8, cmd, "COMMAND")) return self.cmdCommand(w);
         if (std.mem.eql(u8, cmd, "SAVE")) return self.cmdSave(w);
         if (std.mem.eql(u8, cmd, "LASTSAVE")) return self.cmdLastSave(w);
+        if (std.mem.eql(u8, cmd, "BGREWRITEAOF")) return self.cmdBgRewriteAof(w);
 
         // ── Graph commands (GRAPH.*) ──────────────────────────────────
         if (std.mem.eql(u8, cmd, "GRAPH.ADDNODE")) return self.cmdGraphAddNode(args, w);
@@ -481,19 +482,48 @@ pub const CommandHandler = struct {
 
     fn cmdInfo(self: *CommandHandler, out: *std.Io.Writer) std.Io.Writer.Error!void {
         var kv_keys: usize = 0;
+        var kv_with_ttl: u32 = 0;
         var it = self.kv.map.iterator();
         while (it.next()) |entry| {
-            if (stripDbPrefix(self, entry.key_ptr.*) != null) kv_keys += 1;
+            if (entry.value_ptr.flags.deleted) continue;
+            if (stripDbPrefix(self, entry.key_ptr.*) != null) {
+                kv_keys += 1;
+                if (entry.value_ptr.flags.has_ttl) kv_with_ttl += 1;
+            }
         }
         var aw = std.Io.Writer.Allocating.init(self.allocator);
         defer aw.deinit();
-        try aw.writer.writeAll("# Vex\r\n");
-        try aw.writer.writeAll("vex_version:0.1.0\r\n");
+
+        // Server section
+        try aw.writer.writeAll("# Server\r\n");
+        try aw.writer.writeAll("vex_version:0.2.0\r\n");
+        try aw.writer.writeAll("engine:csr_soa_v2\r\n");
+
+        // Keyspace section
+        try aw.writer.writeAll("\r\n# Keyspace\r\n");
         try aw.writer.print("kv_keys:{d}\r\n", .{kv_keys});
+        try aw.writer.print("kv_with_ttl:{d}\r\n", .{kv_with_ttl});
+        try aw.writer.print("kv_tombstones:{d}\r\n", .{self.kv.tombstone_count});
         try aw.writer.print("db_selected:{d}\r\n", .{self.selected_db.load(.monotonic)});
         try aw.writer.print("db_max:{d}\r\n", .{MAX_DATABASES});
+
+        // Graph section
+        try aw.writer.writeAll("\r\n# Graph\r\n");
         try aw.writer.print("graph_nodes:{d}\r\n", .{self.graph.nodeCount()});
         try aw.writer.print("graph_edges:{d}\r\n", .{self.graph.edgeCount()});
+        try aw.writer.print("graph_types:{d}\r\n", .{self.graph.type_intern.count()});
+        try aw.writer.print("graph_delta_edges:{d}\r\n", .{self.graph.delta_edges.items.len});
+        try aw.writer.print("graph_needs_compact:{d}\r\n", .{@intFromBool(self.graph.needs_compact)});
+
+        // Persistence section
+        try aw.writer.writeAll("\r\n# Persistence\r\n");
+        if (self.aof) |a| {
+            try aw.writer.writeAll("aof_enabled:1\r\n");
+            try aw.writer.print("last_save_time:{d}\r\n", .{@divTrunc(a.last_save_time, 1000)});
+        } else {
+            try aw.writer.writeAll("aof_enabled:0\r\n");
+        }
+
         try resp.serializeBulkString(out, aw.written());
     }
 
@@ -860,6 +890,19 @@ pub const CommandHandler = struct {
     fn cmdLastSave(self: *CommandHandler, w: *std.Io.Writer) !void {
         const ts = if (self.aof) |a| @divTrunc(a.last_save_time, 1000) else 0;
         try resp.serializeInteger(w, ts);
+    }
+
+    /// BGREWRITEAOF -- rewrite AOF from current state (compacts redundant ops)
+    fn cmdBgRewriteAof(self: *CommandHandler, w: *std.Io.Writer) !void {
+        const a = self.aof orelse {
+            try resp.serializeError(w, "persistence not configured");
+            return;
+        };
+        a.rewriteFromState(self.allocator, self.kv, self.graph) catch |err| {
+            try resp.serializeError(w, @errorName(err));
+            return;
+        };
+        try resp.serializeSimpleString(w, "Background AOF rewrite started");
     }
 
     fn logToAOF(self: *CommandHandler, args: []const []const u8) void {
