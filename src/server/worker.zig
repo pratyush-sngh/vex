@@ -10,6 +10,7 @@ const CommandHandler = @import("../command/handler.zig").CommandHandler;
 const KeysMode = @import("../command/handler.zig").KeysMode;
 const AOF = @import("../storage/aof.zig").AOF;
 const span = @import("../perf/span.zig");
+const ct = @import("../command/comptime_dispatch.zig");
 
 const READ_BUF_SIZE = 64 * 1024;
 const MAX_NEW_FDS = 256;
@@ -347,7 +348,7 @@ pub const Worker = struct {
                 if (args.len > 1) {
                     writeBulkTo(&conn.write_buf, args[1]);
                 } else {
-                    conn.write_buf.appendSlice("+PONG\r\n") catch {};
+                    conn.write_buf.appendSlice(ct.resp_pong) catch {};
                 }
                 return;
             }
@@ -393,99 +394,107 @@ pub const Worker = struct {
         }
     }
 
-    /// FIX #5: Fast command dispatch using (length, first_byte) instead of
-    /// sequential equalsAsciiUpper chain. Eliminates ~15ns of string comparisons.
+    /// Hot-path command dispatch using comptime dispatch keys.
+    /// The switch cases are derived from the comptime command table —
+    /// adding a new hot command only requires a table entry + handler below.
     fn executeHotFast(self: *Worker, conn: *Connection, args: []const []const u8, ckv: *ConcurrentKV) bool {
         if (args.len == 0) return false;
         const cmd = args[0];
-        if (cmd.len == 0) return false;
+        if (cmd.len == 0 or cmd.len > 16) return false;
 
-        const first = std.ascii.toUpper(cmd[0]);
-        switch (cmd.len) {
-            3 => switch (first) {
-                'G' => { // GET
-                    if (args.len == 2 and equalsAsciiUpper(cmd, "GET")) {
-                        const ns_key = nsKey(conn.selected_db, args[1]) orelse return false;
-                        _ = ckv.getAndWriteBulk(ns_key, &conn.write_buf);
-                        return true;
+        // Compute dispatch key at runtime: (len << 8) | toUpper(first_byte)
+        const key = (@as(u16, @intCast(cmd.len)) << 8) | @as(u16, std.ascii.toUpper(cmd[0]));
+
+        // Switch on comptime-generated dispatch keys (validated collision-free at compile time)
+        switch (key) {
+            comptime ct.dispatchKey("GET") => {
+                if (args.len >= 2 and equalsAsciiUpper(cmd, "GET")) {
+                    const ns_key = nsKey(conn.selected_db, args[1]) orelse return false;
+                    _ = ckv.getAndWriteBulk(ns_key, &conn.write_buf);
+                    return true;
+                }
+            },
+            comptime ct.dispatchKey("SET") => {
+                if (args.len >= 3 and equalsAsciiUpper(cmd, "SET")) {
+                    const ns_key = nsKey(conn.selected_db, args[1]) orelse return false;
+                    if (args.len >= 5 and equalsAsciiUpper(args[3], "EX")) {
+                        const t = std.fmt.parseInt(i64, args[4], 10) catch return false;
+                        ckv.setEx(ns_key, args[2], t) catch return false;
+                    } else if (args.len >= 5 and equalsAsciiUpper(args[3], "PX")) {
+                        const t = std.fmt.parseInt(i64, args[4], 10) catch return false;
+                        ckv.setPx(ns_key, args[2], t) catch return false;
+                    } else {
+                        ckv.set(ns_key, args[2]) catch return false;
                     }
-                },
-                'S' => { // SET
-                    if (args.len >= 3 and equalsAsciiUpper(cmd, "SET")) {
-                        const ns_key = nsKey(conn.selected_db, args[1]) orelse return false;
-                        if (args.len >= 5 and equalsAsciiUpper(args[3], "EX")) {
-                            const t = std.fmt.parseInt(i64, args[4], 10) catch return false;
-                            ckv.setEx(ns_key, args[2], t) catch return false;
-                        } else if (args.len >= 5 and equalsAsciiUpper(args[3], "PX")) {
-                            const t = std.fmt.parseInt(i64, args[4], 10) catch return false;
-                            ckv.setPx(ns_key, args[2], t) catch return false;
-                        } else {
-                            ckv.set(ns_key, args[2]) catch return false;
-                        }
+                    if (self.aof) |a| a.logCommand(args);
+                    conn.write_buf.appendSlice(ct.resp_ok) catch {};
+                    return true;
+                }
+            },
+            comptime ct.dispatchKey("DEL") => {
+                if (args.len >= 2 and equalsAsciiUpper(cmd, "DEL")) {
+                    const ns_key = nsKey(conn.selected_db, args[1]) orelse return false;
+                    if (ckv.delete(ns_key)) {
                         if (self.aof) |a| a.logCommand(args);
-                        conn.write_buf.appendSlice("+OK\r\n") catch {};
-                        return true;
+                        conn.write_buf.appendSlice(ct.RespInts.@"1") catch {};
+                    } else {
+                        conn.write_buf.appendSlice(ct.RespInts.@"0") catch {};
                     }
-                },
-                'D' => { // DEL
-                    if (args.len == 2 and equalsAsciiUpper(cmd, "DEL")) {
-                        const ns_key = nsKey(conn.selected_db, args[1]) orelse return false;
-                        if (ckv.delete(ns_key)) {
-                            if (self.aof) |a| a.logCommand(args);
-                            conn.write_buf.appendSlice(":1\r\n") catch {};
-                        } else {
-                            conn.write_buf.appendSlice(":0\r\n") catch {};
-                        }
-                        return true;
-                    }
-                },
-                'T' => { // TTL
-                    if (args.len == 2 and equalsAsciiUpper(cmd, "TTL")) {
-                        const ns_key = nsKey(conn.selected_db, args[1]) orelse return false;
-                        if (!ckv.exists(ns_key)) {
-                            conn.write_buf.appendSlice(":-2\r\n") catch {};
-                        } else if (ckv.ttl(ns_key)) |sec| {
-                            writeIntTo(&conn.write_buf, sec);
-                        } else {
-                            conn.write_buf.appendSlice(":-1\r\n") catch {};
-                        }
-                        return true;
-                    }
-                },
-                else => {},
-            },
-            4 => if (first == 'P' and equalsAsciiUpper(cmd, "PING")) { // PING
-                if (args.len > 1) {
-                    writeBulkTo(&conn.write_buf, args[1]);
-                } else {
-                    conn.write_buf.appendSlice("+PONG\r\n") catch {};
+                    return true;
                 }
-                return true;
             },
-            6 => if (first == 'E' and args.len == 2 and equalsAsciiUpper(cmd, "EXISTS")) { // EXISTS
-                const ns_key = nsKey(conn.selected_db, args[1]) orelse return false;
-                if (ckv.exists(ns_key)) {
-                    conn.write_buf.appendSlice(":1\r\n") catch {};
-                } else {
-                    conn.write_buf.appendSlice(":0\r\n") catch {};
+            comptime ct.dispatchKey("TTL") => {
+                if (args.len >= 2 and equalsAsciiUpper(cmd, "TTL")) {
+                    const ns_key = nsKey(conn.selected_db, args[1]) orelse return false;
+                    if (!ckv.exists(ns_key)) {
+                        conn.write_buf.appendSlice(ct.RespInts.@"-2") catch {};
+                    } else if (ckv.ttl(ns_key)) |sec| {
+                        writeIntTo(&conn.write_buf, sec);
+                    } else {
+                        conn.write_buf.appendSlice(ct.RespInts.@"-1") catch {};
+                    }
+                    return true;
                 }
-                return true;
             },
-            7 => switch (first) {
-                'C' => { // COMMAND
-                    if (equalsAsciiUpper(cmd, "COMMAND")) {
-                        conn.write_buf.appendSlice("+OK\r\n") catch {};
-                        return true;
+            comptime ct.dispatchKey("PING") => {
+                if (equalsAsciiUpper(cmd, "PING")) {
+                    if (args.len > 1) {
+                        writeBulkTo(&conn.write_buf, args[1]);
+                    } else {
+                        conn.write_buf.appendSlice(ct.resp_pong) catch {};
                     }
-                },
-                'F' => { // FLUSHDB
-                    if (equalsAsciiUpper(cmd, "FLUSHDB")) {
-                        ckv.flushdb();
-                        conn.write_buf.appendSlice("+OK\r\n") catch {};
-                        return true;
+                    return true;
+                }
+            },
+            comptime ct.dispatchKey("EXISTS") => {
+                if (args.len >= 2 and equalsAsciiUpper(cmd, "EXISTS")) {
+                    const ns_key = nsKey(conn.selected_db, args[1]) orelse return false;
+                    if (ckv.exists(ns_key)) {
+                        conn.write_buf.appendSlice(ct.RespInts.@"1") catch {};
+                    } else {
+                        conn.write_buf.appendSlice(ct.RespInts.@"0") catch {};
                     }
-                },
-                else => {},
+                    return true;
+                }
+            },
+            comptime ct.dispatchKey("COMMAND") => {
+                if (equalsAsciiUpper(cmd, "COMMAND")) {
+                    conn.write_buf.appendSlice(ct.resp_ok) catch {};
+                    return true;
+                }
+            },
+            comptime ct.dispatchKey("FLUSHDB") => {
+                if (equalsAsciiUpper(cmd, "FLUSHDB")) {
+                    ckv.flushdb();
+                    conn.write_buf.appendSlice(ct.resp_ok) catch {};
+                    return true;
+                }
+            },
+            comptime ct.dispatchKey("DBSIZE") => {
+                if (equalsAsciiUpper(cmd, "DBSIZE")) {
+                    writeIntTo(&conn.write_buf, @intCast(ckv.dbsize()));
+                    return true;
+                }
             },
             else => {},
         }
