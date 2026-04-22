@@ -19,7 +19,7 @@ services:
       context: .
       dockerfile: Dockerfile.vex
     container_name: vex-compare
-    command: ["--port", "6380", "--data-dir", "/data", "--no-persistence", "--reactor", "--workers", "6"]
+    command: ["--port", "6380", "--data-dir", "/data", "--no-persistence", "--reactor"]
     ports:
       # Host port avoids clashing with a local vex / dev server on 6380
       - "16380:6380"

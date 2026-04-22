@@ -164,7 +164,7 @@ fn parseArgs(init: std.process.Init) Config {
     var cluster_config: ?[]const u8 = null;
     var no_persistence = false;
     var reactor = false;
-    var workers: usize = 4;
+    var workers: usize = @min(std.Thread.getCpuCount() catch 4, 8);
     var requirepass: ?[]const u8 = null;
     var maxclients: u32 = 10000;
     var max_client_buffer: usize = 1024 * 1024; // 1MB
