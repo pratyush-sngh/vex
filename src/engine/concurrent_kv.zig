@@ -66,9 +66,11 @@ pub const ConcurrentKV = struct {
             errdefer self.allocator.free(owned_key);
             const owned_val = try self.allocator.dupe(u8, entry.value_ptr.value);
             errdefer self.allocator.free(owned_val);
+            if (entry.value_ptr.flags.deleted) continue; // skip tombstones
             try s.map.put(owned_key, .{
                 .value = owned_val,
                 .expires_at = entry.value_ptr.expires_at,
+                .flags = entry.value_ptr.flags,
             });
         }
     }
@@ -118,7 +120,7 @@ pub const ConcurrentKV = struct {
     }
 
     pub fn set(self: *ConcurrentKV, key: []const u8, value: []const u8) !void {
-        return self.setInternal(key, value, null);
+        return self.setInternal(key, value, 0);
     }
 
     pub fn setEx(self: *ConcurrentKV, key: []const u8, value: []const u8, ttl_seconds: i64) !void {
@@ -167,12 +169,12 @@ pub const ConcurrentKV = struct {
             self.evictLocked(s, key);
             return null;
         }
-        const exp = entry.expires_at orelse return -1;
-        return @divTrunc(exp - self.nowMillis(), 1000);
+        if (!entry.flags.has_ttl) return -1;
+        return @divTrunc(entry.expires_at - self.nowMillis(), 1000);
     }
 
     pub fn restoreEntry(self: *ConcurrentKV, key: []const u8, value: []const u8, expires_at: ?i64) !void {
-        return self.setInternal(key, value, expires_at);
+        return self.setInternal(key, value, expires_at orelse 0);
     }
 
     // ── Bulk operations (lock all stripes) ──
@@ -223,7 +225,7 @@ pub const ConcurrentKV = struct {
 
     // ── Internal helpers ──
 
-    fn setInternal(self: *ConcurrentKV, key: []const u8, value: []const u8, expires_at: ?i64) !void {
+    fn setInternal(self: *ConcurrentKV, key: []const u8, value: []const u8, expires_at: i64) !void {
         const s = self.getStripe(key);
         lockStripe(s);
         defer unlockStripe(s);
@@ -231,17 +233,20 @@ pub const ConcurrentKV = struct {
         const owned_value = try self.allocator.dupe(u8, value);
         errdefer self.allocator.free(owned_value);
 
+        const has_ttl = expires_at != 0;
         const result = s.map.getPtr(key);
         if (result) |existing| {
             self.allocator.free(existing.value);
             existing.value = owned_value;
             existing.expires_at = expires_at;
+            existing.flags = .{ .has_ttl = has_ttl };
         } else {
             const owned_key = try self.allocator.dupe(u8, key);
             errdefer self.allocator.free(owned_key);
             try s.map.put(owned_key, .{
                 .value = owned_value,
                 .expires_at = expires_at,
+                .flags = .{ .has_ttl = has_ttl },
             });
         }
     }
@@ -277,8 +282,8 @@ pub const ConcurrentKV = struct {
     }
 
     fn isExpired(self: *const ConcurrentKV, entry: *const Entry) bool {
-        const exp = entry.expires_at orelse return false;
-        return self.nowMillis() > exp;
+        if (!entry.flags.has_ttl) return false;
+        return self.nowMillis() > entry.expires_at;
     }
 
     /// Remove an expired entry while the stripe is already locked.

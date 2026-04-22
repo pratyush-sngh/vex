@@ -44,6 +44,7 @@ pub fn main(init: std.process.Init) !void {
     defer allocator.free(aof_path);
 
     var aof_instance: ?AOF = null;
+    defer if (aof_instance) |*a| a.deinit();
     var replayed: u64 = 0;
     if (!config.no_persistence) {
         snapshot.load(io, allocator, &kv, &graph, snapshot_path) catch |err| {
@@ -56,7 +57,6 @@ pub fn main(init: std.process.Init) !void {
         };
         aof_tmp.prof = prof;
         aof_instance = aof_tmp;
-        defer if (aof_instance) |*a| a.deinit();
 
         var replay_db = std.atomic.Value(u8).init(0);
         var replay_handler = CommandHandler.init(allocator, io, &kv, &graph, null, &replay_db, config.keys_mode);
@@ -247,4 +247,7 @@ test {
     _ = @import("storage/snapshot.zig");
     _ = @import("storage/aof.zig");
     _ = @import("perf/span.zig");
+    _ = @import("engine/string_intern.zig");
+    _ = @import("engine/pool_arena.zig");
+    _ = @import("engine/property_store.zig");
 }

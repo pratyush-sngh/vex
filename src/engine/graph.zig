@@ -1,92 +1,160 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const StringIntern = @import("string_intern.zig").StringIntern;
+const TypeMask = @import("string_intern.zig").TypeMask;
+const PropertyStore = @import("property_store.zig").PropertyStore;
 
-/// Dense internal identifier for nodes (allows O(1) indexed lookup).
 pub const NodeId = u32;
-/// Dense internal identifier for edges.
 pub const EdgeId = u32;
-
 pub const INVALID_ID: u32 = std.math.maxInt(u32);
 
-pub const Node = struct {
-    key: []const u8,
-    node_type: []const u8,
-    properties: std.StringHashMap([]const u8),
-    deleted: bool,
+/// Compressed Sparse Row adjacency structure.
+/// Node i's neighbors: targets[offsets[i]..offsets[i+1]]
+pub const CSR = struct {
+    offsets: []u32, // [capacity + 1]
+    targets: []NodeId, // [edge_count]
+    edge_idx: []u32, // [edge_count] — maps CSR pos → edge store index
 
-    pub fn deinit(self: *Node, allocator: Allocator) void {
-        var iter = self.properties.iterator();
-        while (iter.next()) |entry| {
-            allocator.free(entry.key_ptr.*);
-            allocator.free(entry.value_ptr.*);
-        }
-        self.properties.deinit();
-        allocator.free(self.key);
-        allocator.free(self.node_type);
+    pub fn empty() CSR {
+        return .{ .offsets = &.{}, .targets = &.{}, .edge_idx = &.{} };
+    }
+
+    pub fn neighbors(self: *const CSR, node_id: NodeId) []const NodeId {
+        if (self.offsets.len == 0) return &.{};
+        if (node_id + 1 >= self.offsets.len) return &.{};
+        const start = self.offsets[node_id];
+        const end = self.offsets[node_id + 1];
+        if (start >= end) return &.{};
+        return self.targets[start..end];
+    }
+
+    pub fn edgeIndices(self: *const CSR, node_id: NodeId) []const u32 {
+        if (self.offsets.len == 0) return &.{};
+        if (node_id + 1 >= self.offsets.len) return &.{};
+        const start = self.offsets[node_id];
+        const end = self.offsets[node_id + 1];
+        if (start >= end) return &.{};
+        return self.edge_idx[start..end];
+    }
+
+    pub fn deinit(self: *CSR, allocator: Allocator) void {
+        if (self.offsets.len > 0) allocator.free(self.offsets);
+        if (self.targets.len > 0) allocator.free(self.targets);
+        if (self.edge_idx.len > 0) allocator.free(self.edge_idx);
+        self.* = empty();
     }
 };
 
-pub const Edge = struct {
+/// Flat delta edge entry — used instead of a delta CSR.
+/// Small delta (<100 edges typically) is scanned linearly per node.
+/// This avoids O(delta_size) CSR rebuild on every addEdge.
+pub const DeltaEdge = struct {
     from: NodeId,
     to: NodeId,
-    edge_type: []const u8,
-    weight: f64,
-    properties: std.StringHashMap([]const u8),
-
-    pub fn isDeleted(self: *const Edge) bool {
-        return self.from == INVALID_ID;
-    }
-
-    pub fn deinit(self: *Edge, allocator: Allocator) void {
-        var iter = self.properties.iterator();
-        while (iter.next()) |entry| {
-            allocator.free(entry.key_ptr.*);
-            allocator.free(entry.value_ptr.*);
-        }
-        self.properties.deinit();
-        allocator.free(self.edge_type);
-    }
+    eidx: u32,
 };
 
-/// In-memory graph engine with adjacency list representation.
-///
-/// Design mirrors ReviewGraph's Engine: dense internal IDs, parallel arrays,
-/// forward + reverse adjacency lists for efficient traversal.
-///
-/// Single-threaded by design (Redis model) -- the event loop serializes
-/// all mutations, so no locks are needed.
+pub const GraphFlags = packed struct {
+    uniform_weights: bool = true,
+    has_node_props: bool = false,
+    has_edge_props: bool = false,
+    is_untyped: bool = true,
+    _padding: u4 = 0,
+};
+
 pub const GraphEngine = struct {
     allocator: Allocator,
-    nodes: std.array_list.Managed(Node),
-    edges: std.array_list.Managed(Edge),
+    flags: GraphFlags,
+
+    // ─── Node Store (SoA) ───────────────────
+    node_keys: std.array_list.Managed([]const u8),
+    node_type_id: std.array_list.Managed(u16),
+    node_alive: std.DynamicBitSet,
+    node_prop_mask: std.array_list.Managed(u64),
+    node_out_type_mask: std.array_list.Managed(TypeMask),
+    node_in_type_mask: std.array_list.Managed(TypeMask),
     key_to_id: std.StringHashMap(NodeId),
-    outgoing: std.array_list.Managed(std.array_list.Managed(EdgeId)),
-    incoming: std.array_list.Managed(std.array_list.Managed(EdgeId)),
+
+    // ─── Edge Store (SoA) ───────────────────
+    edge_from: std.array_list.Managed(NodeId),
+    edge_to: std.array_list.Managed(NodeId),
+    edge_weight: std.array_list.Managed(f64),
+    edge_type_id: std.array_list.Managed(u16),
+    edge_alive: std.DynamicBitSet,
+    edge_prop_mask: std.array_list.Managed(u64),
+
+    // ─── Topology ───────────────────────────
+    base_out: CSR, // compacted outgoing adjacency
+    base_in: CSR, // compacted incoming adjacency
+    /// Flat delta edges — appended on addEdge, cleared on compact.
+    /// Linear scan per node during traverse (fast for small delta).
+    delta_edges: std.array_list.Managed(DeltaEdge),
+
+    // ─── Shared Infrastructure ──────────────
+    type_intern: StringIntern,
+    node_props: PropertyStore,
+    edge_props: PropertyStore,
+
+    // ─── Compaction state ───────────────────
+    needs_compact: bool,
+    /// True when all edges in the base CSR are alive (no deletions since
+    /// last compact). Allows skipping edge_alive checks and edge_idx
+    /// loads in the traverse hot path — halves CSR data loaded.
+    all_base_edges_alive: bool,
+    /// Set true during bulk loading to skip per-edge bookkeeping.
+    /// Call compact() after bulk loading completes.
+    bulk_loading: bool,
 
     pub fn init(allocator: Allocator) GraphEngine {
         return .{
             .allocator = allocator,
-            .nodes = std.array_list.Managed(Node).init(allocator),
-            .edges = std.array_list.Managed(Edge).init(allocator),
+            .flags = .{},
+            .node_keys = std.array_list.Managed([]const u8).init(allocator),
+            .node_type_id = std.array_list.Managed(u16).init(allocator),
+            .node_alive = std.DynamicBitSet.initEmpty(allocator, 0) catch unreachable,
+            .node_prop_mask = std.array_list.Managed(u64).init(allocator),
+            .node_out_type_mask = std.array_list.Managed(TypeMask).init(allocator),
+            .node_in_type_mask = std.array_list.Managed(TypeMask).init(allocator),
             .key_to_id = std.StringHashMap(NodeId).init(allocator),
-            .outgoing = std.array_list.Managed(std.array_list.Managed(EdgeId)).init(allocator),
-            .incoming = std.array_list.Managed(std.array_list.Managed(EdgeId)).init(allocator),
+            .edge_from = std.array_list.Managed(NodeId).init(allocator),
+            .edge_to = std.array_list.Managed(NodeId).init(allocator),
+            .edge_weight = std.array_list.Managed(f64).init(allocator),
+            .edge_type_id = std.array_list.Managed(u16).init(allocator),
+            .edge_alive = std.DynamicBitSet.initEmpty(allocator, 0) catch unreachable,
+            .edge_prop_mask = std.array_list.Managed(u64).init(allocator),
+            .base_out = CSR.empty(),
+            .base_in = CSR.empty(),
+            .delta_edges = std.array_list.Managed(DeltaEdge).init(allocator),
+            .type_intern = StringIntern.init(allocator),
+            .node_props = PropertyStore.init(allocator),
+            .edge_props = PropertyStore.init(allocator),
+            .needs_compact = false,
+            .all_base_edges_alive = true,
+            .bulk_loading = false,
         };
     }
 
     pub fn deinit(self: *GraphEngine) void {
-        for (self.nodes.items) |*node| node.deinit(self.allocator);
-        self.nodes.deinit();
-
-        for (self.edges.items) |*edge| edge.deinit(self.allocator);
-        self.edges.deinit();
-
+        for (self.node_keys.items) |k| self.allocator.free(k);
+        self.node_keys.deinit();
+        self.node_type_id.deinit();
+        self.node_alive.deinit();
+        self.node_prop_mask.deinit();
+        self.node_out_type_mask.deinit();
+        self.node_in_type_mask.deinit();
         self.key_to_id.deinit();
-
-        for (self.outgoing.items) |*list| list.deinit();
-        self.outgoing.deinit();
-        for (self.incoming.items) |*list| list.deinit();
-        self.incoming.deinit();
+        self.edge_from.deinit();
+        self.edge_to.deinit();
+        self.edge_weight.deinit();
+        self.edge_type_id.deinit();
+        self.edge_alive.deinit();
+        self.edge_prop_mask.deinit();
+        self.base_out.deinit(self.allocator);
+        self.base_in.deinit(self.allocator);
+        self.delta_edges.deinit();
+        self.type_intern.deinit();
+        self.node_props.deinit();
+        self.edge_props.deinit();
     }
 
     // ─── Node Operations ──────────────────────────────────────────────
@@ -94,227 +162,299 @@ pub const GraphEngine = struct {
     pub fn addNode(self: *GraphEngine, key: []const u8, node_type: []const u8) !NodeId {
         if (self.key_to_id.get(key) != null) return error.DuplicateNode;
 
-        const id: NodeId = @intCast(self.nodes.items.len);
+        const id: NodeId = @intCast(self.node_keys.items.len);
+        const type_id = try self.type_intern.intern(node_type);
         const owned_key = try self.allocator.dupe(u8, key);
         errdefer self.allocator.free(owned_key);
-        const owned_type = try self.allocator.dupe(u8, node_type);
-        errdefer self.allocator.free(owned_type);
 
-        try self.nodes.append(.{
-            .key = owned_key,
-            .node_type = owned_type,
-            .properties = std.StringHashMap([]const u8).init(self.allocator),
-            .deleted = false,
-        });
-        errdefer {
-            if (self.nodes.pop()) |n| {
-                var node = n;
-                node.deinit(self.allocator);
-            }
-        }
+        try self.node_keys.append(owned_key);
+        errdefer _ = self.node_keys.pop();
+        try self.node_type_id.append(type_id);
+        try self.node_prop_mask.append(0);
+        try self.node_out_type_mask.append(0);
+        try self.node_in_type_mask.append(0);
+
+        try self.node_alive.resize(id + 1, true);
+        self.node_alive.set(id);
 
         try self.key_to_id.put(owned_key, id);
-        try self.outgoing.append(std.array_list.Managed(EdgeId).init(self.allocator));
-        try self.incoming.append(std.array_list.Managed(EdgeId).init(self.allocator));
+
+        if (self.type_intern.count() > 1) self.flags.is_untyped = false;
 
         return id;
     }
 
-    pub fn getNode(self: *GraphEngine, key: []const u8) ?*const Node {
+    pub fn getNode(self: *const GraphEngine, key: []const u8) ?NodeView {
         const id = self.key_to_id.get(key) orelse return null;
-        const node = &self.nodes.items[id];
-        if (node.deleted) return null;
-        return node;
+        if (!self.node_alive.isSet(id)) return null;
+        return self.nodeView(id);
     }
 
-    pub fn getNodeById(self: *GraphEngine, id: NodeId) ?*const Node {
-        if (id >= self.nodes.items.len) return null;
-        const node = &self.nodes.items[id];
-        if (node.deleted) return null;
-        return node;
+    pub fn getNodeById(self: *const GraphEngine, id: NodeId) ?NodeView {
+        if (id >= self.node_keys.items.len) return null;
+        if (!self.node_alive.isSet(id)) return null;
+        return self.nodeView(id);
     }
 
-    pub fn resolveKey(self: *GraphEngine, key: []const u8) ?NodeId {
-        return self.key_to_id.get(key);
+    fn nodeView(self: *const GraphEngine, id: NodeId) NodeView {
+        return .{
+            .id = id,
+            .key = self.node_keys.items[id],
+            .node_type = self.type_intern.resolve(self.node_type_id.items[id]),
+            .prop_mask = self.node_prop_mask.items[id],
+        };
+    }
+
+    pub fn resolveKey(self: *const GraphEngine, key: []const u8) ?NodeId {
+        const id = self.key_to_id.get(key) orelse return null;
+        if (!self.node_alive.isSet(id)) return null;
+        return id;
     }
 
     pub fn setNodeProperty(self: *GraphEngine, key: []const u8, prop_key: []const u8, prop_val: []const u8) !void {
-        const id = self.key_to_id.get(key) orelse return error.NodeNotFound;
-        var node = &self.nodes.items[id];
-        if (node.deleted) return error.NodeNotFound;
+        const id = self.resolveKey(key) orelse return error.NodeNotFound;
+        try self.node_props.set(id, prop_key, prop_val);
 
-        const owned_pv = try self.allocator.dupe(u8, prop_val);
-        errdefer self.allocator.free(owned_pv);
-
-        const existing = node.properties.getPtr(prop_key);
-        if (existing) |old_val| {
-            self.allocator.free(old_val.*);
-            old_val.* = owned_pv;
-        } else {
-            const owned_pk = try self.allocator.dupe(u8, prop_key);
-            errdefer self.allocator.free(owned_pk);
-            try node.properties.put(owned_pk, owned_pv);
+        if (self.node_props.key_intern.find(prop_key)) |kid| {
+            if (kid < 64) {
+                self.node_prop_mask.items[id] |= @as(u64, 1) << @intCast(kid);
+            }
         }
+        self.flags.has_node_props = true;
     }
 
     pub fn removeNode(self: *GraphEngine, key: []const u8) !void {
-        const id = self.key_to_id.get(key) orelse return error.NodeNotFound;
+        const id = self.resolveKey(key) orelse return error.NodeNotFound;
 
-        // Collect edges to remove (both directions)
-        var edges_to_remove = std.array_list.Managed(EdgeId).init(self.allocator);
-        defer edges_to_remove.deinit();
-
-        for (self.outgoing.items[id].items) |eid| try edges_to_remove.append(eid);
-        for (self.incoming.items[id].items) |eid| try edges_to_remove.append(eid);
-
-        for (edges_to_remove.items) |eid| {
-            var edge = &self.edges.items[eid];
-            if (!edge.isDeleted()) {
-                if (edge.from != id) removeFromList(&self.outgoing.items[edge.from], eid);
-                if (edge.to != id) removeFromList(&self.incoming.items[edge.to], eid);
-                edge.from = INVALID_ID;
-                edge.to = INVALID_ID;
+        for (0..self.edge_from.items.len) |eidx| {
+            if (!self.edge_alive.isSet(eidx)) continue;
+            if (self.edge_from.items[eidx] == id or self.edge_to.items[eidx] == id) {
+                self.edge_alive.unset(eidx);
+                self.all_base_edges_alive = false;
             }
         }
 
-        self.outgoing.items[id].clearAndFree();
-        self.incoming.items[id].clearAndFree();
-
+        self.node_alive.unset(id);
         _ = self.key_to_id.remove(key);
-        self.nodes.items[id].deleted = true;
+        self.node_props.deleteAll(id);
+        self.needs_compact = true;
     }
 
     // ─── Edge Operations ──────────────────────────────────────────────
 
     pub fn addEdge(self: *GraphEngine, from_key: []const u8, to_key: []const u8, edge_type: []const u8, weight: f64) !EdgeId {
-        const from_id = self.key_to_id.get(from_key) orelse return error.NodeNotFound;
-        const to_id = self.key_to_id.get(to_key) orelse return error.NodeNotFound;
+        const from_id = self.resolveKey(from_key) orelse return error.NodeNotFound;
+        const to_id = self.resolveKey(to_key) orelse return error.NodeNotFound;
 
-        const eid: EdgeId = @intCast(self.edges.items.len);
-        const owned_type = try self.allocator.dupe(u8, edge_type);
-        errdefer self.allocator.free(owned_type);
+        const eid: EdgeId = @intCast(self.edge_from.items.len);
+        const type_id = try self.type_intern.intern(edge_type);
 
-        try self.edges.append(.{
-            .from = from_id,
-            .to = to_id,
-            .edge_type = owned_type,
-            .weight = weight,
-            .properties = std.StringHashMap([]const u8).init(self.allocator),
-        });
+        try self.edge_from.append(from_id);
+        try self.edge_to.append(to_id);
+        try self.edge_weight.append(weight);
+        try self.edge_type_id.append(type_id);
+        try self.edge_prop_mask.append(0);
+        try self.edge_alive.resize(eid + 1, true);
+        self.edge_alive.set(eid);
 
-        try self.outgoing.items[from_id].append(eid);
-        try self.incoming.items[to_id].append(eid);
+        // Update node type masks
+        const type_bit = StringIntern.mask(type_id);
+        self.node_out_type_mask.items[from_id] |= type_bit;
+        self.node_in_type_mask.items[to_id] |= type_bit;
+
+        if (weight != 1.0) self.flags.uniform_weights = false;
+        if (self.type_intern.count() > 1) self.flags.is_untyped = false;
+
+        // Append to flat delta — O(1), no CSR rebuild
+        if (!self.bulk_loading) {
+            try self.delta_edges.append(.{ .from = from_id, .to = to_id, .eidx = eid });
+        }
 
         return eid;
     }
 
-    pub fn getEdge(self: *GraphEngine, eid: EdgeId) ?*const Edge {
-        if (eid >= self.edges.items.len) return null;
-        const edge = &self.edges.items[eid];
-        if (edge.isDeleted()) return null;
-        return edge;
+    pub fn getEdge(self: *const GraphEngine, eid: EdgeId) ?EdgeView {
+        if (eid >= self.edge_from.items.len) return null;
+        if (!self.edge_alive.isSet(eid)) return null;
+        return .{
+            .id = eid,
+            .from = self.edge_from.items[eid],
+            .to = self.edge_to.items[eid],
+            .edge_type = self.type_intern.resolve(self.edge_type_id.items[eid]),
+            .weight = self.edge_weight.items[eid],
+            .prop_mask = self.edge_prop_mask.items[eid],
+        };
     }
 
     pub fn removeEdge(self: *GraphEngine, eid: EdgeId) !void {
-        if (eid >= self.edges.items.len) return error.EdgeNotFound;
-        var edge = &self.edges.items[eid];
-        if (edge.isDeleted()) return error.EdgeNotFound;
+        if (eid >= self.edge_from.items.len) return error.EdgeNotFound;
+        if (!self.edge_alive.isSet(eid)) return error.EdgeNotFound;
 
-        removeFromList(&self.outgoing.items[edge.from], eid);
-        removeFromList(&self.incoming.items[edge.to], eid);
-        edge.from = INVALID_ID;
-        edge.to = INVALID_ID;
+        self.edge_alive.unset(eid);
+        self.edge_props.deleteAll(eid);
+        self.all_base_edges_alive = false;
+        self.needs_compact = true;
     }
 
     pub fn setEdgeProperty(self: *GraphEngine, eid: EdgeId, prop_key: []const u8, prop_val: []const u8) !void {
-        if (eid >= self.edges.items.len) return error.EdgeNotFound;
-        var edge = &self.edges.items[eid];
-        if (edge.isDeleted()) return error.EdgeNotFound;
+        if (eid >= self.edge_from.items.len) return error.EdgeNotFound;
+        if (!self.edge_alive.isSet(eid)) return error.EdgeNotFound;
 
-        const owned_pv = try self.allocator.dupe(u8, prop_val);
-        errdefer self.allocator.free(owned_pv);
+        try self.edge_props.set(eid, prop_key, prop_val);
 
-        const existing = edge.properties.getPtr(prop_key);
-        if (existing) |old_val| {
-            self.allocator.free(old_val.*);
-            old_val.* = owned_pv;
-        } else {
-            const owned_pk = try self.allocator.dupe(u8, prop_key);
-            errdefer self.allocator.free(owned_pk);
-            try edge.properties.put(owned_pk, owned_pv);
+        if (self.edge_props.key_intern.find(prop_key)) |kid| {
+            if (kid < 64) {
+                self.edge_prop_mask.items[eid] |= @as(u64, 1) << @intCast(kid);
+            }
         }
+        self.flags.has_edge_props = true;
     }
 
-    // ─── Query Primitives ─────────────────────────────────────────────
+    // ─── Query Primitives (used by query_v2.zig) ─────────────────────
 
-    pub fn outgoingEdges(self: *GraphEngine, key: []const u8) ?[]const EdgeId {
-        const id = self.key_to_id.get(key) orelse return null;
-        return self.outgoing.items[id].items;
+    pub fn outgoingNeighbors(self: *const GraphEngine, id: NodeId) struct { base: []const NodeId, delta: []const NodeId } {
+        return .{
+            .base = self.base_out.neighbors(id),
+            .delta = &.{}, // delta is now flat list, not CSR
+        };
     }
 
-    pub fn incomingEdges(self: *GraphEngine, key: []const u8) ?[]const EdgeId {
-        const id = self.key_to_id.get(key) orelse return null;
-        return self.incoming.items[id].items;
+    pub fn incomingNeighbors(self: *const GraphEngine, id: NodeId) struct { base: []const NodeId, delta: []const NodeId } {
+        return .{
+            .base = self.base_in.neighbors(id),
+            .delta = &.{},
+        };
     }
 
-    pub fn outgoingEdgesById(self: *GraphEngine, id: NodeId) []const EdgeId {
-        if (id >= self.outgoing.items.len) return &.{};
-        return self.outgoing.items[id].items;
+    pub fn outgoingEdgeIndices(self: *const GraphEngine, id: NodeId) struct { base: []const u32, delta: []const u32 } {
+        return .{
+            .base = self.base_out.edgeIndices(id),
+            .delta = &.{},
+        };
     }
 
-    pub fn incomingEdgesById(self: *GraphEngine, id: NodeId) []const EdgeId {
-        if (id >= self.incoming.items.len) return &.{};
-        return self.incoming.items[id].items;
+    pub fn incomingEdgeIndices(self: *const GraphEngine, id: NodeId) struct { base: []const u32, delta: []const u32 } {
+        return .{
+            .base = self.base_in.edgeIndices(id),
+            .delta = &.{},
+        };
     }
 
-    pub fn nodeCount(self: *GraphEngine) usize {
+    pub fn nodeCount(self: *const GraphEngine) usize {
         return self.key_to_id.count();
     }
 
-    pub fn edgeCount(self: *GraphEngine) usize {
-        var count: usize = 0;
-        for (self.edges.items) |e| {
-            if (!e.isDeleted()) count += 1;
+    pub fn edgeCount(self: *const GraphEngine) usize {
+        var c: usize = 0;
+        for (0..self.edge_from.items.len) |i| {
+            if (self.edge_alive.isSet(i)) c += 1;
         }
-        return count;
+        return c;
     }
 
-    // ─── Helpers ──────────────────────────────────────────────────────
+    // ─── CSR Building ─────────────────────────────────────────────────
 
-    fn removeFromList(list: *std.array_list.Managed(EdgeId), value: EdgeId) void {
-        var i: usize = 0;
-        while (i < list.items.len) {
-            if (list.items[i] == value) {
-                _ = list.swapRemove(i);
-                return;
-            }
-            i += 1;
+    fn buildCSR(self: *GraphEngine, start_edge: u32, outgoing: bool) !CSR {
+        const edge_count = self.edge_from.items.len;
+        if (start_edge >= edge_count) return CSR.empty();
+
+        const node_capacity: u32 = @intCast(self.node_keys.items.len);
+        if (node_capacity == 0) return CSR.empty();
+
+        const offsets = try self.allocator.alloc(u32, node_capacity + 1);
+        errdefer self.allocator.free(offsets);
+        @memset(offsets, 0);
+
+        var live_count: u32 = 0;
+        for (start_edge..@as(u32, @intCast(edge_count))) |eidx| {
+            if (!self.edge_alive.isSet(eidx)) continue;
+            const node_id = if (outgoing) self.edge_from.items[eidx] else self.edge_to.items[eidx];
+            offsets[node_id + 1] += 1;
+            live_count += 1;
         }
+
+        if (live_count == 0) {
+            self.allocator.free(offsets);
+            return CSR.empty();
+        }
+
+        for (1..offsets.len) |i| {
+            offsets[i] += offsets[i - 1];
+        }
+
+        const targets = try self.allocator.alloc(NodeId, live_count);
+        errdefer self.allocator.free(targets);
+        const edge_idx = try self.allocator.alloc(u32, live_count);
+        errdefer self.allocator.free(edge_idx);
+
+        const pos = try self.allocator.alloc(u32, node_capacity);
+        defer self.allocator.free(pos);
+        @memcpy(pos, offsets[0..node_capacity]);
+
+        for (start_edge..@as(u32, @intCast(edge_count))) |eidx| {
+            if (!self.edge_alive.isSet(eidx)) continue;
+            const src = if (outgoing) self.edge_from.items[eidx] else self.edge_to.items[eidx];
+            const dst = if (outgoing) self.edge_to.items[eidx] else self.edge_from.items[eidx];
+            const p = pos[src];
+            targets[p] = dst;
+            edge_idx[p] = @intCast(eidx);
+            pos[src] = p + 1;
+        }
+
+        return .{ .offsets = offsets, .targets = targets, .edge_idx = edge_idx };
     }
+
+    /// Full compaction: rebuild base CSR from all live edges, clear delta.
+    /// Sets all_base_edges_alive = true so traversals skip edge_alive checks.
+    pub fn compact(self: *GraphEngine) !void {
+        self.base_out.deinit(self.allocator);
+        self.base_in.deinit(self.allocator);
+        self.base_out = try self.buildCSR(0, true);
+        self.base_in = try self.buildCSR(0, false);
+        self.delta_edges.clearRetainingCapacity();
+        self.all_base_edges_alive = true;
+        self.needs_compact = false;
+    }
+
+    // ─── View Types ───────────────────────────────────────────────────
+
+    pub const NodeView = struct {
+        id: NodeId,
+        key: []const u8,
+        node_type: []const u8,
+        prop_mask: u64,
+    };
+
+    pub const EdgeView = struct {
+        id: EdgeId,
+        from: NodeId,
+        to: NodeId,
+        edge_type: []const u8,
+        weight: f64,
+        prop_mask: u64,
+    };
 };
 
 // ─── Tests ────────────────────────────────────────────────────────────
 
-test "graph add nodes and edges" {
+test "graph_v2 add nodes and edges" {
     var g = GraphEngine.init(std.testing.allocator);
     defer g.deinit();
 
     _ = try g.addNode("service:auth", "service");
     _ = try g.addNode("service:user", "service");
-
     _ = try g.addEdge("service:auth", "service:user", "calls", 1.0);
 
     try std.testing.expectEqual(@as(usize, 2), g.nodeCount());
     try std.testing.expectEqual(@as(usize, 1), g.edgeCount());
 
-    const out = g.outgoingEdges("service:auth").?;
-    try std.testing.expectEqual(@as(usize, 1), out.len);
-
-    const inc = g.incomingEdges("service:user").?;
-    try std.testing.expectEqual(@as(usize, 1), inc.len);
+    // Delta edges should contain the new edge
+    try std.testing.expectEqual(@as(usize, 1), g.delta_edges.items.len);
+    try std.testing.expectEqual(@as(NodeId, 0), g.delta_edges.items[0].from);
+    try std.testing.expectEqual(@as(NodeId, 1), g.delta_edges.items[0].to);
 }
 
-test "graph duplicate node" {
+test "graph_v2 duplicate node" {
     var g = GraphEngine.init(std.testing.allocator);
     defer g.deinit();
 
@@ -323,18 +463,19 @@ test "graph duplicate node" {
     try std.testing.expect(result == error.DuplicateNode);
 }
 
-test "graph node properties" {
+test "graph_v2 node properties" {
     var g = GraphEngine.init(std.testing.allocator);
     defer g.deinit();
 
     _ = try g.addNode("n1", "service");
     try g.setNodeProperty("n1", "version", "2.1");
 
-    const node = g.getNode("n1").?;
-    try std.testing.expectEqualStrings("2.1", node.properties.get("version").?);
+    const val = g.node_props.get(0, "version");
+    try std.testing.expectEqualStrings("2.1", val.?);
+    try std.testing.expect(g.flags.has_node_props);
 }
 
-test "graph remove node" {
+test "graph_v2 remove node" {
     var g = GraphEngine.init(std.testing.allocator);
     defer g.deinit();
 
@@ -346,9 +487,10 @@ test "graph remove node" {
     try std.testing.expectEqual(@as(usize, 1), g.nodeCount());
     try std.testing.expectEqual(@as(usize, 0), g.edgeCount());
     try std.testing.expect(g.getNode("a") == null);
+    try std.testing.expect(!g.all_base_edges_alive);
 }
 
-test "graph remove edge" {
+test "graph_v2 remove edge" {
     var g = GraphEngine.init(std.testing.allocator);
     defer g.deinit();
 
@@ -359,4 +501,107 @@ test "graph remove edge" {
     try g.removeEdge(eid);
     try std.testing.expectEqual(@as(usize, 0), g.edgeCount());
     try std.testing.expect(g.getEdge(eid) == null);
+}
+
+test "graph_v2 compact moves delta to base" {
+    var g = GraphEngine.init(std.testing.allocator);
+    defer g.deinit();
+
+    _ = try g.addNode("a", "t");
+    _ = try g.addNode("b", "t");
+    _ = try g.addNode("c", "t");
+    _ = try g.addEdge("a", "b", "link", 1.0);
+    _ = try g.addEdge("b", "c", "link", 1.0);
+
+    // Before compact: edges in delta
+    try std.testing.expectEqual(@as(usize, 2), g.delta_edges.items.len);
+    try std.testing.expectEqual(@as(usize, 0), g.base_out.neighbors(0).len);
+
+    try g.compact();
+
+    // After compact: edges in base, delta cleared
+    try std.testing.expectEqual(@as(usize, 0), g.delta_edges.items.len);
+    try std.testing.expectEqual(@as(usize, 1), g.base_out.neighbors(0).len);
+    try std.testing.expectEqual(@as(NodeId, 1), g.base_out.neighbors(0)[0]);
+    try std.testing.expect(g.all_base_edges_alive);
+}
+
+test "graph_v2 type interning" {
+    var g = GraphEngine.init(std.testing.allocator);
+    defer g.deinit();
+
+    _ = try g.addNode("a", "service");
+    _ = try g.addNode("b", "service");
+    _ = try g.addNode("c", "database");
+
+    try std.testing.expectEqual(g.node_type_id.items[0], g.node_type_id.items[1]);
+    try std.testing.expect(g.node_type_id.items[0] != g.node_type_id.items[2]);
+    try std.testing.expectEqual(@as(u16, 2), g.type_intern.count());
+}
+
+test "graph_v2 type mask filtering" {
+    var g = GraphEngine.init(std.testing.allocator);
+    defer g.deinit();
+
+    _ = try g.addNode("a", "t");
+    _ = try g.addNode("b", "t");
+    _ = try g.addNode("c", "t");
+    _ = try g.addEdge("a", "b", "calls", 1.0);
+    _ = try g.addEdge("a", "c", "owns", 1.0);
+
+    const calls_id = g.type_intern.find("calls").?;
+    const calls_mask = StringIntern.mask(calls_id);
+    try std.testing.expect(g.node_out_type_mask.items[0] & calls_mask != 0);
+
+    const owns_id = g.type_intern.find("owns").?;
+    const owns_mask = StringIntern.mask(owns_id);
+    try std.testing.expect(g.node_out_type_mask.items[0] & owns_mask != 0);
+
+    try std.testing.expectEqual(@as(TypeMask, 0), g.node_out_type_mask.items[1]);
+}
+
+test "graph_v2 uniform weights flag" {
+    var g = GraphEngine.init(std.testing.allocator);
+    defer g.deinit();
+
+    _ = try g.addNode("a", "t");
+    _ = try g.addNode("b", "t");
+
+    try std.testing.expect(g.flags.uniform_weights);
+    _ = try g.addEdge("a", "b", "link", 1.0);
+    try std.testing.expect(g.flags.uniform_weights);
+    _ = try g.addEdge("b", "a", "link", 2.5);
+    try std.testing.expect(!g.flags.uniform_weights);
+}
+
+test "graph_v2 edge properties" {
+    var g = GraphEngine.init(std.testing.allocator);
+    defer g.deinit();
+
+    _ = try g.addNode("a", "t");
+    _ = try g.addNode("b", "t");
+    const eid = try g.addEdge("a", "b", "link", 1.0);
+
+    try g.setEdgeProperty(eid, "latency", "50ms");
+    const val = g.edge_props.get(eid, "latency");
+    try std.testing.expectEqualStrings("50ms", val.?);
+    try std.testing.expect(g.flags.has_edge_props);
+}
+
+test "graph_v2 all_base_edges_alive flag" {
+    var g = GraphEngine.init(std.testing.allocator);
+    defer g.deinit();
+
+    _ = try g.addNode("a", "t");
+    _ = try g.addNode("b", "t");
+    _ = try g.addEdge("a", "b", "link", 1.0);
+
+    try g.compact();
+    try std.testing.expect(g.all_base_edges_alive);
+
+    try g.removeEdge(0);
+    try std.testing.expect(!g.all_base_edges_alive);
+
+    try g.compact();
+    try std.testing.expect(g.all_base_edges_alive);
 }

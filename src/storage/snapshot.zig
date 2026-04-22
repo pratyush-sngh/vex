@@ -7,7 +7,7 @@ const NodeId = graph_mod.NodeId;
 const EdgeId = graph_mod.EdgeId;
 
 const MAGIC = [_]u8{ 'Z', 'G', 'D', 'B' };
-const FORMAT_VERSION: u8 = 1;
+const FORMAT_VERSION: u8 = 2; // v2: SoA graph layout
 
 // ── Binary write helpers ─────────────────────────────────────────────
 
@@ -29,6 +29,12 @@ fn appendF64(buf: *std.array_list.Managed(u8), value: f64) !void {
     try buf.appendSlice(&bytes);
 }
 
+fn appendU16(buf: *std.array_list.Managed(u8), value: u16) !void {
+    var bytes: [2]u8 = undefined;
+    std.mem.writeInt(u16, &bytes, value, .little);
+    try buf.appendSlice(&bytes);
+}
+
 fn appendBytes(buf: *std.array_list.Managed(u8), data: []const u8) !void {
     try appendU32(buf, @intCast(data.len));
     try buf.appendSlice(data);
@@ -45,6 +51,13 @@ const BinReader = struct {
         const b = self.data[self.pos];
         self.pos += 1;
         return b;
+    }
+
+    fn readU16(self: *BinReader) !u16 {
+        if (self.pos + 2 > self.data.len) return error.CorruptedData;
+        const v = std.mem.readInt(u16, self.data[self.pos..][0..2], .little);
+        self.pos += 2;
+        return v;
     }
 
     fn readU32(self: *BinReader) !u32 {
@@ -106,10 +119,16 @@ fn readFileAll(file: std.Io.File, io: std.Io, allocator: Allocator, max_len: usi
     return buf;
 }
 
-// ── Save ─────────────────────────────────────────────────────────────
+// ── Save (v2 format) ────────────────────────────────────────────────
+//
+// Format v2:
+//   Header: MAGIC(4) + VERSION(1) + Timestamp(i64)
+//   KV: count(u32) + [key(lenpfx) + value(lenpfx) + has_ttl(u8) + expires(i64)?]*
+//   Interned types: count(u16) + [type_string(lenpfx)]*
+//   Nodes: count(u32) + [alive(u8) + key(lenpfx) + type_id(u16) + prop_count(u32) + [key(lenpfx)+val(lenpfx)]*]*
+//   Edges: count(u32) + [alive(u8) + from(u32) + to(u32) + type_id(u16) + weight(f64) + prop_count(u32) + [k+v]*]*
+//   CRC-32(u32)
 
-/// Write a full binary snapshot of KVStore + GraphEngine to disk.
-/// Format: Header | KV Section | Graph Section | CRC-32 footer.
 pub fn save(
     io: std.Io,
     allocator: Allocator,
@@ -126,66 +145,72 @@ pub fn save(
     try appendI64(&buf, std.Io.Timestamp.now(io, .real).toMilliseconds());
 
     // KV section
-    try appendU32(&buf, @intCast(kv.map.count()));
+    try appendU32(&buf, kv.live_count);
     {
         var it = kv.map.iterator();
         while (it.next()) |entry| {
+            if (entry.value_ptr.flags.deleted) continue;
             try appendBytes(&buf, entry.key_ptr.*);
             try appendBytes(&buf, entry.value_ptr.value);
-            if (entry.value_ptr.expires_at) |exp| {
+            if (entry.value_ptr.flags.has_ttl) {
                 try buf.append(1);
-                try appendI64(&buf, exp);
+                try appendI64(&buf, entry.value_ptr.expires_at);
             } else {
                 try buf.append(0);
             }
         }
     }
 
-    // Graph: Nodes (dense array, including soft-deleted)
-    const node_count: u32 = @intCast(graph.nodes.items.len);
+    // Interned types
+    const type_count = graph.type_intern.count();
+    try appendU16(&buf, type_count);
+    for (0..type_count) |i| {
+        try appendBytes(&buf, graph.type_intern.resolve(@intCast(i)));
+    }
+
+    // Nodes (SoA serialized per-node)
+    const node_count: u32 = @intCast(graph.node_keys.items.len);
     try appendU32(&buf, node_count);
-    for (graph.nodes.items) |node| {
-        try buf.append(if (node.deleted) @as(u8, 1) else @as(u8, 0));
-        try appendBytes(&buf, node.key);
-        try appendBytes(&buf, node.node_type);
-        try appendU32(&buf, @intCast(node.properties.count()));
-        {
-            var it = node.properties.iterator();
-            while (it.next()) |prop| {
-                try appendBytes(&buf, prop.key_ptr.*);
-                try appendBytes(&buf, prop.value_ptr.*);
+    for (0..node_count) |i| {
+        const alive = graph.node_alive.isSet(i);
+        try buf.append(if (alive) @as(u8, 1) else @as(u8, 0));
+        try appendBytes(&buf, graph.node_keys.items[i]);
+        try appendU16(&buf, graph.node_type_id.items[i]);
+
+        // Properties from shared PropertyStore
+        const prop_count = graph.node_props.countProps(@intCast(i));
+        try appendU32(&buf, prop_count);
+        if (prop_count > 0) {
+            const pairs = try graph.node_props.collectAll(@intCast(i), allocator);
+            defer allocator.free(pairs);
+            for (pairs) |pair| {
+                try appendBytes(&buf, pair.key);
+                try appendBytes(&buf, pair.value);
             }
         }
     }
 
-    // Graph: Edges (dense array, including tombstoned)
-    const edge_count: u32 = @intCast(graph.edges.items.len);
+    // Edges (SoA serialized per-edge)
+    const edge_count: u32 = @intCast(graph.edge_from.items.len);
     try appendU32(&buf, edge_count);
-    for (graph.edges.items) |edge| {
-        try appendU32(&buf, edge.from);
-        try appendU32(&buf, edge.to);
-        try appendBytes(&buf, edge.edge_type);
-        try appendF64(&buf, edge.weight);
-        try appendU32(&buf, @intCast(edge.properties.count()));
-        {
-            var it = edge.properties.iterator();
-            while (it.next()) |prop| {
-                try appendBytes(&buf, prop.key_ptr.*);
-                try appendBytes(&buf, prop.value_ptr.*);
+    for (0..edge_count) |i| {
+        const alive = graph.edge_alive.isSet(i);
+        try buf.append(if (alive) @as(u8, 1) else @as(u8, 0));
+        try appendU32(&buf, graph.edge_from.items[i]);
+        try appendU32(&buf, graph.edge_to.items[i]);
+        try appendU16(&buf, graph.edge_type_id.items[i]);
+        try appendF64(&buf, graph.edge_weight.items[i]);
+
+        const prop_count = graph.edge_props.countProps(@intCast(i));
+        try appendU32(&buf, prop_count);
+        if (prop_count > 0) {
+            const pairs = try graph.edge_props.collectAll(@intCast(i), allocator);
+            defer allocator.free(pairs);
+            for (pairs) |pair| {
+                try appendBytes(&buf, pair.key);
+                try appendBytes(&buf, pair.value);
             }
         }
-    }
-
-    // Graph: Adjacency lists
-    try appendU32(&buf, node_count);
-    for (graph.outgoing.items) |list| {
-        try appendU32(&buf, @intCast(list.items.len));
-        for (list.items) |eid| try appendU32(&buf, eid);
-    }
-    try appendU32(&buf, node_count);
-    for (graph.incoming.items) |list| {
-        try appendU32(&buf, @intCast(list.items.len));
-        for (list.items) |eid| try appendU32(&buf, eid);
     }
 
     // CRC-32 footer
@@ -196,10 +221,8 @@ pub fn save(
     try file.writeStreamingAll(io, buf.items);
 }
 
-// ── Load ─────────────────────────────────────────────────────────────
+// ── Load (v2 format) ────────────────────────────────────────────────
 
-/// Load a binary snapshot into KVStore + GraphEngine.
-/// Returns cleanly if the file does not exist (fresh start).
 pub fn load(
     io: std.Io,
     allocator: Allocator,
@@ -218,7 +241,6 @@ pub fn load(
 
     if (raw.len < 4 + 1 + 8 + 4) return error.CorruptedData;
 
-    // Verify CRC (last 4 bytes are checksum of everything before them)
     const payload = raw[0 .. raw.len - 4];
     const stored_crc = std.mem.readInt(u32, raw[raw.len - 4 ..][0..4], .little);
     if (stored_crc != computeCrc32(payload)) return error.ChecksumMismatch;
@@ -230,7 +252,7 @@ pub fn load(
     if (!std.mem.eql(u8, magic, &MAGIC)) return error.InvalidMagic;
     const version = try r.readByte();
     if (version != FORMAT_VERSION) return error.UnsupportedVersion;
-    _ = try r.readI64(); // snapshot timestamp (informational)
+    _ = try r.readI64(); // timestamp
 
     // KV section
     const kv_count = try r.readU32();
@@ -242,82 +264,95 @@ pub fn load(
         try kv.restoreEntry(key, value, expires);
     }
 
-    // Graph: Nodes
+    // Interned types — restore in order so IDs match
+    const type_count = try r.readU16();
+    for (0..type_count) |_| {
+        const type_str = try r.readLenPrefixed();
+        _ = try graph.type_intern.intern(type_str);
+    }
+
+    // Nodes
     const node_count = try r.readU32();
+    graph.bulk_loading = true;
     for (0..node_count) |_| {
-        const deleted = (try r.readByte()) == 1;
+        const alive = (try r.readByte()) == 1;
         const key_raw = try r.readLenPrefixed();
-        const type_raw = try r.readLenPrefixed();
+        const type_id = try r.readU16();
 
         const owned_key = try allocator.dupe(u8, key_raw);
         errdefer allocator.free(owned_key);
-        const owned_type = try allocator.dupe(u8, type_raw);
-        errdefer allocator.free(owned_type);
 
-        var props = std.StringHashMap([]const u8).init(allocator);
+        // Append to SoA arrays directly
+        const id: NodeId = @intCast(graph.node_keys.items.len);
+        try graph.node_keys.append(owned_key);
+        try graph.node_type_id.append(type_id);
+        try graph.node_prop_mask.append(0);
+        try graph.node_out_type_mask.append(0);
+        try graph.node_in_type_mask.append(0);
+        try graph.node_alive.resize(id + 1, true);
+        if (alive) {
+            graph.node_alive.set(id);
+            try graph.key_to_id.put(owned_key, id);
+        } else {
+            graph.node_alive.unset(id);
+        }
+
+        // Properties
         const pc = try r.readU32();
         for (0..pc) |_| {
             const pk = try r.readLenPrefixed();
             const pv = try r.readLenPrefixed();
-            try props.put(try allocator.dupe(u8, pk), try allocator.dupe(u8, pv));
+            try graph.node_props.set(id, pk, pv);
         }
-
-        const id: NodeId = @intCast(graph.nodes.items.len);
-        try graph.nodes.append(.{
-            .key = owned_key,
-            .node_type = owned_type,
-            .properties = props,
-            .deleted = deleted,
-        });
-
-        if (!deleted) try graph.key_to_id.put(owned_key, id);
-        try graph.outgoing.append(std.array_list.Managed(EdgeId).init(allocator));
-        try graph.incoming.append(std.array_list.Managed(EdgeId).init(allocator));
+        if (pc > 0) graph.flags.has_node_props = true;
     }
 
-    // Graph: Edges
+    // Edges
     const edge_count = try r.readU32();
     for (0..edge_count) |_| {
+        const alive = (try r.readByte()) == 1;
         const from = try r.readU32();
         const to = try r.readU32();
-        const et_raw = try r.readLenPrefixed();
+        const type_id = try r.readU16();
         const weight = try r.readF64();
 
-        const owned_et = try allocator.dupe(u8, et_raw);
-        var props = std.StringHashMap([]const u8).init(allocator);
+        const eid: EdgeId = @intCast(graph.edge_from.items.len);
+        try graph.edge_from.append(from);
+        try graph.edge_to.append(to);
+        try graph.edge_type_id.append(type_id);
+        try graph.edge_weight.append(weight);
+        try graph.edge_prop_mask.append(0);
+        try graph.edge_alive.resize(eid + 1, true);
+        if (alive) {
+            graph.edge_alive.set(eid);
+            // Update type masks
+            if (from < graph.node_out_type_mask.items.len) {
+                const bit = @import("../engine/string_intern.zig").StringIntern.mask(type_id);
+                graph.node_out_type_mask.items[from] |= bit;
+                if (to < graph.node_in_type_mask.items.len) {
+                    graph.node_in_type_mask.items[to] |= bit;
+                }
+            }
+        } else {
+            graph.edge_alive.unset(eid);
+        }
+
+        if (weight != 1.0) graph.flags.uniform_weights = false;
+
         const pc = try r.readU32();
         for (0..pc) |_| {
             const pk = try r.readLenPrefixed();
             const pv = try r.readLenPrefixed();
-            try props.put(try allocator.dupe(u8, pk), try allocator.dupe(u8, pv));
+            try graph.edge_props.set(eid, pk, pv);
         }
-
-        try graph.edges.append(.{
-            .from = from,
-            .to = to,
-            .edge_type = owned_et,
-            .weight = weight,
-            .properties = props,
-        });
+        if (pc > 0) graph.flags.has_edge_props = true;
     }
 
-    // Graph: Adjacency outgoing
-    const out_n = try r.readU32();
-    for (0..out_n) |i| {
-        const len = try r.readU32();
-        for (0..len) |_| {
-            try graph.outgoing.items[i].append(try r.readU32());
-        }
-    }
+    graph.bulk_loading = false;
+    if (graph.type_intern.count() > 1) graph.flags.is_untyped = false;
 
-    // Graph: Adjacency incoming
-    const in_n = try r.readU32();
-    for (0..in_n) |i| {
-        const len = try r.readU32();
-        for (0..len) |_| {
-            try graph.incoming.items[i].append(try r.readU32());
-        }
-    }
+    // Build CSR from loaded data
+    try graph.compact();
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -325,7 +360,7 @@ pub fn load(
 test "snapshot round-trip" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
-    const path = "/tmp/vex_test.zdb";
+    const path = "/tmp/vex_test_v2.zdb";
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
     var kv = KVStore.init(allocator, io);
@@ -357,7 +392,8 @@ test "snapshot round-trip" {
     try std.testing.expectEqual(@as(usize, 1), g2.edgeCount());
     const na = g2.getNode("a").?;
     try std.testing.expectEqualStrings("svc", na.node_type);
-    try std.testing.expectEqualStrings("3", na.properties.get("version").?);
+    // Check property via PropertyStore
+    try std.testing.expectEqualStrings("3", g2.node_props.get(na.id, "version").?);
     const nb = g2.getNode("b").?;
     try std.testing.expectEqualStrings("db", nb.node_type);
 }
@@ -376,7 +412,7 @@ test "snapshot missing file returns cleanly" {
 test "snapshot corrupted CRC" {
     const io = std.testing.io;
     const allocator = std.testing.allocator;
-    const path = "/tmp/vex_crc_test.zdb";
+    const path = "/tmp/vex_crc_test_v2.zdb";
     defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
 
     var kv = KVStore.init(allocator, io);

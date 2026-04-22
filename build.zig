@@ -58,6 +58,21 @@ pub fn build(b: *std.Build) void {
     const bench_hashmap_step = b.step("bench-hashmap", "Benchmark std vs verztable string maps");
     bench_hashmap_step.dependOn(&run_hashmap_bench.step);
 
+    // KV engine benchmark
+    const kv_bench = b.addExecutable(.{
+        .name = "kv_bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/engine/kv_bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const run_kv_bench = b.addRunArtifact(kv_bench);
+    if (b.args) |args| run_kv_bench.addArgs(args);
+    const bench_kv_step = b.step("bench-kv", "Benchmark KV engine (SET/GET/DEL)");
+    bench_kv_step.dependOn(&run_kv_bench.step);
+
     const persistence_bench = b.addExecutable(.{
         .name = "persistence_bench",
         .root_module = b.createModule(.{

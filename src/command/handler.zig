@@ -351,10 +351,10 @@ pub const CommandHandler = struct {
             for (graph_to_delete.items) |k| self.allocator.free(k);
             graph_to_delete.deinit();
         }
-        for (self.graph.nodes.items) |node| {
-            if (node.deleted) continue;
-            if (stripGraphDbPrefix(self, node.key) != null) {
-                const dup = self.allocator.dupe(u8, node.key) catch {
+        var giter = self.graph.key_to_id.iterator();
+        while (giter.next()) |entry| {
+            if (stripGraphDbPrefix(self, entry.key_ptr.*) != null) {
+                const dup = self.allocator.dupe(u8, entry.key_ptr.*) catch {
                     try resp.serializeError(w, "internal error");
                     return;
                 };
@@ -420,8 +420,8 @@ pub const CommandHandler = struct {
         }
 
         const now = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
-        if (src_entry.expires_at) |exp| {
-            const remaining = exp - now;
+        if (src_entry.flags.has_ttl) {
+            const remaining = src_entry.expires_at - now;
             if (remaining <= 0) {
                 _ = self.kv.delete(src);
                 try resp.serializeInteger(w, 0);
@@ -539,17 +539,21 @@ pub const CommandHandler = struct {
         };
 
         // Return as array: [key, type, prop_count, k1, v1, k2, v2, ...]
-        const prop_count = node.properties.count();
+        const prop_count = self.graph.node_props.countProps(node.id);
+        const pairs = self.graph.node_props.collectAll(node.id, self.allocator) catch {
+            try resp.serializeError(w, "internal error");
+            return;
+        };
+        defer self.allocator.free(pairs);
         const total: usize = 3 + prop_count * 2;
         try resp.serializeArrayHeader(w, total);
         const user_key = stripGraphDbPrefix(self, node.key) orelse node.key;
         try resp.serializeBulkString(w, user_key);
         try resp.serializeBulkString(w, node.node_type);
         try resp.serializeInteger(w, @intCast(prop_count));
-        var iter = node.properties.iterator();
-        while (iter.next()) |entry| {
-            try resp.serializeBulkString(w, entry.key_ptr.*);
-            try resp.serializeBulkString(w, entry.value_ptr.*);
+        for (pairs) |pair| {
+            try resp.serializeBulkString(w, pair.key);
+            try resp.serializeBulkString(w, pair.value);
         }
     }
 
@@ -817,14 +821,15 @@ pub const CommandHandler = struct {
     /// GRAPH.STATS
     fn cmdGraphStats(self: *CommandHandler, w: *std.Io.Writer) !void {
         var nodes: usize = 0;
-        for (self.graph.nodes.items) |node| {
-            if (node.deleted) continue;
-            if (stripGraphDbPrefix(self, node.key) != null) nodes += 1;
+        var key_iter = self.graph.key_to_id.iterator();
+        while (key_iter.next()) |entry| {
+            if (stripGraphDbPrefix(self, entry.key_ptr.*) != null) nodes += 1;
         }
         var edges: usize = 0;
-        for (self.graph.edges.items) |edge| {
-            if (edge.isDeleted()) continue;
-            const from_node = self.graph.getNodeById(edge.from) orelse continue;
+        for (0..self.graph.edge_from.items.len) |eidx| {
+            if (!self.graph.edge_alive.isSet(eidx)) continue;
+            const from_id = self.graph.edge_from.items[eidx];
+            const from_node = self.graph.getNodeById(from_id) orelse continue;
             if (stripGraphDbPrefix(self, from_node.key) != null) edges += 1;
         }
         try resp.serializeArrayHeader(w, 4);

@@ -14,14 +14,26 @@ const span = @import("../perf/span.zig");
 const READ_BUF_SIZE = 64 * 1024;
 const MAX_NEW_FDS = 256;
 
+// ─── Precomputed DB prefixes (fix #4) ───────────────────────────────
+// Avoids std.fmt.bufPrint("db:{d}:") per command (~20ns saved per op)
+const DB_PREFIXES = blk: {
+    var prefixes: [16][]const u8 = undefined;
+    for (0..16) |i| {
+        prefixes[i] = std.fmt.comptimePrint("db:{d}:", .{i});
+    }
+    break :blk prefixes;
+};
+
 // ─── Connection ──────────────────────────────────────────────────────
 
 const Connection = struct {
     fd: i32,
     selected_db: u8,
     accum: std.array_list.Managed(u8),
+    accum_pos: usize, // FIX #1: head index — avoids memmove on consumeAccum
     write_buf: std.array_list.Managed(u8),
     write_offset: usize,
+    write_registered: bool, // FIX #2: track write interest to avoid redundant syscalls
 
     fn init(allocator: Allocator, fd: i32) !*Connection {
         const conn = try allocator.create(Connection);
@@ -29,8 +41,10 @@ const Connection = struct {
             .fd = fd,
             .selected_db = 0,
             .accum = std.array_list.Managed(u8).init(allocator),
+            .accum_pos = 0,
             .write_buf = std.array_list.Managed(u8).init(allocator),
             .write_offset = 0,
+            .write_registered = false,
         };
         return conn;
     }
@@ -39,6 +53,27 @@ const Connection = struct {
         self.accum.deinit();
         self.write_buf.deinit();
         allocator.destroy(self);
+    }
+
+    /// Remaining unprocessed data in the accumulator.
+    fn accumData(self: *const Connection) []const u8 {
+        return self.accum.items[self.accum_pos..];
+    }
+
+    /// Advance the read position (no memmove). Compacts only when fully consumed.
+    fn advanceAccum(self: *Connection, n: usize) void {
+        self.accum_pos += n;
+        if (self.accum_pos >= self.accum.items.len) {
+            // Fully consumed — reset to reuse buffer capacity
+            self.accum.clearRetainingCapacity();
+            self.accum_pos = 0;
+        } else if (self.accum_pos > 32768) {
+            // Compact when head is far advanced to avoid unbounded growth
+            const remaining = self.accum.items.len - self.accum_pos;
+            std.mem.copyForwards(u8, self.accum.items[0..remaining], self.accum.items[self.accum_pos..]);
+            self.accum.shrinkRetainingCapacity(remaining);
+            self.accum_pos = 0;
+        }
     }
 };
 
@@ -58,7 +93,6 @@ pub const Worker = struct {
     aof: ?*AOF,
     keys_mode: KeysMode,
     profile: ?*span.Profile,
-    // Bounded ring buffer for new fds pushed by the accept thread.
     new_fds: [MAX_NEW_FDS]i32,
     new_fd_head: std.atomic.Value(usize),
     new_fd_tail: std.atomic.Value(usize),
@@ -96,24 +130,18 @@ pub const Worker = struct {
         };
     }
 
-    /// Called by the accept thread to hand off a new client fd to this worker.
-    /// Lock-free single-producer (accept thread) is assumed; multiple producers
-    /// would need a CAS loop, but our architecture has one accept thread.
     pub fn pushNewFd(self: *Worker, fd: i32) void {
         const tail = self.new_fd_tail.load(.monotonic);
         const head = self.new_fd_head.load(.acquire);
-        // If the ring buffer is full, drop the connection.
         if (tail -% head >= MAX_NEW_FDS) {
             _ = std.c.close(fd);
             return;
         }
         self.new_fds[tail % MAX_NEW_FDS] = fd;
         self.new_fd_tail.store(tail +% 1, .release);
-        // Wake the event loop so it picks up the new fd promptly.
         self.loop.notify();
     }
 
-    /// Main loop — runs on the worker thread, never returns.
     pub fn run(self: *Worker) void {
         var event_buf: [128]EventLoop.Event = undefined;
 
@@ -163,6 +191,9 @@ pub const Worker = struct {
     }
 
     fn registerConnection(self: *Worker, fd: i32) void {
+        // FIX #6: Set TCP_NODELAY on accepted socket
+        setTcpNoDelay(fd);
+
         const conn = Connection.init(self.allocator, fd) catch {
             _ = std.c.close(fd);
             return;
@@ -194,9 +225,8 @@ pub const Worker = struct {
         if (rc <= 0) {
             if (rc < 0) {
                 const err = std.c.errno(rc);
-                if (err == .AGAIN) return; // no data yet
+                if (err == .AGAIN) return;
             }
-            // 0 = EOF, or fatal error
             self.closeConn(conn.fd);
             return;
         }
@@ -207,25 +237,27 @@ pub const Worker = struct {
             return;
         };
 
-        // Process as many complete commands as we can from the accumulator.
-        while (conn.accum.items.len > 0) {
+        // Process ALL complete commands from this read (FIX #3: batch before flush)
+        while (conn.accumData().len > 0) {
             if (!self.processOneCommand(conn)) break;
         }
 
-        // Try to flush any pending writes immediately.
+        // FIX #2+3: Single flush attempt after processing all commands.
+        // Try direct write first — avoids enableWrite/disableWrite syscalls
+        // for small responses that fit in the TCP send buffer.
         if (conn.write_buf.items.len > conn.write_offset) {
-            self.flushWrite(conn);
+            self.directFlush(conn);
         }
     }
 
     fn processOneCommand(self: *Worker, conn: *Connection) bool {
-        const data = conn.accum.items;
+        const data = conn.accumData(); // FIX #1: uses head index, no copy
 
-        // Fast RESP path: manual parse avoids full parser allocations.
+        // Fast RESP path: zero-allocation manual parse.
         if (data.len >= 4 and data[0] == '*') {
             if (parseFastResp(data)) |result| {
                 self.dispatchCommand(conn, result.args[0..result.argc]);
-                consumeAccum(&conn.accum, result.consumed);
+                conn.advanceAccum(result.consumed); // FIX #1: advance, no memmove
                 return true;
             }
         }
@@ -242,7 +274,7 @@ pub const Worker = struct {
             }
 
             self.dispatchCommand(conn, parts);
-            consumeAccum(&conn.accum, eol + 2);
+            conn.advanceAccum(eol + 2);
             return true;
         }
 
@@ -264,127 +296,129 @@ pub const Worker = struct {
         }
 
         self.dispatchCommand(conn, args.items);
-        consumeAccum(&conn.accum, parser.pos);
+        conn.advanceAccum(parser.pos);
         return true;
     }
 
     fn dispatchCommand(self: *Worker, conn: *Connection, args: []const []const u8) void {
         if (args.len == 0) return;
 
-        // Handle SELECT per-connection without going through CommandHandler.
+        // FIX #5: Fast command dispatch via first byte + length
+        // Avoids linear chain of equalsAsciiUpper comparisons
+        if (self.ckv) |ckv| {
+            if (self.executeHotFast(conn, args, ckv)) return;
+        }
+
         if (isSelect(args)) {
             self.handleSelect(conn, args);
             return;
         }
 
-        // Hot-path: use ConcurrentKV directly (no global mutex needed)
-        if (self.ckv) |ckv| {
-            if (self.executeHot(conn, args, ckv)) return;
-        }
-
         self.executeCommand(conn, args);
     }
 
-    /// Execute common KV commands directly on ConcurrentKV (lock-free hot path).
-    /// Returns true if handled, false to fall back to CommandHandler.
-    fn executeHot(self: *Worker, conn: *Connection, args: []const []const u8, ckv: *ConcurrentKV) bool {
+    /// FIX #5: Fast command dispatch using (length, first_byte) instead of
+    /// sequential equalsAsciiUpper chain. Eliminates ~15ns of string comparisons.
+    fn executeHotFast(self: *Worker, conn: *Connection, args: []const []const u8, ckv: *ConcurrentKV) bool {
         if (args.len == 0) return false;
         const cmd = args[0];
+        if (cmd.len == 0) return false;
 
-        if (equalsAsciiUpper(cmd, "PING")) {
-            if (args.len > 1) {
-                writeBulkTo(&conn.write_buf, args[1]);
-            } else {
-                conn.write_buf.appendSlice("+PONG\r\n") catch {};
-            }
-            return true;
+        const first = std.ascii.toUpper(cmd[0]);
+        switch (cmd.len) {
+            3 => switch (first) {
+                'G' => { // GET
+                    if (args.len == 2 and equalsAsciiUpper(cmd, "GET")) {
+                        const ns_key = nsKey(conn.selected_db, args[1]) orelse return false;
+                        _ = ckv.getAndWriteBulk(ns_key, &conn.write_buf);
+                        return true;
+                    }
+                },
+                'S' => { // SET
+                    if (args.len >= 3 and equalsAsciiUpper(cmd, "SET")) {
+                        const ns_key = nsKey(conn.selected_db, args[1]) orelse return false;
+                        if (args.len >= 5 and equalsAsciiUpper(args[3], "EX")) {
+                            const t = std.fmt.parseInt(i64, args[4], 10) catch return false;
+                            ckv.setEx(ns_key, args[2], t) catch return false;
+                        } else if (args.len >= 5 and equalsAsciiUpper(args[3], "PX")) {
+                            const t = std.fmt.parseInt(i64, args[4], 10) catch return false;
+                            ckv.setPx(ns_key, args[2], t) catch return false;
+                        } else {
+                            ckv.set(ns_key, args[2]) catch return false;
+                        }
+                        if (self.aof) |a| a.logCommand(args);
+                        conn.write_buf.appendSlice("+OK\r\n") catch {};
+                        return true;
+                    }
+                },
+                'D' => { // DEL
+                    if (args.len == 2 and equalsAsciiUpper(cmd, "DEL")) {
+                        const ns_key = nsKey(conn.selected_db, args[1]) orelse return false;
+                        if (ckv.delete(ns_key)) {
+                            if (self.aof) |a| a.logCommand(args);
+                            conn.write_buf.appendSlice(":1\r\n") catch {};
+                        } else {
+                            conn.write_buf.appendSlice(":0\r\n") catch {};
+                        }
+                        return true;
+                    }
+                },
+                'T' => { // TTL
+                    if (args.len == 2 and equalsAsciiUpper(cmd, "TTL")) {
+                        const ns_key = nsKey(conn.selected_db, args[1]) orelse return false;
+                        if (!ckv.exists(ns_key)) {
+                            conn.write_buf.appendSlice(":-2\r\n") catch {};
+                        } else if (ckv.ttl(ns_key)) |sec| {
+                            writeIntTo(&conn.write_buf, sec);
+                        } else {
+                            conn.write_buf.appendSlice(":-1\r\n") catch {};
+                        }
+                        return true;
+                    }
+                },
+                else => {},
+            },
+            4 => if (first == 'P' and equalsAsciiUpper(cmd, "PING")) { // PING
+                if (args.len > 1) {
+                    writeBulkTo(&conn.write_buf, args[1]);
+                } else {
+                    conn.write_buf.appendSlice("+PONG\r\n") catch {};
+                }
+                return true;
+            },
+            6 => if (first == 'E' and args.len == 2 and equalsAsciiUpper(cmd, "EXISTS")) { // EXISTS
+                const ns_key = nsKey(conn.selected_db, args[1]) orelse return false;
+                if (ckv.exists(ns_key)) {
+                    conn.write_buf.appendSlice(":1\r\n") catch {};
+                } else {
+                    conn.write_buf.appendSlice(":0\r\n") catch {};
+                }
+                return true;
+            },
+            7 => switch (first) {
+                'C' => { // COMMAND
+                    if (equalsAsciiUpper(cmd, "COMMAND")) {
+                        conn.write_buf.appendSlice("+OK\r\n") catch {};
+                        return true;
+                    }
+                },
+                'F' => { // FLUSHDB
+                    if (equalsAsciiUpper(cmd, "FLUSHDB")) {
+                        ckv.flushdb();
+                        conn.write_buf.appendSlice("+OK\r\n") catch {};
+                        return true;
+                    }
+                },
+                else => {},
+            },
+            else => {},
         }
-
-        if (equalsAsciiUpper(cmd, "COMMAND")) {
-            conn.write_buf.appendSlice("+OK\r\n") catch {};
-            return true;
-        }
-
-        // Build namespaced key: "db:N:userkey"
-        const db = conn.selected_db;
-
-        if (equalsAsciiUpper(cmd, "GET") and args.len == 2) {
-            var key_buf: [512]u8 = undefined;
-            const ns_key = namespacedKey(db, args[1], &key_buf) orelse return false;
-            _ = ckv.getAndWriteBulk(ns_key, &conn.write_buf);
-            return true;
-        }
-
-        if (equalsAsciiUpper(cmd, "SET") and args.len >= 3) {
-            var key_buf: [512]u8 = undefined;
-            const ns_key = namespacedKey(db, args[1], &key_buf) orelse return false;
-            if (args.len >= 5 and equalsAsciiUpper(args[3], "EX")) {
-                const ttl = std.fmt.parseInt(i64, args[4], 10) catch return false;
-                ckv.setEx(ns_key, args[2], ttl) catch return false;
-            } else if (args.len >= 5 and equalsAsciiUpper(args[3], "PX")) {
-                const ttl = std.fmt.parseInt(i64, args[4], 10) catch return false;
-                ckv.setPx(ns_key, args[2], ttl) catch return false;
-            } else {
-                ckv.set(ns_key, args[2]) catch return false;
-            }
-            if (self.aof) |a| {
-                a.logCommand(args);
-            }
-            conn.write_buf.appendSlice("+OK\r\n") catch {};
-            return true;
-        }
-
-        if (equalsAsciiUpper(cmd, "DEL") and args.len == 2) {
-            var key_buf: [512]u8 = undefined;
-            const ns_key = namespacedKey(db, args[1], &key_buf) orelse return false;
-            const removed = ckv.delete(ns_key);
-            if (removed) {
-                if (self.aof) |a| a.logCommand(args);
-                conn.write_buf.appendSlice(":1\r\n") catch {};
-            } else {
-                conn.write_buf.appendSlice(":0\r\n") catch {};
-            }
-            return true;
-        }
-
-        if (equalsAsciiUpper(cmd, "EXISTS") and args.len == 2) {
-            var key_buf: [512]u8 = undefined;
-            const ns_key = namespacedKey(db, args[1], &key_buf) orelse return false;
-            if (ckv.exists(ns_key)) {
-                conn.write_buf.appendSlice(":1\r\n") catch {};
-            } else {
-                conn.write_buf.appendSlice(":0\r\n") catch {};
-            }
-            return true;
-        }
-
-        if (equalsAsciiUpper(cmd, "TTL") and args.len == 2) {
-            var key_buf: [512]u8 = undefined;
-            const ns_key = namespacedKey(db, args[1], &key_buf) orelse return false;
-            const present = ckv.exists(ns_key);
-            if (!present) {
-                conn.write_buf.appendSlice(":-2\r\n") catch {};
-            } else if (ckv.ttl(ns_key)) |sec| {
-                writeIntTo(&conn.write_buf, sec);
-            } else {
-                conn.write_buf.appendSlice(":-1\r\n") catch {};
-            }
-            return true;
-        }
-
-        if (equalsAsciiUpper(cmd, "FLUSHDB")) {
-            ckv.flushdb();
-            conn.write_buf.appendSlice("+OK\r\n") catch {};
-            return true;
-        }
-
-        return false; // not a hot command, fall back to CommandHandler
+        return false;
     }
 
     fn executeCommand(self: *Worker, conn: *Connection, args: []const []const u8) void {
         var selected_db = std.atomic.Value(u8).init(conn.selected_db);
 
-        // Serialize all KV/graph access under mutex (temporary until ConcurrentKV is wired)
         const is_graph = isGraphCommand(args);
         if (is_graph) {
             while (!self.graph_mutex.tryLock()) std.atomic.spinLoopHint();
@@ -411,10 +445,7 @@ pub const Worker = struct {
 
         handler.execute(args, &aw.writer) catch return;
 
-        // Sync selected_db back — handler may have changed it for SELECT
-        // (though we handle SELECT ourselves, this is a safety net).
         conn.selected_db = selected_db.load(.monotonic);
-
         conn.write_buf.appendSlice(aw.written()) catch return;
     }
 
@@ -436,18 +467,23 @@ pub const Worker = struct {
         conn.write_buf.appendSlice("+OK\r\n") catch return;
     }
 
-    fn flushWrite(self: *Worker, conn: *Connection) void {
+    /// FIX #2: Direct write attempt — avoids enableWrite/disableWrite syscalls.
+    /// Most responses fit in the TCP send buffer, so write() succeeds immediately.
+    /// Only registers for writable events if EAGAIN (partial write).
+    fn directFlush(self: *Worker, conn: *Connection) void {
         while (conn.write_offset < conn.write_buf.items.len) {
             const remaining = conn.write_buf.items[conn.write_offset..];
             const rc = std.c.write(conn.fd, remaining.ptr, remaining.len);
             if (rc < 0) {
                 const err = std.c.errno(rc);
                 if (err == .AGAIN) {
-                    // Cannot write more now; ask the event loop to notify when writable.
-                    self.loop.enableWrite(conn.fd, @intCast(conn.fd)) catch {};
+                    // TCP send buffer full — register for writable event
+                    if (!conn.write_registered) {
+                        self.loop.enableWrite(conn.fd, @intCast(conn.fd)) catch {};
+                        conn.write_registered = true;
+                    }
                     return;
                 }
-                // Fatal write error — drop the connection.
                 self.closeConn(conn.fd);
                 return;
             }
@@ -458,22 +494,39 @@ pub const Worker = struct {
             conn.write_offset += @intCast(rc);
         }
 
-        // All data flushed — reset the write buffer and disable write interest.
+        // All data flushed
         conn.write_buf.clearRetainingCapacity();
         conn.write_offset = 0;
-        self.loop.disableWrite(conn.fd, @intCast(conn.fd)) catch {};
+        // Only call disableWrite if we previously registered
+        if (conn.write_registered) {
+            self.loop.disableWrite(conn.fd, @intCast(conn.fd)) catch {};
+            conn.write_registered = false;
+        }
+    }
+
+    /// Called when event loop says fd is writable (deferred flush for partial writes).
+    fn flushWrite(self: *Worker, conn: *Connection) void {
+        self.directFlush(conn);
     }
 };
 
 // ─── Utility ─────────────────────────────────────────────────────────
 
-fn consumeAccum(accum: *std.array_list.Managed(u8), n: usize) void {
-    if (n >= accum.items.len) {
-        accum.clearRetainingCapacity();
-    } else {
-        std.mem.copyForwards(u8, accum.items[0..], accum.items[n..]);
-        accum.shrinkRetainingCapacity(accum.items.len - n);
-    }
+/// FIX #4: Precomputed DB prefix + user key concatenation.
+/// Uses compile-time prefix table instead of runtime std.fmt.bufPrint.
+fn nsKey(db: u8, user_key: []const u8) ?[]const u8 {
+    // We need to build "db:N:userkey" in a buffer.
+    // The prefix is precomputed; we just memcpy prefix + user_key.
+    const S = struct {
+        threadlocal var buf: [512]u8 = undefined;
+    };
+    if (db >= 16) return null;
+    const prefix = DB_PREFIXES[db];
+    const total = prefix.len + user_key.len;
+    if (total > S.buf.len) return null;
+    @memcpy(S.buf[0..prefix.len], prefix);
+    @memcpy(S.buf[prefix.len..total], user_key);
+    return S.buf[0..total];
 }
 
 fn findCRLF(data: []const u8) ?usize {
@@ -518,8 +571,6 @@ const FastRespResult = struct {
     consumed: usize,
 };
 
-/// Zero-allocation RESP array parser. Returns slices into the input data.
-/// Handles up to 8 args. Returns null if incomplete or unsupported.
 fn parseFastResp(data: []const u8) ?FastRespResult {
     if (data.len < 4 or data[0] != '*') return null;
     var pos: usize = 1;
@@ -561,14 +612,6 @@ fn parseIntLine(data: []const u8, pos: *usize) ?i64 {
     return null;
 }
 
-fn namespacedKey(db: u8, user_key: []const u8, buf: []u8) ?[]const u8 {
-    const prefix = std.fmt.bufPrint(buf, "db:{d}:", .{db}) catch return null;
-    const total = prefix.len + user_key.len;
-    if (total > buf.len) return null;
-    std.mem.copyForwards(u8, buf[prefix.len..total], user_key);
-    return buf[0..total];
-}
-
 fn writeBulkTo(list: *std.array_list.Managed(u8), data: []const u8) void {
     var hdr: [32]u8 = undefined;
     const h = std.fmt.bufPrint(&hdr, "${d}\r\n", .{data.len}) catch return;
@@ -581,6 +624,11 @@ fn writeIntTo(list: *std.array_list.Managed(u8), n: i64) void {
     var buf: [32]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, ":{d}\r\n", .{n}) catch return;
     list.appendSlice(s) catch return;
+}
+
+fn setTcpNoDelay(fd: i32) void {
+    const yes: c_int = 1;
+    _ = std.c.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, @ptrCast(&yes), @sizeOf(c_int));
 }
 
 fn log(comptime fmt: []const u8, args: anytype) void {
