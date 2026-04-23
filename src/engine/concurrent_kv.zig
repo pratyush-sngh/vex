@@ -280,11 +280,13 @@ pub const ConcurrentKV = struct {
         errdefer self.allocator.free(owned_value);
 
         const has_ttl = expires_at != 0;
+        const now = self.cached_now_ms;
         const result = s.map.getPtr(key);
         if (result) |existing| {
             self.allocator.free(existing.value);
             existing.value = owned_value;
             existing.expires_at = expires_at;
+            existing.last_access = now;
             existing.flags = .{ .has_ttl = has_ttl };
         } else {
             const owned_key = try self.allocator.dupe(u8, key);
@@ -292,6 +294,7 @@ pub const ConcurrentKV = struct {
             try s.map.put(owned_key, .{
                 .value = owned_value,
                 .expires_at = expires_at,
+                .last_access = now,
                 .flags = .{ .has_ttl = has_ttl },
             });
         }

@@ -19,6 +19,9 @@ pub const KeysMode = enum {
 
 /// Central command dispatcher. Parses a RESP array (the Redis command)
 /// and routes to the appropriate KV or graph handler.
+/// Shared atomic flag for BGSAVE (prevents concurrent background saves).
+pub var bgsave_in_progress: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
 pub const CommandHandler = struct {
     kv: *KVStore,
     graph: *GraphEngine,
@@ -27,6 +30,7 @@ pub const CommandHandler = struct {
     aof: ?*AOF,
     selected_db: *std.atomic.Value(u8),
     keys_mode: KeysMode,
+    graph_rwlock: ?*std.c.pthread_rwlock_t,
 
     pub fn init(
         allocator: Allocator,
@@ -45,6 +49,7 @@ pub const CommandHandler = struct {
             .aof = aof,
             .selected_db = selected_db,
             .keys_mode = keys_mode,
+            .graph_rwlock = null,
         };
     }
 
@@ -104,6 +109,7 @@ pub const CommandHandler = struct {
                 'S' => if (std.mem.eql(u8, cmd, "SELECT")) return self.cmdSelect(args, w),
                 'I' => if (std.mem.eql(u8, cmd, "INCRBY")) return self.cmdIncrBy(args, w),
                 'A' => if (std.mem.eql(u8, cmd, "APPEND")) return self.cmdAppend(args, w),
+                'B' => if (std.mem.eql(u8, cmd, "BGSAVE")) return self.cmdBgSave(w),
                 else => {},
             },
             7 => switch (first) {
@@ -1157,6 +1163,76 @@ pub const CommandHandler = struct {
         a.truncate() catch {};
         a.last_save_time = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
         try resp.serializeSimpleString(w, "OK");
+    }
+
+    /// BGSAVE -- background snapshot in a separate thread
+    fn cmdBgSave(self: *CommandHandler, w: *std.Io.Writer) !void {
+        const a = self.aof orelse {
+            try resp.serializeError(w, "persistence not configured");
+            return;
+        };
+        // Check if a BGSAVE is already in progress
+        if (bgsave_in_progress.load(.acquire)) {
+            try resp.serializeError(w, "Background save already in progress");
+            return;
+        }
+        // Set the flag atomically
+        if (bgsave_in_progress.cmpxchgStrong(false, true, .acq_rel, .monotonic) != null) {
+            try resp.serializeError(w, "Background save already in progress");
+            return;
+        }
+
+        const BgSaveCtx = struct {
+            io: std.Io,
+            allocator: Allocator,
+            kv: *KVStore,
+            graph: *GraphEngine,
+            snapshot_path: []const u8,
+            aof_ptr: *AOF,
+            graph_rwlock: ?*std.c.pthread_rwlock_t,
+
+            fn run(ctx: *@This()) void {
+                defer {
+                    bgsave_in_progress.store(false, .release);
+                    ctx.allocator.destroy(ctx);
+                }
+                // Acquire read locks for consistent snapshot
+                if (ctx.graph_rwlock) |rwl| {
+                    _ = std.c.pthread_rwlock_rdlock(rwl);
+                }
+                defer if (ctx.graph_rwlock) |rwl| {
+                    _ = std.c.pthread_rwlock_unlock(rwl);
+                };
+
+                snapshot.save(ctx.io, ctx.allocator, ctx.kv, ctx.graph, ctx.snapshot_path) catch return;
+                ctx.aof_ptr.truncate() catch {};
+                ctx.aof_ptr.last_save_time = std.Io.Timestamp.now(ctx.io, .real).toMilliseconds();
+            }
+        };
+
+        const ctx = self.allocator.create(BgSaveCtx) catch {
+            bgsave_in_progress.store(false, .release);
+            try resp.serializeError(w, "out of memory");
+            return;
+        };
+        ctx.* = .{
+            .io = self.io,
+            .allocator = self.allocator,
+            .kv = self.kv,
+            .graph = self.graph,
+            .snapshot_path = a.snapshot_path,
+            .aof_ptr = a,
+            .graph_rwlock = self.graph_rwlock,
+        };
+
+        const t = std.Thread.spawn(.{}, BgSaveCtx.run, .{ctx}) catch {
+            bgsave_in_progress.store(false, .release);
+            self.allocator.destroy(ctx);
+            try resp.serializeError(w, "failed to spawn background save thread");
+            return;
+        };
+        t.detach();
+        try resp.serializeSimpleString(w, "Background saving started");
     }
 
     /// LASTSAVE -- unix timestamp (seconds) of last successful snapshot

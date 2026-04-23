@@ -94,6 +94,8 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var kv = KVStore.init(allocator, io);
+    kv.maxmemory = config.maxmemory;
+    kv.eviction_policy = config.maxmemory_policy;
     defer kv.deinit();
 
     var graph = GraphEngine.init(allocator);
@@ -185,22 +187,20 @@ pub fn main(init: std.process.Init) !void {
                 log("cluster mode: LEADER (node {d})", .{cc.self_id});
                 g_local_port = config.port;
 
-                var rl = ReplMod.ReplicationLeader.init(allocator, cc, config.port);
-                rl.execute_fn = executeForwardedWrite;
-                rl.start() catch |err| {
+                repl_leader = ReplMod.ReplicationLeader.init(allocator, cc, config.port);
+                repl_leader.?.execute_fn = executeForwardedWrite;
+                repl_leader.?.start() catch |err| {
                     log("warning: replication listener failed: {s}", .{@errorName(err)});
                 };
-                repl_leader = rl;
             } else {
                 log("cluster mode: FOLLOWER (node {d})", .{cc.self_id});
-                var rf = ReplMod.ReplicationFollower.init(allocator, cc);
-                rf.connectToLeader() catch |err| {
+                repl_follower = ReplMod.ReplicationFollower.init(allocator, cc, config.port);
+                repl_follower.?.connectToLeader() catch |err| {
                     log("warning: cannot connect to leader: {s}", .{@errorName(err)});
                 };
-                rf.start() catch |err| {
+                repl_follower.?.start() catch |err| {
                     log("warning: replication receiver failed: {s}", .{@errorName(err)});
                 };
-                repl_follower = rf;
             }
         }
     }
@@ -268,6 +268,8 @@ const Config = struct {
     max_client_buffer: usize,
     tls_cert: ?[]const u8,
     tls_key: ?[]const u8,
+    maxmemory: usize,
+    maxmemory_policy: @import("engine/kv.zig").EvictionPolicy,
 };
 
 fn parseArgs(init: std.process.Init) Config {
@@ -288,6 +290,8 @@ fn parseArgs(init: std.process.Init) Config {
     var max_client_buffer: usize = 1024 * 1024; // 1MB
     var tls_cert: ?[]const u8 = null;
     var tls_key: ?[]const u8 = null;
+    var maxmemory: usize = 0;
+    var maxmemory_policy: @import("engine/kv.zig").EvictionPolicy = .noeviction;
 
     var it = std.process.Args.Iterator.init(init.minimal.args);
     defer it.deinit();
@@ -367,6 +371,19 @@ fn parseArgs(init: std.process.Init) Config {
             if (it.next()) |p| {
                 tls_key = std.mem.sliceTo(p, 0);
             }
+        } else if (std.mem.eql(u8, arg, "--maxmemory")) {
+            if (it.next()) |n| {
+                maxmemory = std.fmt.parseInt(usize, std.mem.sliceTo(n, 0), 10) catch 0;
+            }
+        } else if (std.mem.eql(u8, arg, "--maxmemory-policy")) {
+            if (it.next()) |p| {
+                const pol = std.mem.sliceTo(p, 0);
+                if (std.mem.eql(u8, pol, "allkeys-lru")) {
+                    maxmemory_policy = .allkeys_lru;
+                } else {
+                    maxmemory_policy = .noeviction;
+                }
+            }
         }
     }
 
@@ -388,6 +405,8 @@ fn parseArgs(init: std.process.Init) Config {
         .max_client_buffer = max_client_buffer,
         .tls_cert = tls_cert,
         .tls_key = tls_key,
+        .maxmemory = maxmemory,
+        .maxmemory_policy = maxmemory_policy,
     };
 }
 
@@ -416,6 +435,28 @@ fn printBanner(port: u16, kv_keys: usize, graph_nodes: usize, aof_replayed: u64)
         std.debug.print("\n", .{});
     }
     std.debug.print("\n", .{});
+}
+
+/// Parse memory size with optional suffix: "256mb", "1gb", "1024" (bytes)
+fn parseMemorySize(s: []const u8) usize {
+    if (s.len == 0) return 0;
+    var end = s.len;
+    var multiplier: usize = 1;
+    if (s.len >= 2) {
+        const last2 = s[s.len - 2 ..];
+        if (std.ascii.eqlIgnoreCase(last2, "mb")) {
+            multiplier = 1024 * 1024;
+            end = s.len - 2;
+        } else if (std.ascii.eqlIgnoreCase(last2, "gb")) {
+            multiplier = 1024 * 1024 * 1024;
+            end = s.len - 2;
+        } else if (std.ascii.eqlIgnoreCase(last2, "kb")) {
+            multiplier = 1024;
+            end = s.len - 2;
+        }
+    }
+    const n = std.fmt.parseInt(usize, s[0..end], 10) catch return 0;
+    return n * multiplier;
 }
 
 fn log(comptime fmt: []const u8, args: anytype) void {

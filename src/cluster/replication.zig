@@ -66,8 +66,9 @@ pub const ReplicationLeader = struct {
         var i: usize = 0;
         while (i < self.follower_fds.items.len) {
             const fd = self.follower_fds.items[i];
+            std.debug.print("[repl-leader] broadcasting to fd={d} len={d}\n", .{ fd, aof_record.len });
             protocol.writeFrame(fd, .repl_data, aof_record) catch {
-                // Follower disconnected — remove it
+                std.debug.print("[repl-leader] broadcast to fd={d} failed\n", .{fd});
                 _ = std.c.close(fd);
                 _ = self.follower_fds.swapRemove(i);
                 continue;
@@ -112,17 +113,13 @@ pub const ReplicationLeader = struct {
             const client_fd = std.c.accept(sock, @ptrCast(&client_addr), &addr_len);
             if (client_fd < 0) continue;
 
-            std.debug.print("[repl-leader] follower connected (fd={d})\n", .{client_fd});
+            std.debug.print("[repl-leader] connection accepted (fd={d})\n", .{client_fd});
 
-            _ = std.c.pthread_mutex_lock(&self.mutex);
-            self.follower_fds.append(client_fd) catch {
-                _ = std.c.close(client_fd);
-                _ = std.c.pthread_mutex_unlock(&self.mutex);
-                continue;
-            };
-            _ = std.c.pthread_mutex_unlock(&self.mutex);
+            // DON'T add to follower_fds yet — wait until we know this is a repl_stream
+            // connection (identified by repl_request frame). Forward connections send
+            // write_forward frames and should NOT receive broadcasts.
 
-            // Spawn handler thread for this follower
+            // Spawn handler thread for this connection
             const ctx = self.allocator.create(FollowerHandlerCtx) catch continue;
             ctx.* = .{ .leader = self, .fd = client_fd };
             const t = std.Thread.spawn(.{}, followerHandler, .{ctx}) catch {
@@ -183,7 +180,11 @@ pub const ReplicationLeader = struct {
                 },
                 .repl_request => {
                     if (frame.payload.len > 0) self.allocator.free(@constCast(frame.payload));
-                    // TODO: stream AOF records since requested seq
+                    // This connection is a repl_stream — add to broadcast list
+                    _ = std.c.pthread_mutex_lock(&self.mutex);
+                    self.follower_fds.append(fd) catch {};
+                    _ = std.c.pthread_mutex_unlock(&self.mutex);
+                    std.debug.print("[repl-leader] follower fd={d} registered for replication stream\n", .{fd});
                 },
                 .heartbeat => {
                     if (frame.payload.len > 0) self.allocator.free(@constCast(frame.payload));
@@ -206,8 +207,9 @@ pub const ReplicationFollower = struct {
     running: std.atomic.Value(bool),
     receiver_thread: ?std.Thread,
     replay_fn: ?*const fn (data: []const u8) void,
+    local_port: u16,
 
-    pub fn init(allocator: Allocator, conf: *const ClusterConfig) ReplicationFollower {
+    pub fn init(allocator: Allocator, conf: *const ClusterConfig, local_port: u16) ReplicationFollower {
         return .{
             .allocator = allocator,
             .config = conf,
@@ -216,6 +218,7 @@ pub const ReplicationFollower = struct {
             .running = std.atomic.Value(bool).init(false),
             .receiver_thread = null,
             .replay_fn = null,
+            .local_port = local_port,
         };
     }
 
@@ -306,6 +309,52 @@ pub const ReplicationFollower = struct {
         return @constCast(frame.payload);
     }
 
+    fn replayViaLoopback(self: *ReplicationFollower, args_in: []const []const u8) void {
+        // Prepend "_REPL" marker so the worker knows this is a replayed command
+        // and doesn't forward it back to the leader (which would cause an infinite loop)
+        var args_buf: [16][]const u8 = undefined;
+        if (args_in.len + 1 > args_buf.len) return;
+        args_buf[0] = "_REPL";
+        for (args_in, 0..) |a, i| args_buf[i + 1] = a;
+        const args = args_buf[0 .. args_in.len + 1];
+        // Connect to own RESP port and send the command
+        const sock = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
+        if (sock < 0) return;
+        defer _ = std.c.close(sock);
+
+        var addr: std.c.sockaddr.in = .{
+            .family = std.c.AF.INET,
+            .port = std.mem.nativeToBig(u16, self.local_port),
+            .addr = 0x0100007f, // 127.0.0.1
+        };
+        if (std.c.connect(sock, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) < 0) return;
+
+        // Build RESP command
+        var buf = std.array_list.Managed(u8).init(self.allocator);
+        defer buf.deinit();
+        var hdr: [32]u8 = undefined;
+        const h = std.fmt.bufPrint(&hdr, "*{d}\r\n", .{args.len}) catch return;
+        buf.appendSlice(h) catch return;
+        for (args) |arg| {
+            const ah = std.fmt.bufPrint(&hdr, "${d}\r\n", .{arg.len}) catch return;
+            buf.appendSlice(ah) catch return;
+            buf.appendSlice(arg) catch return;
+            buf.appendSlice("\r\n") catch return;
+        }
+
+        // Send
+        var sent: usize = 0;
+        while (sent < buf.items.len) {
+            const rc = std.c.write(sock, buf.items[sent..].ptr, buf.items.len - sent);
+            if (rc <= 0) return;
+            sent += @intCast(rc);
+        }
+
+        // Read response (discard — we don't need it)
+        var discard: [4096]u8 = undefined;
+        _ = std.c.read(sock, &discard, discard.len);
+    }
+
     fn receiverLoop(self: *ReplicationFollower) void {
         // Send initial repl_request with seq=0
         const req = protocol.encodeReplRequest(0);
@@ -325,14 +374,21 @@ pub const ReplicationFollower = struct {
                 std.debug.print("[repl-follower] read error: {s}\n", .{@errorName(err)});
                 break;
             };
+            std.debug.print("[repl-follower] received frame type={d}\n", .{@intFromEnum(frame.frame_type)});
 
             switch (frame.frame_type) {
                 .repl_data => {
-                    // Replay the AOF record locally
-                    if (self.replay_fn) |replay| {
-                        replay(frame.payload);
-                    }
-                    if (frame.payload.len > 0) self.allocator.free(@constCast(frame.payload));
+                    // Decode command args and replay locally via loopback
+                    const args = protocol.decodeWriteForward(self.allocator, frame.payload) catch {
+                        if (frame.payload.len > 0) self.allocator.free(@constCast(frame.payload));
+                        continue;
+                    };
+                    defer self.allocator.free(args);
+                    // payload freed after args are used
+                    defer if (frame.payload.len > 0) self.allocator.free(@constCast(frame.payload));
+
+                    // Replay via loopback to own RESP port
+                    self.replayViaLoopback(args);
                 },
                 .heartbeat => {
                     if (frame.payload.len > 0) self.allocator.free(@constCast(frame.payload));

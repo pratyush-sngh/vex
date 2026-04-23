@@ -94,10 +94,16 @@ pub const KVStore = struct {
 
     /// SET with single-hash getOrPut, tombstone reuse, and compact entry.
     fn setInternal(self: *KVStore, key: []const u8, value: []const u8, expires_at: i64) !void {
+        // LRU eviction: if maxmemory is set, evict before inserting
+        if (self.maxmemory > 0) {
+            try self.evictIfNeeded();
+        }
+
         const owned_value = try self.allocator.dupe(u8, value);
         errdefer self.allocator.free(owned_value);
 
         const has_ttl = expires_at != 0;
+        const now = self.cached_now_ms;
 
         // Single hash via getOrPut (was: getPtr + put = two hashes on insert)
         const gop = try self.map.getOrPut(key);
@@ -116,6 +122,7 @@ pub const KVStore = struct {
             gop.value_ptr.* = .{
                 .value = owned_value,
                 .expires_at = expires_at,
+                .last_access = now,
                 .flags = .{ .has_ttl = has_ttl },
             };
         } else {
@@ -126,10 +133,56 @@ pub const KVStore = struct {
             gop.value_ptr.* = .{
                 .value = owned_value,
                 .expires_at = expires_at,
+                .last_access = now,
                 .flags = .{ .has_ttl = has_ttl },
             };
             self.live_count += 1;
             if (has_ttl) self.ttl_count += 1;
+        }
+    }
+
+    /// Estimate total memory used by all live entries.
+    pub fn memoryUsage(self: *const KVStore) usize {
+        var total: usize = 0;
+        var it = self.map.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.flags.deleted) continue;
+            total += entry.key_ptr.*.len + entry.value_ptr.value.len + @sizeOf(Entry);
+        }
+        return total;
+    }
+
+    /// Evict keys using approximate LRU (sample 5, evict oldest) until under maxmemory.
+    pub fn evictIfNeeded(self: *KVStore) !void {
+        if (self.maxmemory == 0) return;
+        if (self.eviction_policy == .noeviction) {
+            if (self.memoryUsage() > self.maxmemory) return error.OutOfMemory;
+            return;
+        }
+
+        // allkeys-lru: sample 5 random keys, evict the one with oldest last_access
+        while (self.memoryUsage() > self.maxmemory) {
+            if (self.live_count == 0) break;
+
+            var oldest_key: ?[]const u8 = null;
+            var oldest_access: i64 = std.math.maxInt(i64);
+            var samples: usize = 0;
+            var it = self.map.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.flags.deleted) continue;
+                if (entry.value_ptr.last_access < oldest_access) {
+                    oldest_access = entry.value_ptr.last_access;
+                    oldest_key = entry.key_ptr.*;
+                }
+                samples += 1;
+                if (samples >= 5) break;
+            }
+
+            if (oldest_key) |key| {
+                if (self.map.getPtr(key)) |entry| {
+                    self.tombstoneEntry(key, entry);
+                }
+            } else break;
         }
     }
 
@@ -173,6 +226,7 @@ pub const KVStore = struct {
                 return false;
             }
         }
+        entry.last_access = self.cached_now_ms;
         return true;
     }
 

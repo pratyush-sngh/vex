@@ -447,6 +447,18 @@ pub const Worker = struct {
             return;
         }
 
+        // ── Replication replay marker: _REPL prefix means this is a replayed
+        // command. Execute locally, skip forwarding AND broadcasting.
+        if (args.len >= 2 and std.mem.eql(u8, args[0], "_REPL")) {
+            const real_args = args[1..];
+            // Execute directly — bypass forwarding and broadcasting
+            if (self.ckv) |ckv| {
+                if (self.executeHotFast(conn, real_args, ckv)) return;
+            }
+            self.executeCommand(conn, real_args);
+            return;
+        }
+
         // ── Follower write forwarding: send writes to leader ──
         if (self.repl_follower) |rf| {
             if (replication.isWriteCommand(args)) {
@@ -461,7 +473,11 @@ pub const Worker = struct {
         }
 
         if (self.ckv) |ckv| {
-            if (self.executeHotFast(conn, args, ckv)) return;
+            if (self.executeHotFast(conn, args, ckv)) {
+                // Leader: broadcast write mutations to followers
+                self.maybeBroadcast(args);
+                return;
+            }
         }
 
         // AUTH when already authenticated (Redis allows re-AUTH)
@@ -476,6 +492,19 @@ pub const Worker = struct {
         }
 
         self.executeCommand(conn, args);
+        self.maybeBroadcast(args);
+    }
+
+    /// If this node is the leader and the command is a write, broadcast to followers.
+    fn maybeBroadcast(self: *Worker, args: []const []const u8) void {
+        const rl = self.repl_leader orelse return;
+        if (!replication.isWriteCommand(args)) return;
+
+        // Encode command as write_forward payload (same format followers use)
+        const payload = @import("../cluster/protocol.zig").encodeWriteForward(self.allocator, args) catch return;
+        defer self.allocator.free(payload);
+        std.debug.print("[repl-broadcast] cmd={s} payload_len={d}\n", .{ if (args.len > 0) args[0] else "?", payload.len });
+        rl.broadcastMutation(payload);
     }
 
     fn handleAuth(self: *Worker, conn: *Connection, args: []const []const u8) void {

@@ -4,15 +4,20 @@ const Allocator = std.mem.Allocator;
 const span = @import("../perf/span.zig");
 
 /// Append-Only File for write-ahead logging.
+/// Group commit: logCommand() appends to an in-memory buffer (no I/O),
+/// flush() writes the entire buffer to file in one write call.
 pub const AOF = struct {
     io: std.Io,
     path: []const u8,
     file: std.Io.File,
-    write_buf: [4096]u8 = undefined,
+    file_write_buf: [4096]u8 = undefined,
     snapshot_path: []const u8,
     last_save_time: i64,
     mutex: c.pthread_mutex_t = c.PTHREAD_MUTEX_INITIALIZER,
     prof: ?*span.Profile = null,
+    /// In-memory group commit buffer (commands accumulated between flushes)
+    group_buf: std.array_list.Managed(u8) = undefined,
+    group_buf_inited: bool = false,
 
     pub fn init(io: std.Io, path: []const u8, snapshot_path: []const u8) !AOF {
         const file = try std.Io.Dir.cwd().createFile(io, path, .{
@@ -29,19 +34,78 @@ pub const AOF = struct {
         };
     }
 
+    pub fn initGroupBuf(self: *AOF, allocator: Allocator) void {
+        if (!self.group_buf_inited) {
+            self.group_buf = std.array_list.Managed(u8).init(allocator);
+            self.group_buf_inited = true;
+        }
+    }
+
     pub fn deinit(self: *AOF) void {
+        // Flush any remaining buffered commands
+        self.flush();
+        if (self.group_buf_inited) self.group_buf.deinit();
         self.file.close(self.io);
     }
 
+    /// Append command to in-memory buffer (no I/O). Thread-safe via mutex.
     pub fn logCommand(self: *AOF, args: []const []const u8) void {
         _ = c.pthread_mutex_lock(&self.mutex);
         defer _ = c.pthread_mutex_unlock(&self.mutex);
-        self.writeRecord(args) catch {};
+
+        if (!self.group_buf_inited) {
+            // Fallback: direct write if group buffer not initialized
+            self.writeRecordDirect(args) catch {};
+            return;
+        }
+
+        // Append binary record to in-memory buffer
+        self.appendRecord(args) catch {};
     }
 
-    fn writeRecord(self: *AOF, args: []const []const u8) !void {
+    fn appendRecord(self: *AOF, args: []const []const u8) !void {
+        var ts_buf: [8]u8 = undefined;
+        std.mem.writeInt(i64, &ts_buf, std.Io.Timestamp.now(self.io, .real).toMilliseconds(), .little);
+        try self.group_buf.appendSlice(&ts_buf);
+
+        var ac_buf: [2]u8 = undefined;
+        std.mem.writeInt(u16, &ac_buf, @intCast(args.len), .little);
+        try self.group_buf.appendSlice(&ac_buf);
+
+        for (args) |arg| {
+            var len_buf: [4]u8 = undefined;
+            std.mem.writeInt(u32, &len_buf, @intCast(arg.len), .little);
+            try self.group_buf.appendSlice(&len_buf);
+            try self.group_buf.appendSlice(arg);
+        }
+    }
+
+    /// Flush the in-memory buffer to file in one write call (group commit).
+    /// Called at the end of each event loop tick in worker.zig.
+    pub fn flush(self: *AOF) void {
+        _ = c.pthread_mutex_lock(&self.mutex);
+        defer _ = c.pthread_mutex_unlock(&self.mutex);
+
+        if (!self.group_buf_inited or self.group_buf.items.len == 0) return;
+
         const t0 = std.Io.Clock.Timestamp.now(self.io, .awake);
-        var fw = std.Io.File.writer(self.file, self.io, &self.write_buf);
+        self.flushBufferToFile() catch {};
+        const t1 = std.Io.Clock.Timestamp.now(self.io, .awake);
+        if (self.prof) |p| p.recordAofWrite(span.monotonicNs(t0, t1));
+    }
+
+    fn flushBufferToFile(self: *AOF) !void {
+        var fw = std.Io.File.writer(self.file, self.io, &self.file_write_buf);
+        try fw.seekTo(try self.file.length(self.io));
+        const w = &fw.interface;
+        try w.writeAll(self.group_buf.items);
+        try w.flush();
+        self.group_buf.clearRetainingCapacity();
+    }
+
+    fn writeRecordDirect(self: *AOF, args: []const []const u8) !void {
+        const t0 = std.Io.Clock.Timestamp.now(self.io, .awake);
+        var fw = std.Io.File.writer(self.file, self.io, &self.file_write_buf);
         try fw.seekTo(try self.file.length(self.io));
         const w = &fw.interface;
 
