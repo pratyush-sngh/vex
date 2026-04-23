@@ -11,6 +11,7 @@ const KeysMode = @import("../command/handler.zig").KeysMode;
 const AOF = @import("../storage/aof.zig").AOF;
 const span = @import("../perf/span.zig");
 const ct = @import("../command/comptime_dispatch.zig");
+const replication = @import("../cluster/replication.zig");
 const TlsContext = @import("tls.zig").TlsContext;
 const SSL = @import("tls.zig").SSL;
 
@@ -105,6 +106,8 @@ pub const Worker = struct {
     max_client_buffer: usize,
     active_connections: *std.atomic.Value(u32),
     tls_ctx: ?*TlsContext,
+    repl_follower: ?*replication.ReplicationFollower,
+    repl_leader: ?*replication.ReplicationLeader,
     new_fds: [MAX_NEW_FDS]i32,
     new_fd_head: std.atomic.Value(usize),
     new_fd_tail: std.atomic.Value(usize),
@@ -126,6 +129,8 @@ pub const Worker = struct {
         max_client_buffer: usize,
         active_connections: *std.atomic.Value(u32),
         tls_ctx: ?*TlsContext,
+        repl_follower: ?*replication.ReplicationFollower,
+        repl_leader: ?*replication.ReplicationLeader,
     ) !Worker {
         return .{
             .id = id,
@@ -146,6 +151,8 @@ pub const Worker = struct {
             .max_client_buffer = max_client_buffer,
             .active_connections = active_connections,
             .tls_ctx = tls_ctx,
+            .repl_follower = repl_follower,
+            .repl_leader = repl_leader,
             .new_fds = [_]i32{-1} ** MAX_NEW_FDS,
             .new_fd_head = std.atomic.Value(usize).init(0),
             .new_fd_tail = std.atomic.Value(usize).init(0),
@@ -227,12 +234,26 @@ pub const Worker = struct {
             return;
         }
 
+        // TLS handshake (before adding to event loop)
+        var ssl: ?*SSL = null;
+        if (self.tls_ctx) |tls| {
+            ssl = tls.wrapFd(fd);
+            if (ssl == null) {
+                _ = self.active_connections.fetchSub(1, .monotonic);
+                _ = std.c.close(fd);
+                return;
+            }
+        }
+
         const conn = Connection.init(self.allocator, fd, self.requirepass != null) catch {
+            if (ssl) |s| self.tls_ctx.?.sslClose(s);
             _ = self.active_connections.fetchSub(1, .monotonic);
             _ = std.c.close(fd);
             return;
         };
+        conn.ssl = ssl;
         self.conns.put(fd, conn) catch {
+            if (conn.ssl) |s| self.tls_ctx.?.sslClose(s);
             conn.deinit(self.allocator);
             _ = self.active_connections.fetchSub(1, .monotonic);
             _ = std.c.close(fd);
@@ -240,6 +261,7 @@ pub const Worker = struct {
         };
         self.loop.addFd(fd, @intCast(fd)) catch {
             _ = self.conns.remove(fd);
+            if (conn.ssl) |s| self.tls_ctx.?.sslClose(s);
             conn.deinit(self.allocator);
             _ = self.active_connections.fetchSub(1, .monotonic);
             _ = std.c.close(fd);
@@ -250,20 +272,50 @@ pub const Worker = struct {
     fn closeConn(self: *Worker, fd: i32) void {
         self.loop.removeFd(fd);
         if (self.conns.fetchRemove(fd)) |kv| {
+            if (kv.value.ssl) |s| {
+                if (self.tls_ctx) |tls| tls.sslClose(s);
+            }
             kv.value.deinit(self.allocator);
         }
         _ = self.active_connections.fetchSub(1, .monotonic);
         _ = std.c.close(fd);
     }
 
+    /// Read from connection, handling TLS transparently.
+    /// Returns: >0 bytes read, 0 = closed, -1 = EAGAIN.
+    fn connRead(self: *Worker, conn: *Connection, buf: [*]u8, len: usize) isize {
+        if (conn.ssl) |ssl| {
+            return self.tls_ctx.?.sslRead(ssl, buf, len);
+        }
+        const rc = std.c.read(conn.fd, buf, len);
+        if (rc < 0) {
+            const err = std.c.errno(rc);
+            if (err == .AGAIN) return -1;
+            return 0;
+        }
+        return rc;
+    }
+
+    /// Write to connection, handling TLS transparently.
+    /// Returns: >0 bytes written, 0 = closed, -1 = EAGAIN.
+    fn connWrite(self: *Worker, conn: *Connection, buf: [*]const u8, len: usize) isize {
+        if (conn.ssl) |ssl| {
+            return self.tls_ctx.?.sslWrite(ssl, buf, len);
+        }
+        const rc = std.c.write(conn.fd, buf, len);
+        if (rc < 0) {
+            const err = std.c.errno(rc);
+            if (err == .AGAIN) return -1;
+            return 0;
+        }
+        return rc;
+    }
+
     fn handleRead(self: *Worker, conn: *Connection) void {
         var read_buf: [READ_BUF_SIZE]u8 = undefined;
-        const rc = std.c.read(conn.fd, &read_buf, READ_BUF_SIZE);
+        const rc = self.connRead(conn, &read_buf, READ_BUF_SIZE);
         if (rc <= 0) {
-            if (rc < 0) {
-                const err = std.c.errno(rc);
-                if (err == .AGAIN) return;
-            }
+            if (rc < 0) return; // EAGAIN
             self.closeConn(conn.fd);
             return;
         }
@@ -393,6 +445,19 @@ pub const Worker = struct {
             }
             conn.write_buf.appendSlice("-NOAUTH Authentication required.\r\n") catch {};
             return;
+        }
+
+        // ── Follower write forwarding: send writes to leader ──
+        if (self.repl_follower) |rf| {
+            if (replication.isWriteCommand(args)) {
+                const resp_bytes = rf.forwardWrite(args) catch {
+                    conn.write_buf.appendSlice("-ERR leader unavailable\r\n") catch {};
+                    return;
+                };
+                defer self.allocator.free(resp_bytes);
+                conn.write_buf.appendSlice(resp_bytes) catch {};
+                return;
+            }
         }
 
         if (self.ckv) |ckv| {
@@ -605,18 +670,13 @@ pub const Worker = struct {
     fn directFlush(self: *Worker, conn: *Connection) void {
         while (conn.write_offset < conn.write_buf.items.len) {
             const remaining = conn.write_buf.items[conn.write_offset..];
-            const rc = std.c.write(conn.fd, remaining.ptr, remaining.len);
+            const rc = self.connWrite(conn, remaining.ptr, remaining.len);
             if (rc < 0) {
-                const err = std.c.errno(rc);
-                if (err == .AGAIN) {
-                    // TCP send buffer full — register for writable event
-                    if (!conn.write_registered) {
-                        self.loop.enableWrite(conn.fd, @intCast(conn.fd)) catch {};
-                        conn.write_registered = true;
-                    }
-                    return;
+                // Send buffer full — register for writable event
+                if (!conn.write_registered) {
+                    self.loop.enableWrite(conn.fd, @intCast(conn.fd)) catch {};
+                    conn.write_registered = true;
                 }
-                self.closeConn(conn.fd);
                 return;
             }
             if (rc == 0) {

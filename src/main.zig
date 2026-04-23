@@ -11,6 +11,55 @@ const aof_mod = @import("storage/aof.zig");
 const AOF = aof_mod.AOF;
 const span = @import("perf/span.zig");
 
+// Global state for replication — leader's local port for self-loopback
+
+/// Execute a forwarded write by sending it to the local RESP port as a client.
+/// This ensures it goes through the worker → ConcurrentKV path (not plain KVStore).
+fn executeForwardedWrite(allocator: std.mem.Allocator, args: []const []const u8) ?[]u8 {
+    // Connect to ourselves on the RESP port
+    const sock = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
+    if (sock < 0) return null;
+    defer _ = std.c.close(sock);
+
+    var addr: std.c.sockaddr.in = .{
+        .family = std.c.AF.INET,
+        .port = std.mem.nativeToBig(u16, g_local_port),
+        .addr = 0x0100007f, // 127.0.0.1
+    };
+    if (std.c.connect(sock, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) < 0) return null;
+
+    // Build RESP command
+    var cmd_buf = std.array_list.Managed(u8).init(allocator);
+    defer cmd_buf.deinit();
+    var hdr: [32]u8 = undefined;
+    const h = std.fmt.bufPrint(&hdr, "*{d}\r\n", .{args.len}) catch return null;
+    cmd_buf.appendSlice(h) catch return null;
+    for (args) |arg| {
+        const ah = std.fmt.bufPrint(&hdr, "${d}\r\n", .{arg.len}) catch return null;
+        cmd_buf.appendSlice(ah) catch return null;
+        cmd_buf.appendSlice(arg) catch return null;
+        cmd_buf.appendSlice("\r\n") catch return null;
+    }
+
+    // Send command
+    var sent: usize = 0;
+    while (sent < cmd_buf.items.len) {
+        const rc = std.c.write(sock, cmd_buf.items[sent..].ptr, cmd_buf.items.len - sent);
+        if (rc <= 0) return null;
+        sent += @intCast(rc);
+    }
+
+    // Read response (up to 64KB)
+    var resp_buf: [65536]u8 = undefined;
+    const rc = std.c.read(sock, &resp_buf, resp_buf.len);
+    if (rc <= 0) return null;
+    const n: usize = @intCast(rc);
+
+    return allocator.dupe(u8, resp_buf[0..n]) catch null;
+}
+
+var g_local_port: u16 = 6380;
+
 const DEFAULT_HOST = "0.0.0.0";
 const DEFAULT_PORT: u16 = 6380;
 const DEFAULT_DATA_DIR = "data";
@@ -115,14 +164,14 @@ pub fn main(init: std.process.Init) !void {
 
     // ── Cluster setup ─────────────────────────────────────────────────
     const cluster_config_mod = @import("cluster/config.zig");
-    const repl_mod = @import("cluster/replication.zig");
+    const ReplMod = @import("cluster/replication.zig");
 
     var cluster_conf: ?cluster_config_mod.ClusterConfig = null;
     defer if (cluster_conf) |*cc| cc.deinit();
 
-    var repl_leader: ?repl_mod.ReplicationLeader = null;
+    var repl_leader: ?ReplMod.ReplicationLeader = null;
     defer if (repl_leader) |*rl| rl.deinit();
-    var repl_follower: ?repl_mod.ReplicationFollower = null;
+    var repl_follower: ?ReplMod.ReplicationFollower = null;
     defer if (repl_follower) |*rf| rf.deinit();
 
     if (config.cluster_config) |cc_path| {
@@ -134,14 +183,17 @@ pub fn main(init: std.process.Init) !void {
         if (cluster_conf) |*cc| {
             if (cc.isLeader()) {
                 log("cluster mode: LEADER (node {d})", .{cc.self_id});
-                var rl = repl_mod.ReplicationLeader.init(allocator, cc, config.port);
+                g_local_port = config.port;
+
+                var rl = ReplMod.ReplicationLeader.init(allocator, cc, config.port);
+                rl.execute_fn = executeForwardedWrite;
                 rl.start() catch |err| {
                     log("warning: replication listener failed: {s}", .{@errorName(err)});
                 };
                 repl_leader = rl;
             } else {
                 log("cluster mode: FOLLOWER (node {d})", .{cc.self_id});
-                var rf = repl_mod.ReplicationFollower.init(allocator, cc);
+                var rf = ReplMod.ReplicationFollower.init(allocator, cc);
                 rf.connectToLeader() catch |err| {
                     log("warning: cannot connect to leader: {s}", .{@errorName(err)});
                 };
@@ -172,6 +224,8 @@ pub fn main(init: std.process.Init) !void {
         config.maxclients,
         config.max_client_buffer,
         if (tls_ctx) |*t| t else null,
+        if (repl_follower) |*rf| rf else null,
+        if (repl_leader) |*rl| rl else null,
     );
     if (config.reactor) {
         server.runReactor(config.workers, &shutdown_requested) catch |err| {

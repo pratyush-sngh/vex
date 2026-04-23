@@ -782,6 +782,8 @@ pub const Server = struct {
     maxclients: u32,
     max_client_buffer: usize,
     tls_ctx: ?*TlsContext,
+    repl_follower: ?*@import("../cluster/replication.zig").ReplicationFollower,
+    repl_leader: ?*@import("../cluster/replication.zig").ReplicationLeader,
     active_connections: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     pub fn init(
@@ -801,6 +803,8 @@ pub const Server = struct {
         maxclients: u32,
         max_client_buffer: usize,
         tls_ctx: ?*TlsContext,
+        repl_follower: ?*@import("../cluster/replication.zig").ReplicationFollower,
+        repl_leader: ?*@import("../cluster/replication.zig").ReplicationLeader,
     ) !Server {
         const resolved = try std.Io.net.IpAddress.resolve(io, host, port);
         const bind_address: std.Io.net.IpAddress = switch (resolved) {
@@ -827,6 +831,8 @@ pub const Server = struct {
             .maxclients = maxclients,
             .max_client_buffer = max_client_buffer,
             .tls_ctx = tls_ctx,
+            .repl_follower = repl_follower,
+            .repl_leader = repl_leader,
         };
     }
 
@@ -1007,6 +1013,9 @@ pub const Server = struct {
                 self.maxclients,
                 self.max_client_buffer,
                 &self.active_connections,
+                self.tls_ctx,
+                self.repl_follower,
+                self.repl_leader,
             );
         }
 

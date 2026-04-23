@@ -6,24 +6,30 @@ const ClusterConfig = config_mod.ClusterConfig;
 const ClusterNode = config_mod.ClusterNode;
 
 /// Leader-side replication: accepts follower connections and streams mutations.
+/// Callback type for executing a forwarded write command on the leader.
+/// Returns the RESP response bytes (caller must free).
+pub const ExecuteWriteFn = *const fn (allocator: Allocator, args: []const []const u8) ?[]u8;
+
 pub const ReplicationLeader = struct {
     allocator: Allocator,
     config: *const ClusterConfig,
     listen_port: u16,
-    /// Connected follower fds (protected by mutex for multi-worker access)
     follower_fds: std.array_list.Managed(i32),
     mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
     running: std.atomic.Value(bool),
     listener_thread: ?std.Thread,
+    /// Callback to execute forwarded write commands
+    execute_fn: ?ExecuteWriteFn,
 
     pub fn init(allocator: Allocator, conf: *const ClusterConfig, base_port: u16) ReplicationLeader {
         return .{
             .allocator = allocator,
             .config = conf,
-            .listen_port = base_port + 10000, // replication port = base + 10000
+            .listen_port = base_port + 10000,
             .follower_fds = std.array_list.Managed(i32).init(allocator),
             .running = std.atomic.Value(bool).init(false),
             .listener_thread = null,
+            .execute_fn = null,
         };
     }
 
@@ -111,8 +117,81 @@ pub const ReplicationLeader = struct {
             _ = std.c.pthread_mutex_lock(&self.mutex);
             self.follower_fds.append(client_fd) catch {
                 _ = std.c.close(client_fd);
+                _ = std.c.pthread_mutex_unlock(&self.mutex);
+                continue;
             };
             _ = std.c.pthread_mutex_unlock(&self.mutex);
+
+            // Spawn handler thread for this follower
+            const ctx = self.allocator.create(FollowerHandlerCtx) catch continue;
+            ctx.* = .{ .leader = self, .fd = client_fd };
+            const t = std.Thread.spawn(.{}, followerHandler, .{ctx}) catch {
+                self.allocator.destroy(ctx);
+                continue;
+            };
+            t.detach();
+        }
+    }
+
+    const FollowerHandlerCtx = struct {
+        leader: *ReplicationLeader,
+        fd: i32,
+    };
+
+    fn followerHandler(ctx: *FollowerHandlerCtx) void {
+        const self = ctx.leader;
+        const fd = ctx.fd;
+        defer self.allocator.destroy(ctx);
+
+        while (self.running.load(.acquire)) {
+            var pfd = [1]std.c.pollfd{.{
+                .fd = fd,
+                .events = std.c.POLL.IN,
+                .revents = 0,
+            }};
+            const poll_rc = std.c.poll(&pfd, 1, 500);
+            if (poll_rc <= 0) continue;
+
+            const frame = protocol.readFrame(fd, self.allocator) catch |err| {
+                std.debug.print("[repl-leader] follower fd={d} read error: {s}\n", .{ fd, @errorName(err) });
+                break;
+            };
+
+            switch (frame.frame_type) {
+                .write_forward => {
+                    // Decode command args from payload
+                    // NOTE: args are slices into frame.payload — must NOT free payload until done
+                    const args = protocol.decodeWriteForward(self.allocator, frame.payload) catch {
+                        if (frame.payload.len > 0) self.allocator.free(@constCast(frame.payload));
+                        protocol.writeFrame(fd, .write_forward_response, "-ERR decode failed\r\n") catch break;
+                        continue;
+                    };
+                    defer self.allocator.free(args);
+                    defer if (frame.payload.len > 0) self.allocator.free(@constCast(frame.payload));
+
+                    // Execute via callback
+                    if (self.execute_fn) |exec| {
+                        if (exec(self.allocator, args)) |resp_bytes| {
+                            defer self.allocator.free(resp_bytes);
+                            protocol.writeFrame(fd, .write_forward_response, resp_bytes) catch break;
+                        } else {
+                            protocol.writeFrame(fd, .write_forward_response, "-ERR execution failed\r\n") catch break;
+                        }
+                    } else {
+                        protocol.writeFrame(fd, .write_forward_response, "-ERR no handler\r\n") catch break;
+                    }
+                },
+                .repl_request => {
+                    if (frame.payload.len > 0) self.allocator.free(@constCast(frame.payload));
+                    // TODO: stream AOF records since requested seq
+                },
+                .heartbeat => {
+                    if (frame.payload.len > 0) self.allocator.free(@constCast(frame.payload));
+                },
+                else => {
+                    if (frame.payload.len > 0) self.allocator.free(@constCast(frame.payload));
+                },
+            }
         }
     }
 };
@@ -121,10 +200,11 @@ pub const ReplicationLeader = struct {
 pub const ReplicationFollower = struct {
     allocator: Allocator,
     config: *const ClusterConfig,
-    leader_fd: i32,
+    leader_fd: i32, // replication stream (receiver thread reads from this)
+    forward_fd: i32, // write forwarding (worker threads write/read from this, mutex-protected)
+    forward_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
     running: std.atomic.Value(bool),
     receiver_thread: ?std.Thread,
-    /// Callback: replay a received AOF record through the command handler
     replay_fn: ?*const fn (data: []const u8) void,
 
     pub fn init(allocator: Allocator, conf: *const ClusterConfig) ReplicationFollower {
@@ -132,6 +212,7 @@ pub const ReplicationFollower = struct {
             .allocator = allocator,
             .config = conf,
             .leader_fd = -1,
+            .forward_fd = -1,
             .running = std.atomic.Value(bool).init(false),
             .receiver_thread = null,
             .replay_fn = null,
@@ -143,6 +224,10 @@ pub const ReplicationFollower = struct {
         if (self.leader_fd >= 0) {
             _ = std.c.close(self.leader_fd);
             self.leader_fd = -1;
+        }
+        if (self.forward_fd >= 0) {
+            _ = std.c.close(self.forward_fd);
+            self.forward_fd = -1;
         }
     }
 
@@ -161,8 +246,8 @@ pub const ReplicationFollower = struct {
             .addr = 0,
         };
 
-        // Parse IPv4 address manually (no inet_addr in Zig's std.c)
-        addr.addr = parseIpv4(leader.host) orelse return error.InvalidAddress;
+        // Resolve hostname → IPv4 (supports both IP addresses and DNS names)
+        addr.addr = resolveHost(self.allocator, leader.host) orelse return error.InvalidAddress;
 
         if (std.c.connect(sock, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) < 0) {
             _ = std.c.close(sock);
@@ -170,6 +255,17 @@ pub const ReplicationFollower = struct {
         }
 
         self.leader_fd = sock;
+
+        // Open a second connection for write forwarding (separate from repl stream)
+        const fwd_sock = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
+        if (fwd_sock >= 0) {
+            if (std.c.connect(fwd_sock, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) >= 0) {
+                self.forward_fd = fwd_sock;
+            } else {
+                _ = std.c.close(fwd_sock);
+            }
+        }
+
         std.debug.print("[repl-follower] connected to leader {s}:{d}\n", .{ leader.host, repl_port });
     }
 
@@ -189,15 +285,19 @@ pub const ReplicationFollower = struct {
     /// Forward a write command to the leader and get the response.
     /// Returns the RESP response bytes to send back to the client.
     pub fn forwardWrite(self: *ReplicationFollower, args: []const []const u8) ![]u8 {
-        if (self.leader_fd < 0) return error.NotConnected;
+        if (self.forward_fd < 0) return error.NotConnected;
+
+        // Mutex: multiple worker threads may call forwardWrite concurrently
+        _ = std.c.pthread_mutex_lock(&self.forward_mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.forward_mutex);
 
         // Encode and send
         const payload = try protocol.encodeWriteForward(self.allocator, args);
         defer self.allocator.free(payload);
-        try protocol.writeFrame(self.leader_fd, .write_forward, payload);
+        try protocol.writeFrame(self.forward_fd, .write_forward, payload);
 
-        // Read response
-        const frame = try protocol.readFrame(self.leader_fd, self.allocator);
+        // Read response from the dedicated forward connection
+        const frame = try protocol.readFrame(self.forward_fd, self.allocator);
         if (frame.frame_type != .write_forward_response) {
             if (frame.payload.len > 0) self.allocator.free(@constCast(frame.payload));
             return error.UnexpectedFrame;
@@ -280,6 +380,29 @@ pub fn isWriteCommand(args: []const []const u8) bool {
         if (std.mem.eql(u8, upper[6..], "DELEDGE")) return true;
     }
     return false;
+}
+
+fn resolveHost(allocator: Allocator, host: []const u8) ?u32 {
+    // Try numeric IP first
+    if (parseIpv4(host)) |ip| return ip;
+
+    // DNS resolution via getaddrinfo
+    const host_z = allocator.dupeZ(u8, host) catch return null;
+    defer allocator.free(host_z);
+
+    var hints: std.c.addrinfo = std.mem.zeroes(std.c.addrinfo);
+    hints.family = std.c.AF.INET;
+
+    var result: ?*std.c.addrinfo = null;
+    const gai_result = std.c.getaddrinfo(host_z, null, &hints, &result);
+    if (@intFromEnum(gai_result) != 0) return null;
+    defer if (result) |r| std.c.freeaddrinfo(r);
+
+    if (result) |res| {
+        const addr: *std.c.sockaddr.in = @ptrCast(@alignCast(res.addr));
+        return addr.addr;
+    }
+    return null;
 }
 
 fn parseIpv4(s: []const u8) ?u32 {

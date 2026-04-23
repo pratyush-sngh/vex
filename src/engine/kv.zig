@@ -12,6 +12,11 @@ const Allocator = std.mem.Allocator;
 ///   - ttl_count: skip expiry checks entirely when no keys have TTL
 ///   - getOrPut: single hash per SET instead of two (getPtr + put)
 ///   - Compact Entry: i64 (8B) instead of ?i64 (16B) for expires_at
+pub const EvictionPolicy = enum {
+    noeviction,
+    allkeys_lru,
+};
+
 pub const KVStore = struct {
     map: std.StringHashMap(Entry),
     allocator: Allocator,
@@ -20,6 +25,8 @@ pub const KVStore = struct {
     ttl_count: u32,
     tombstone_count: u32,
     live_count: u32,
+    maxmemory: usize,
+    eviction_policy: EvictionPolicy,
 
     pub const EntryFlags = packed struct {
         deleted: bool = false,
@@ -31,6 +38,7 @@ pub const KVStore = struct {
     pub const Entry = struct {
         value: []const u8,
         expires_at: i64 = 0, // 0 = no expiry (was ?i64 = 16 bytes, now i64 = 8 bytes)
+        last_access: i64 = 0,
         flags: EntryFlags = .{},
     };
 
@@ -43,6 +51,8 @@ pub const KVStore = struct {
             .ttl_count = 0,
             .tombstone_count = 0,
             .live_count = 0,
+            .maxmemory = 0, // 0 = unlimited
+            .eviction_policy = .noeviction,
         };
     }
 
@@ -134,6 +144,7 @@ pub const KVStore = struct {
                 return null;
             }
         }
+        entry.last_access = self.cached_now_ms;
         return entry.value;
     }
 
