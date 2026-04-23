@@ -972,8 +972,6 @@ pub const CommandHandler = struct {
             return;
         }
 
-        const t0 = nowNs();
-
         var opts = query.TraversalOptions{};
         var i: usize = 2;
         while (i < args.len) {
@@ -1004,23 +1002,17 @@ pub const CommandHandler = struct {
             }
         }
 
-        const t1 = nowNs(); // parse done
-
         const nk = graphNamespacedKey(self, args[1]) catch {
             try resp.serializeError(w, "internal error");
             return;
         };
         defer self.allocator.free(nk);
 
-        const t2 = nowNs(); // key namespace done
-
         const ids = query.traverse(self.graph, self.allocator, nk, opts) catch |err| {
             try resp.serializeError(w, @errorName(err));
             return;
         };
         defer self.allocator.free(ids);
-
-        const t3 = nowNs(); // BFS engine done
 
         try resp.serializeArrayHeader(w, ids.len);
         for (ids) |nid| {
@@ -1033,23 +1025,6 @@ pub const CommandHandler = struct {
             }
         }
 
-        const t4 = nowNs(); // serialization done
-
-        // Log timing breakdown (visible in container logs)
-        std.debug.print("[traverse] nodes={d} parse={d}us nskey={d}us bfs={d}us serialize={d}us total={d}us\n", .{
-            ids.len,
-            (t1 - t0) / 1000,
-            (t2 - t1) / 1000,
-            (t3 - t2) / 1000,
-            (t4 - t3) / 1000,
-            (t4 - t0) / 1000,
-        });
-    }
-
-    fn nowNs() u64 {
-        var ts: std.c.timespec = undefined;
-        _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
-        return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
     }
 
     /// GRAPH.PATH <from_key> <to_key> [MAXDEPTH <n>]
@@ -1433,4 +1408,164 @@ test "command handler SELECT isolates KV namespace" {
     const get_db0 = [_][]const u8{ "GET", "same" };
     try handler.execute(&get_db0, &aw6.writer);
     try std.testing.expectEqualStrings("$3\r\ndb0\r\n", aw6.written());
+}
+
+// ─── Helper: create a fresh handler + run a command, return response string ───
+fn testExec(handler: *CommandHandler, allocator: Allocator, args: []const []const u8) ![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    var aw = std.Io.Writer.Allocating.fromArrayList(allocator, &list);
+    defer aw.deinit();
+    try handler.execute(args, &aw.writer);
+    return allocator.dupe(u8, aw.written());
+}
+
+test "MGET/MSET" {
+    const allocator = std.testing.allocator;
+    var kv = KVStore.init(allocator, std.testing.io);
+    defer kv.deinit();
+    var g = GraphEngine.init(allocator);
+    defer g.deinit();
+    var db = std.atomic.Value(u8).init(0);
+    var handler = CommandHandler.init(allocator, std.testing.io, &kv, &g, null, &db, .strict);
+
+    // MSET k1 v1 k2 v2
+    const mset = [_][]const u8{ "MSET", "k1", "v1", "k2", "v2" };
+    const r1 = try testExec(&handler, allocator, &mset);
+    defer allocator.free(r1);
+    try std.testing.expectEqualStrings("+OK\r\n", r1);
+
+    // MGET k1 k2 missing
+    const mget = [_][]const u8{ "MGET", "k1", "k2", "missing" };
+    const r2 = try testExec(&handler, allocator, &mget);
+    defer allocator.free(r2);
+    try std.testing.expect(std.mem.indexOf(u8, r2, "*3\r\n") != null); // array of 3
+    try std.testing.expect(std.mem.indexOf(u8, r2, "$2\r\nv1\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r2, "$2\r\nv2\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r2, "$-1\r\n") != null); // null for missing
+}
+
+test "INCR/DECR" {
+    const allocator = std.testing.allocator;
+    var kv = KVStore.init(allocator, std.testing.io);
+    defer kv.deinit();
+    var g = GraphEngine.init(allocator);
+    defer g.deinit();
+    var db = std.atomic.Value(u8).init(0);
+    var handler = CommandHandler.init(allocator, std.testing.io, &kv, &g, null, &db, .strict);
+
+    // INCR on non-existent key → 1
+    const incr1 = [_][]const u8{ "INCR", "counter" };
+    const r1 = try testExec(&handler, allocator, &incr1);
+    defer allocator.free(r1);
+    try std.testing.expectEqualStrings(":1\r\n", r1);
+
+    // INCR again → 2
+    const r2 = try testExec(&handler, allocator, &incr1);
+    defer allocator.free(r2);
+    try std.testing.expectEqualStrings(":2\r\n", r2);
+
+    // DECR → 1
+    const decr = [_][]const u8{ "DECR", "counter" };
+    const r3 = try testExec(&handler, allocator, &decr);
+    defer allocator.free(r3);
+    try std.testing.expectEqualStrings(":1\r\n", r3);
+
+    // INCRBY 10 → 11
+    const incrby = [_][]const u8{ "INCRBY", "counter", "10" };
+    const r4 = try testExec(&handler, allocator, &incrby);
+    defer allocator.free(r4);
+    try std.testing.expectEqualStrings(":11\r\n", r4);
+
+    // DECRBY 5 → 6
+    const decrby = [_][]const u8{ "DECRBY", "counter", "5" };
+    const r5 = try testExec(&handler, allocator, &decrby);
+    defer allocator.free(r5);
+    try std.testing.expectEqualStrings(":6\r\n", r5);
+
+    // INCR on non-integer value → error
+    const set_str = [_][]const u8{ "SET", "str", "hello" };
+    const rs = try testExec(&handler, allocator, &set_str);
+    defer allocator.free(rs);
+    const incr_str = [_][]const u8{ "INCR", "str" };
+    const re = try testExec(&handler, allocator, &incr_str);
+    defer allocator.free(re);
+    try std.testing.expect(std.mem.indexOf(u8, re, "-ERR") != null);
+}
+
+test "EXPIRE/PERSIST/TTL" {
+    const allocator = std.testing.allocator;
+    var kv = KVStore.init(allocator, std.testing.io);
+    defer kv.deinit();
+    var g = GraphEngine.init(allocator);
+    defer g.deinit();
+    var db = std.atomic.Value(u8).init(0);
+    var handler = CommandHandler.init(allocator, std.testing.io, &kv, &g, null, &db, .strict);
+
+    // SET key
+    const set = [_][]const u8{ "SET", "mykey", "val" };
+    const r1 = try testExec(&handler, allocator, &set);
+    defer allocator.free(r1);
+
+    // TTL returns -1 (no expiry)
+    const ttl1 = [_][]const u8{ "TTL", "mykey" };
+    const r2 = try testExec(&handler, allocator, &ttl1);
+    defer allocator.free(r2);
+    try std.testing.expectEqualStrings(":-1\r\n", r2);
+
+    // EXPIRE 3600
+    const expire = [_][]const u8{ "EXPIRE", "mykey", "3600" };
+    const r3 = try testExec(&handler, allocator, &expire);
+    defer allocator.free(r3);
+    try std.testing.expectEqualStrings(":1\r\n", r3);
+
+    // TTL now > 0
+    const r4 = try testExec(&handler, allocator, &ttl1);
+    defer allocator.free(r4);
+    try std.testing.expect(r4[0] == ':');
+    try std.testing.expect(r4[1] != '-'); // positive TTL
+
+    // PERSIST removes TTL
+    const persist = [_][]const u8{ "PERSIST", "mykey" };
+    const r5 = try testExec(&handler, allocator, &persist);
+    defer allocator.free(r5);
+    try std.testing.expectEqualStrings(":1\r\n", r5);
+
+    // TTL back to -1
+    const r6 = try testExec(&handler, allocator, &ttl1);
+    defer allocator.free(r6);
+    try std.testing.expectEqualStrings(":-1\r\n", r6);
+
+    // EXPIRE on non-existent key → 0
+    const expire_missing = [_][]const u8{ "EXPIRE", "nokey", "100" };
+    const r7 = try testExec(&handler, allocator, &expire_missing);
+    defer allocator.free(r7);
+    try std.testing.expectEqualStrings(":0\r\n", r7);
+}
+
+test "APPEND" {
+    const allocator = std.testing.allocator;
+    var kv = KVStore.init(allocator, std.testing.io);
+    defer kv.deinit();
+    var g = GraphEngine.init(allocator);
+    defer g.deinit();
+    var db = std.atomic.Value(u8).init(0);
+    var handler = CommandHandler.init(allocator, std.testing.io, &kv, &g, null, &db, .strict);
+
+    // APPEND to non-existent key → creates it
+    const append1 = [_][]const u8{ "APPEND", "msg", "hello" };
+    const r1 = try testExec(&handler, allocator, &append1);
+    defer allocator.free(r1);
+    try std.testing.expectEqualStrings(":5\r\n", r1); // length 5
+
+    // APPEND more
+    const append2 = [_][]const u8{ "APPEND", "msg", " world" };
+    const r2 = try testExec(&handler, allocator, &append2);
+    defer allocator.free(r2);
+    try std.testing.expectEqualStrings(":11\r\n", r2); // length 11
+
+    // GET to verify
+    const get = [_][]const u8{ "GET", "msg" };
+    const r3 = try testExec(&handler, allocator, &get);
+    defer allocator.free(r3);
+    try std.testing.expectEqualStrings("$11\r\nhello world\r\n", r3);
 }
