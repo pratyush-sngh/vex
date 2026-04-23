@@ -92,7 +92,7 @@ pub const Worker = struct {
     kv_mutex: *std.atomic.Mutex,
     ckv: ?*ConcurrentKV,
     graph: *GraphEngine,
-    graph_mutex: *std.atomic.Mutex,
+    graph_rwlock: *std.c.pthread_rwlock_t,
     aof: ?*AOF,
     keys_mode: KeysMode,
     profile: ?*span.Profile,
@@ -112,7 +112,7 @@ pub const Worker = struct {
         kv_mutex: *std.atomic.Mutex,
         ckv: ?*ConcurrentKV,
         graph: *GraphEngine,
-        graph_mutex: *std.atomic.Mutex,
+        graph_rwlock: *std.c.pthread_rwlock_t,
         aof: ?*AOF,
         keys_mode: KeysMode,
         profile: ?*span.Profile,
@@ -131,7 +131,7 @@ pub const Worker = struct {
             .kv_mutex = kv_mutex,
             .ckv = ckv,
             .graph = graph,
-            .graph_mutex = graph_mutex,
+            .graph_rwlock = graph_rwlock,
             .aof = aof,
             .keys_mode = keys_mode,
             .profile = profile,
@@ -538,10 +538,17 @@ pub const Worker = struct {
         var selected_db = std.atomic.Value(u8).init(conn.selected_db);
 
         const is_graph = isGraphCommand(args);
+        const is_graph_write = if (is_graph) isGraphWriteCommand(args) else false;
         if (is_graph) {
-            while (!self.graph_mutex.tryLock()) std.atomic.spinLoopHint();
+            if (is_graph_write) {
+                _ = std.c.pthread_rwlock_wrlock(self.graph_rwlock);
+            } else {
+                _ = std.c.pthread_rwlock_rdlock(self.graph_rwlock);
+            }
         }
-        defer if (is_graph) self.graph_mutex.unlock();
+        defer if (is_graph) {
+            _ = std.c.pthread_rwlock_unlock(self.graph_rwlock);
+        };
 
         while (!self.kv_mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.kv_mutex.unlock();
@@ -665,6 +672,20 @@ fn isGraphCommand(args: []const []const u8) bool {
     const cmd = args[0];
     if (cmd.len < 6) return false;
     return equalsAsciiUpperPrefix(cmd[0..6], "GRAPH.");
+}
+
+/// Graph write commands need exclusive (write) lock.
+/// Read commands (GETNODE, NEIGHBORS, TRAVERSE, PATH, WPATH, STATS) take shared read lock.
+fn isGraphWriteCommand(args: []const []const u8) bool {
+    if (args.len == 0) return false;
+    const cmd = args[0];
+    // Write commands: ADDNODE, DELNODE, SETPROP, ADDEDGE, DELEDGE
+    if (cmd.len >= 12 and equalsAsciiUpperPrefix(cmd[6..], "ADDNOD")) return true;
+    if (cmd.len >= 12 and equalsAsciiUpperPrefix(cmd[6..], "DELNOD")) return true;
+    if (cmd.len >= 13 and equalsAsciiUpperPrefix(cmd[6..], "SETPRO")) return true;
+    if (cmd.len >= 12 and equalsAsciiUpperPrefix(cmd[6..], "ADDEDG")) return true;
+    if (cmd.len >= 12 and equalsAsciiUpperPrefix(cmd[6..], "DELEDG")) return true;
+    return false; // GETNODE, NEIGHBORS, TRAVERSE, PATH, WPATH, STATS = read
 }
 
 fn equalsAsciiUpper(s: []const u8, comptime upper: []const u8) bool {

@@ -974,7 +974,7 @@ pub const Server = struct {
         });
         defer net_server.deinit(self.io);
 
-        var graph_mutex = std.atomic.Mutex.unlocked;
+        var graph_rwlock = std.mem.zeroes(std.c.pthread_rwlock_t);
         var kv_mutex = std.atomic.Mutex.unlocked;
 
         // Create ConcurrentKV and import existing data from the plain KVStore.
@@ -995,7 +995,7 @@ pub const Server = struct {
                 &kv_mutex,
                 &ckv,
                 self.graph,
-                &graph_mutex,
+                &graph_rwlock,
                 self.aof,
                 self.keys_mode,
                 self.profile,
