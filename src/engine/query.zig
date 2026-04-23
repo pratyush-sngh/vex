@@ -95,7 +95,7 @@ pub fn traverse(
         }
 
         // ── Scan base CSR ──
-        const csrs = getCSRs(g, item.id, opts.direction);
+        const csrs = getCSRSlice(g, opts.direction);
         for (csrs) |csr| {
             const targets = csr.neighbors(item.id);
             if (targets.len == 0) continue;
@@ -162,7 +162,8 @@ pub fn traverse(
     return result.toOwnedSlice();
 }
 
-/// BFS shortest path (unweighted).
+/// BFS shortest path (unweighted). Uses flat parent array (not HashMap)
+/// for O(1) per-node parent tracking instead of O(50ns) hash+probe.
 pub fn shortestPath(
     g: *const GraphEngine,
     allocator: Allocator,
@@ -179,22 +180,27 @@ pub fn shortestPath(
         return PathResult{ .nodes = path, .total_weight = 0 };
     }
 
-    var visited = try std.DynamicBitSet.initEmpty(allocator, g.node_keys.items.len);
+    const node_cap = g.node_keys.items.len;
+
+    var visited = try std.DynamicBitSet.initEmpty(allocator, node_cap);
     defer visited.deinit();
 
-    var parent = std.AutoHashMap(NodeId, NodeId).init(allocator);
-    defer parent.deinit();
+    // Flat parent array: parent[node_id] = predecessor. ~1ns per access vs ~50ns HashMap.
+    const parent = try allocator.alloc(NodeId, node_cap);
+    defer allocator.free(parent);
+    @memset(parent, graph_mod.INVALID_ID);
 
     const QueueItem = struct { id: NodeId, depth: u32 };
     var queue = std.array_list.Managed(QueueItem).init(allocator);
     defer queue.deinit();
 
     visited.set(from_id);
-    try parent.put(from_id, graph_mod.INVALID_ID);
+    parent[from_id] = from_id; // sentinel: start node is its own parent
     try queue.append(.{ .id = from_id, .depth = 0 });
 
     const all_alive = g.all_base_edges_alive;
     const has_delta = g.delta_edges.items.len > 0;
+    const csrs = getCSRSlice(g, .both);
 
     var head: usize = 0;
     while (head < queue.items.len) {
@@ -203,14 +209,11 @@ pub fn shortestPath(
 
         if (item.depth >= max_depth) continue;
 
-        // Prefetch
         if (head < queue.items.len) {
             prefetchCSROffsets(&g.base_out, queue.items[head].id);
             prefetchCSROffsets(&g.base_in, queue.items[head].id);
         }
 
-        // Both directions for undirected path
-        const csrs = getCSRs(g, item.id, .both);
         for (csrs) |csr| {
             const targets = csr.neighbors(item.id);
             if (targets.len == 0) continue;
@@ -220,8 +223,8 @@ pub fn shortestPath(
                     if (!g.node_alive.isSet(neighbor_id)) continue;
                     if (visited.isSet(neighbor_id)) continue;
                     visited.set(neighbor_id);
-                    try parent.put(neighbor_id, item.id);
-                    if (neighbor_id == to_id) return reconstructPath(allocator, &parent, from_id, to_id);
+                    parent[neighbor_id] = item.id;
+                    if (neighbor_id == to_id) return reconstructFlatPath(allocator, parent, from_id, to_id);
                     try queue.append(.{ .id = neighbor_id, .depth = item.depth + 1 });
                 }
             } else {
@@ -231,14 +234,13 @@ pub fn shortestPath(
                     if (!g.node_alive.isSet(neighbor_id)) continue;
                     if (visited.isSet(neighbor_id)) continue;
                     visited.set(neighbor_id);
-                    try parent.put(neighbor_id, item.id);
-                    if (neighbor_id == to_id) return reconstructPath(allocator, &parent, from_id, to_id);
+                    parent[neighbor_id] = item.id;
+                    if (neighbor_id == to_id) return reconstructFlatPath(allocator, parent, from_id, to_id);
                     try queue.append(.{ .id = neighbor_id, .depth = item.depth + 1 });
                 }
             }
         }
 
-        // Delta edges (both directions for path finding)
         if (has_delta) {
             for (g.delta_edges.items) |de| {
                 if (de.from != item.id and de.to != item.id) continue;
@@ -247,8 +249,8 @@ pub fn shortestPath(
                 if (!g.node_alive.isSet(neighbor_id)) continue;
                 if (visited.isSet(neighbor_id)) continue;
                 visited.set(neighbor_id);
-                try parent.put(neighbor_id, item.id);
-                if (neighbor_id == to_id) return reconstructPath(allocator, &parent, from_id, to_id);
+                parent[neighbor_id] = item.id;
+                if (neighbor_id == to_id) return reconstructFlatPath(allocator, parent, from_id, to_id);
                 try queue.append(.{ .id = neighbor_id, .depth = item.depth + 1 });
             }
         }
@@ -403,7 +405,7 @@ pub fn neighbors(
     var ids = std.array_list.Managed(NodeId).init(allocator);
     errdefer ids.deinit();
 
-    const csrs = getCSRs(g, id, direction);
+    const csrs = getCSRSlice(g, direction);
     for (csrs) |csr| {
         const targets = csr.neighbors(id);
         if (targets.len == 0) continue;
@@ -479,7 +481,7 @@ fn neighborsFull(
     for (already_seen[0..already_count]) |nid| seen.set(nid);
 
     const all_alive = g.all_base_edges_alive;
-    const csrs = getCSRs(g, id, direction);
+    const csrs = getCSRSlice(g, direction);
 
     // Continue scanning CSR from where inline left off (we re-scan but skip already-seen via bitset)
     for (csrs) |csr| {
@@ -530,12 +532,25 @@ fn inlineContains(buf: []const NodeId, count: usize, val: NodeId) bool {
 
 // ─── Internal helpers ─────────────────────────────────────────────────
 
-fn getCSRs(g: *const GraphEngine, id: NodeId, direction: Direction) [2]*const CSR {
-    _ = id;
+/// Returns 1 CSR for single-direction, 2 for both. No wasted iterations.
+fn getCSRSlice(g: *const GraphEngine, direction: Direction) []const *const CSR {
+    const S = struct {
+        threadlocal var buf: [2]*const CSR = undefined;
+    };
     return switch (direction) {
-        .outgoing => .{ &g.base_out, &g.base_out }, // second unused, checked via neighbors len
-        .incoming => .{ &g.base_in, &g.base_in },
-        .both => .{ &g.base_out, &g.base_in },
+        .outgoing => {
+            S.buf[0] = &g.base_out;
+            return S.buf[0..1];
+        },
+        .incoming => {
+            S.buf[0] = &g.base_in;
+            return S.buf[0..1];
+        },
+        .both => {
+            S.buf[0] = &g.base_out;
+            S.buf[1] = &g.base_in;
+            return S.buf[0..2];
+        },
     };
 }
 
@@ -545,6 +560,30 @@ fn prefetchCSROffsets(csr: *const CSR, node_id: NodeId) void {
     // Prefetch the offsets for this node — hides L2 latency
     const ptr: [*]const u8 = @ptrCast(&csr.offsets[node_id]);
     @prefetch(ptr, .{ .rw = .read, .locality = 1 });
+}
+
+/// Reconstruct path from flat parent array.
+fn reconstructFlatPath(
+    allocator: Allocator,
+    parent: []const NodeId,
+    from_id: NodeId,
+    to_id: NodeId,
+) !PathResult {
+    var path = std.array_list.Managed(NodeId).init(allocator);
+    errdefer path.deinit();
+
+    var current = to_id;
+    var safety: u32 = 0;
+    while (current != from_id) : (safety += 1) {
+        if (safety > 1_000_000) return error.PathNotFound;
+        try path.append(current);
+        current = parent[current];
+        if (current == graph_mod.INVALID_ID) return error.PathNotFound;
+    }
+    try path.append(from_id);
+
+    std.mem.reverse(NodeId, path.items);
+    return PathResult{ .nodes = try path.toOwnedSlice(), .total_weight = 0 };
 }
 
 fn reconstructPath(

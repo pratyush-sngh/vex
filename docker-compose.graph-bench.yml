@@ -1,0 +1,24 @@
+services:
+  memgraph:
+    image: memgraph/memgraph:latest
+    container_name: memgraph-bench
+    ports:
+      - "17687:7687"
+    command: ["--also-log-to-stderr", "--log-level=WARNING"]
+    volumes:
+      - memgraph_data:/var/lib/memgraph
+
+  vex:
+    build:
+      context: .
+      dockerfile: Dockerfile.vex
+    container_name: vex-graph-bench
+    command: ["--port", "6380", "--data-dir", "/data", "--no-persistence", "--reactor"]
+    ports:
+      - "17380:6380"
+    volumes:
+      - vex_graph_data:/data
+
+volumes:
+  memgraph_data:
+  vex_graph_data:
