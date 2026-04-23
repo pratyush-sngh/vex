@@ -97,6 +97,9 @@ pub const GraphEngine = struct {
 
     // ─── Compaction state ───────────────────
     needs_compact: bool,
+    /// Monotonically increasing mutation counter. Incremented on every
+    /// write operation. Used as replication cursor for followers.
+    mutation_seq: u64,
     /// True when all edges in the base CSR are alive (no deletions since
     /// last compact). Allows skipping edge_alive checks and edge_idx
     /// loads in the traverse hot path — halves CSR data loaded.
@@ -129,6 +132,7 @@ pub const GraphEngine = struct {
             .node_props = PropertyStore.init(allocator),
             .edge_props = PropertyStore.init(allocator),
             .needs_compact = false,
+            .mutation_seq = 0,
             .all_base_edges_alive = true,
             .bulk_loading = false,
         };
@@ -181,6 +185,7 @@ pub const GraphEngine = struct {
 
         if (self.type_intern.count() > 1) self.flags.is_untyped = false;
 
+        self.mutation_seq += 1;
         return id;
     }
 
@@ -221,6 +226,7 @@ pub const GraphEngine = struct {
             }
         }
         self.flags.has_node_props = true;
+        self.mutation_seq += 1;
     }
 
     pub fn removeNode(self: *GraphEngine, key: []const u8) !void {
@@ -238,6 +244,7 @@ pub const GraphEngine = struct {
         _ = self.key_to_id.remove(key);
         self.node_props.deleteAll(id);
         self.needs_compact = true;
+        self.mutation_seq += 1;
     }
 
     // ─── Edge Operations ──────────────────────────────────────────────
@@ -278,6 +285,7 @@ pub const GraphEngine = struct {
             }
         }
 
+        self.mutation_seq += 1;
         return eid;
     }
 
@@ -302,6 +310,7 @@ pub const GraphEngine = struct {
         self.edge_props.deleteAll(eid);
         self.all_base_edges_alive = false;
         self.needs_compact = true;
+        self.mutation_seq += 1;
     }
 
     pub fn setEdgeProperty(self: *GraphEngine, eid: EdgeId, prop_key: []const u8, prop_val: []const u8) !void {
@@ -316,6 +325,7 @@ pub const GraphEngine = struct {
             }
         }
         self.flags.has_edge_props = true;
+        self.mutation_seq += 1;
     }
 
     // ─── Query Primitives (used by query_v2.zig) ─────────────────────

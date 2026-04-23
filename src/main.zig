@@ -3,6 +3,7 @@ const KVStore = @import("engine/kv.zig").KVStore;
 const GraphEngine = @import("engine/graph.zig").GraphEngine;
 const Server = @import("server/tcp.zig").Server;
 const ScaleMode = @import("server/tcp.zig").ScaleMode;
+const TlsContext = @import("server/tls.zig").TlsContext;
 const CommandHandler = @import("command/handler.zig").CommandHandler;
 const KeysMode = @import("command/handler.zig").KeysMode;
 const snapshot = @import("storage/snapshot.zig");
@@ -92,6 +93,24 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // ── TLS setup ────────────────────────────────────────────────────
+    var tls_ctx: ?TlsContext = null;
+    if (config.tls_cert) |cert| {
+        if (config.tls_key) |key| {
+            const cert_z = try allocator.dupeZ(u8, cert);
+            defer allocator.free(cert_z);
+            const key_z = try allocator.dupeZ(u8, key);
+            defer allocator.free(key_z);
+            tls_ctx = TlsContext.init(cert_z, key_z) catch |err| blk: {
+                log("warning: TLS init failed: {s} (running without TLS)", .{@errorName(err)});
+                break :blk null;
+            };
+        } else {
+            log("warning: --tls-cert requires --tls-key (running without TLS)", .{});
+        }
+    }
+    defer if (tls_ctx) |*t| t.deinit();
+
     printBanner(config.port, kv.dbsize(), graph.nodeCount(), replayed);
 
     var server = try Server.init(
@@ -110,6 +129,7 @@ pub fn main(init: std.process.Init) !void {
         config.requirepass,
         config.maxclients,
         config.max_client_buffer,
+        if (tls_ctx) |*t| t else null,
     );
     if (config.reactor) {
         server.runReactor(config.workers, &shutdown_requested) catch |err| {
@@ -150,6 +170,8 @@ const Config = struct {
     requirepass: ?[]const u8,
     maxclients: u32,
     max_client_buffer: usize,
+    tls_cert: ?[]const u8,
+    tls_key: ?[]const u8,
 };
 
 fn parseArgs(init: std.process.Init) Config {
@@ -168,6 +190,8 @@ fn parseArgs(init: std.process.Init) Config {
     var requirepass: ?[]const u8 = null;
     var maxclients: u32 = 10000;
     var max_client_buffer: usize = 1024 * 1024; // 1MB
+    var tls_cert: ?[]const u8 = null;
+    var tls_key: ?[]const u8 = null;
 
     var it = std.process.Args.Iterator.init(init.minimal.args);
     defer it.deinit();
@@ -239,6 +263,14 @@ fn parseArgs(init: std.process.Init) Config {
             if (it.next()) |n| {
                 max_client_buffer = std.fmt.parseInt(usize, std.mem.sliceTo(n, 0), 10) catch 1024 * 1024;
             }
+        } else if (std.mem.eql(u8, arg, "--tls-cert")) {
+            if (it.next()) |p| {
+                tls_cert = std.mem.sliceTo(p, 0);
+            }
+        } else if (std.mem.eql(u8, arg, "--tls-key")) {
+            if (it.next()) |p| {
+                tls_key = std.mem.sliceTo(p, 0);
+            }
         }
     }
 
@@ -258,6 +290,8 @@ fn parseArgs(init: std.process.Init) Config {
         .requirepass = requirepass,
         .maxclients = maxclients,
         .max_client_buffer = max_client_buffer,
+        .tls_cert = tls_cert,
+        .tls_key = tls_key,
     };
 }
 
@@ -308,4 +342,6 @@ test {
     _ = @import("engine/pool_arena.zig");
     _ = @import("engine/property_store.zig");
     _ = @import("command/comptime_dispatch.zig");
+    _ = @import("cluster/config.zig");
+    _ = @import("cluster/protocol.zig");
 }
