@@ -162,8 +162,10 @@ pub fn traverse(
     return result.toOwnedSlice();
 }
 
-/// BFS shortest path (unweighted). Uses flat parent array (not HashMap)
-/// for O(1) per-node parent tracking instead of O(50ns) hash+probe.
+/// Bidirectional BFS shortest path (unweighted).
+/// Searches from BOTH ends simultaneously, meeting in the middle.
+/// Explores ~2*sqrt(N) nodes instead of ~N — dramatically faster on large graphs.
+/// Uses flat parent arrays for O(1) per-node tracking.
 pub fn shortestPath(
     g: *const GraphEngine,
     allocator: Allocator,
@@ -181,82 +183,209 @@ pub fn shortestPath(
     }
 
     const node_cap = g.node_keys.items.len;
-
-    var visited = try std.DynamicBitSet.initEmpty(allocator, node_cap);
-    defer visited.deinit();
-
-    // Flat parent array: parent[node_id] = predecessor. ~1ns per access vs ~50ns HashMap.
-    const parent = try allocator.alloc(NodeId, node_cap);
-    defer allocator.free(parent);
-    @memset(parent, graph_mod.INVALID_ID);
-
-    const QueueItem = struct { id: NodeId, depth: u32 };
-    var queue = std.array_list.Managed(QueueItem).init(allocator);
-    defer queue.deinit();
-
-    visited.set(from_id);
-    parent[from_id] = from_id; // sentinel: start node is its own parent
-    try queue.append(.{ .id = from_id, .depth = 0 });
-
     const all_alive = g.all_base_edges_alive;
     const has_delta = g.delta_edges.items.len > 0;
     const csrs = getCSRSlice(g, .both);
 
-    var head: usize = 0;
-    while (head < queue.items.len) {
-        const item = queue.items[head];
-        head += 1;
+    // Forward search (from start)
+    var fwd_visited = try std.DynamicBitSet.initEmpty(allocator, node_cap);
+    defer fwd_visited.deinit();
+    const fwd_parent = try allocator.alloc(NodeId, node_cap);
+    defer allocator.free(fwd_parent);
+    @memset(fwd_parent, graph_mod.INVALID_ID);
 
-        if (item.depth >= max_depth) continue;
+    // Backward search (from target)
+    var bwd_visited = try std.DynamicBitSet.initEmpty(allocator, node_cap);
+    defer bwd_visited.deinit();
+    const bwd_parent = try allocator.alloc(NodeId, node_cap);
+    defer allocator.free(bwd_parent);
+    @memset(bwd_parent, graph_mod.INVALID_ID);
 
-        if (head < queue.items.len) {
-            prefetchCSROffsets(&g.base_out, queue.items[head].id);
-            prefetchCSROffsets(&g.base_in, queue.items[head].id);
-        }
+    const QueueItem = struct { id: NodeId, depth: u32 };
+    var fwd_queue = std.array_list.Managed(QueueItem).init(allocator);
+    defer fwd_queue.deinit();
+    var bwd_queue = std.array_list.Managed(QueueItem).init(allocator);
+    defer bwd_queue.deinit();
 
-        for (csrs) |csr| {
-            const targets = csr.neighbors(item.id);
-            if (targets.len == 0) continue;
+    fwd_visited.set(from_id);
+    fwd_parent[from_id] = from_id;
+    try fwd_queue.append(.{ .id = from_id, .depth = 0 });
 
-            if (all_alive) {
-                for (targets) |neighbor_id| {
-                    if (!g.node_alive.isSet(neighbor_id)) continue;
-                    if (visited.isSet(neighbor_id)) continue;
-                    visited.set(neighbor_id);
-                    parent[neighbor_id] = item.id;
-                    if (neighbor_id == to_id) return reconstructFlatPath(allocator, parent, from_id, to_id);
-                    try queue.append(.{ .id = neighbor_id, .depth = item.depth + 1 });
+    bwd_visited.set(to_id);
+    bwd_parent[to_id] = to_id;
+    try bwd_queue.append(.{ .id = to_id, .depth = 0 });
+
+    var fwd_head: usize = 0;
+    var bwd_head: usize = 0;
+    var fwd_depth: u32 = 0;
+    var bwd_depth: u32 = 0;
+
+    while ((fwd_head < fwd_queue.items.len or bwd_head < bwd_queue.items.len) and
+        fwd_depth + bwd_depth <= max_depth)
+    {
+        // Expand the smaller frontier (heuristic: explore less)
+        const expand_fwd = if (fwd_head >= fwd_queue.items.len)
+            false
+        else if (bwd_head >= bwd_queue.items.len)
+            true
+        else
+            (fwd_queue.items.len - fwd_head) <= (bwd_queue.items.len - bwd_head);
+
+        if (expand_fwd) {
+            // Expand one level of forward BFS
+            const level_end = fwd_queue.items.len;
+            while (fwd_head < level_end) {
+                const item = fwd_queue.items[fwd_head];
+                fwd_head += 1;
+
+                for (csrs) |csr| {
+                    const targets = csr.neighbors(item.id);
+                    if (all_alive) {
+                        for (targets) |nid| {
+                            if (!g.node_alive.isSet(nid)) continue;
+                            if (fwd_visited.isSet(nid)) continue;
+                            fwd_visited.set(nid);
+                            fwd_parent[nid] = item.id;
+
+                            // Check if backward search already visited this node
+                            if (bwd_visited.isSet(nid)) {
+                                return buildBidirectionalPath(allocator, fwd_parent, bwd_parent, from_id, to_id, nid);
+                            }
+                            try fwd_queue.append(.{ .id = nid, .depth = item.depth + 1 });
+                        }
+                    } else {
+                        const eidxs = csr.edgeIndices(item.id);
+                        for (targets, eidxs) |nid, eidx| {
+                            if (!g.edge_alive.isSet(eidx)) continue;
+                            if (!g.node_alive.isSet(nid)) continue;
+                            if (fwd_visited.isSet(nid)) continue;
+                            fwd_visited.set(nid);
+                            fwd_parent[nid] = item.id;
+                            if (bwd_visited.isSet(nid)) {
+                                return buildBidirectionalPath(allocator, fwd_parent, bwd_parent, from_id, to_id, nid);
+                            }
+                            try fwd_queue.append(.{ .id = nid, .depth = item.depth + 1 });
+                        }
+                    }
                 }
-            } else {
-                const edge_indices = csr.edgeIndices(item.id);
-                for (targets, edge_indices) |neighbor_id, eidx| {
-                    if (!g.edge_alive.isSet(eidx)) continue;
-                    if (!g.node_alive.isSet(neighbor_id)) continue;
-                    if (visited.isSet(neighbor_id)) continue;
-                    visited.set(neighbor_id);
-                    parent[neighbor_id] = item.id;
-                    if (neighbor_id == to_id) return reconstructFlatPath(allocator, parent, from_id, to_id);
-                    try queue.append(.{ .id = neighbor_id, .depth = item.depth + 1 });
+                if (has_delta) {
+                    for (g.delta_edges.items) |de| {
+                        if (de.from != item.id and de.to != item.id) continue;
+                        if (!g.edge_alive.isSet(de.eidx)) continue;
+                        const nid = if (de.from == item.id) de.to else de.from;
+                        if (!g.node_alive.isSet(nid)) continue;
+                        if (fwd_visited.isSet(nid)) continue;
+                        fwd_visited.set(nid);
+                        fwd_parent[nid] = item.id;
+                        if (bwd_visited.isSet(nid)) {
+                            return buildBidirectionalPath(allocator, fwd_parent, bwd_parent, from_id, to_id, nid);
+                        }
+                        try fwd_queue.append(.{ .id = nid, .depth = item.depth + 1 });
+                    }
                 }
             }
-        }
+            fwd_depth += 1;
+        } else {
+            // Expand one level of backward BFS
+            const level_end = bwd_queue.items.len;
+            while (bwd_head < level_end) {
+                const item = bwd_queue.items[bwd_head];
+                bwd_head += 1;
 
-        if (has_delta) {
-            for (g.delta_edges.items) |de| {
-                if (de.from != item.id and de.to != item.id) continue;
-                if (!g.edge_alive.isSet(de.eidx)) continue;
-                const neighbor_id = if (de.from == item.id) de.to else de.from;
-                if (!g.node_alive.isSet(neighbor_id)) continue;
-                if (visited.isSet(neighbor_id)) continue;
-                visited.set(neighbor_id);
-                parent[neighbor_id] = item.id;
-                if (neighbor_id == to_id) return reconstructFlatPath(allocator, parent, from_id, to_id);
-                try queue.append(.{ .id = neighbor_id, .depth = item.depth + 1 });
+                for (csrs) |csr| {
+                    const targets = csr.neighbors(item.id);
+                    if (all_alive) {
+                        for (targets) |nid| {
+                            if (!g.node_alive.isSet(nid)) continue;
+                            if (bwd_visited.isSet(nid)) continue;
+                            bwd_visited.set(nid);
+                            bwd_parent[nid] = item.id;
+                            if (fwd_visited.isSet(nid)) {
+                                return buildBidirectionalPath(allocator, fwd_parent, bwd_parent, from_id, to_id, nid);
+                            }
+                            try bwd_queue.append(.{ .id = nid, .depth = item.depth + 1 });
+                        }
+                    } else {
+                        const eidxs = csr.edgeIndices(item.id);
+                        for (targets, eidxs) |nid, eidx| {
+                            if (!g.edge_alive.isSet(eidx)) continue;
+                            if (!g.node_alive.isSet(nid)) continue;
+                            if (bwd_visited.isSet(nid)) continue;
+                            bwd_visited.set(nid);
+                            bwd_parent[nid] = item.id;
+                            if (fwd_visited.isSet(nid)) {
+                                return buildBidirectionalPath(allocator, fwd_parent, bwd_parent, from_id, to_id, nid);
+                            }
+                            try bwd_queue.append(.{ .id = nid, .depth = item.depth + 1 });
+                        }
+                    }
+                }
+                if (has_delta) {
+                    for (g.delta_edges.items) |de| {
+                        if (de.from != item.id and de.to != item.id) continue;
+                        if (!g.edge_alive.isSet(de.eidx)) continue;
+                        const nid = if (de.from == item.id) de.to else de.from;
+                        if (!g.node_alive.isSet(nid)) continue;
+                        if (bwd_visited.isSet(nid)) continue;
+                        bwd_visited.set(nid);
+                        bwd_parent[nid] = item.id;
+                        if (fwd_visited.isSet(nid)) {
+                            return buildBidirectionalPath(allocator, fwd_parent, bwd_parent, from_id, to_id, nid);
+                        }
+                        try bwd_queue.append(.{ .id = nid, .depth = item.depth + 1 });
+                    }
+                }
             }
+            bwd_depth += 1;
         }
     }
 
     return error.PathNotFound;
+}
+
+/// Build the path from bidirectional BFS: forward chain to meeting point + backward chain from meeting point.
+fn buildBidirectionalPath(
+    allocator: Allocator,
+    fwd_parent: []const NodeId,
+    bwd_parent: []const NodeId,
+    from_id: NodeId,
+    to_id: NodeId,
+    meet_id: NodeId,
+) !PathResult {
+    var path = std.array_list.Managed(NodeId).init(allocator);
+    errdefer path.deinit();
+
+    // Forward chain: from_id → ... → meet_id (reversed)
+    var fwd_chain = std.array_list.Managed(NodeId).init(allocator);
+    defer fwd_chain.deinit();
+    var cur = meet_id;
+    var safety: u32 = 0;
+    while (cur != from_id) : (safety += 1) {
+        if (safety > 1_000_000) return error.PathNotFound;
+        try fwd_chain.append(cur);
+        cur = fwd_parent[cur];
+        if (cur == graph_mod.INVALID_ID) return error.PathNotFound;
+    }
+    try fwd_chain.append(from_id);
+    std.mem.reverse(NodeId, fwd_chain.items);
+
+    // Add forward chain
+    try path.appendSlice(fwd_chain.items);
+
+    // Backward chain: meet_id → ... → to_id
+    // bwd_parent[meet_id] points toward to_id
+    if (meet_id != to_id) {
+        cur = bwd_parent[meet_id];
+        safety = 0;
+        while (cur != to_id and cur != graph_mod.INVALID_ID) : (safety += 1) {
+            if (safety > 1_000_000) return error.PathNotFound;
+            try path.append(cur);
+            cur = bwd_parent[cur];
+        }
+        if (cur == to_id) try path.append(to_id);
+    }
+
+    return PathResult{ .nodes = try path.toOwnedSlice(), .total_weight = 0 };
 }
 
 /// Dijkstra's algorithm for weighted shortest path.
