@@ -11,6 +11,8 @@ const KeysMode = @import("../command/handler.zig").KeysMode;
 const AOF = @import("../storage/aof.zig").AOF;
 const span = @import("../perf/span.zig");
 const ct = @import("../command/comptime_dispatch.zig");
+const TlsContext = @import("tls.zig").TlsContext;
+const SSL = @import("tls.zig").SSL;
 
 const READ_BUF_SIZE = 64 * 1024;
 const MAX_NEW_FDS = 256;
@@ -36,6 +38,7 @@ const Connection = struct {
     write_offset: usize,
     write_registered: bool,
     authenticated: bool,
+    ssl: ?*SSL,
 
     fn init(allocator: Allocator, fd: i32, auth_required: bool) !*Connection {
         const conn = try allocator.create(Connection);
@@ -48,6 +51,7 @@ const Connection = struct {
             .write_offset = 0,
             .write_registered = false,
             .authenticated = !auth_required,
+            .ssl = null,
         };
         return conn;
     }
@@ -100,6 +104,7 @@ pub const Worker = struct {
     maxclients: u32,
     max_client_buffer: usize,
     active_connections: *std.atomic.Value(u32),
+    tls_ctx: ?*TlsContext,
     new_fds: [MAX_NEW_FDS]i32,
     new_fd_head: std.atomic.Value(usize),
     new_fd_tail: std.atomic.Value(usize),
@@ -120,6 +125,7 @@ pub const Worker = struct {
         maxclients: u32,
         max_client_buffer: usize,
         active_connections: *std.atomic.Value(u32),
+        tls_ctx: ?*TlsContext,
     ) !Worker {
         return .{
             .id = id,
@@ -139,6 +145,7 @@ pub const Worker = struct {
             .maxclients = maxclients,
             .max_client_buffer = max_client_buffer,
             .active_connections = active_connections,
+            .tls_ctx = tls_ctx,
             .new_fds = [_]i32{-1} ** MAX_NEW_FDS,
             .new_fd_head = std.atomic.Value(usize).init(0),
             .new_fd_tail = std.atomic.Value(usize).init(0),

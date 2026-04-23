@@ -161,11 +161,8 @@ pub const ReplicationFollower = struct {
             .addr = 0,
         };
 
-        // Parse IP address
-        const host_z = try self.allocator.dupeZ(u8, leader.host);
-        defer self.allocator.free(host_z);
-        addr.addr = std.c.inet_addr(host_z);
-        if (addr.addr == 0xFFFFFFFF) return error.InvalidAddress;
+        // Parse IPv4 address manually (no inet_addr in Zig's std.c)
+        addr.addr = parseIpv4(leader.host) orelse return error.InvalidAddress;
 
         if (std.c.connect(sock, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) < 0) {
             _ = std.c.close(sock);
@@ -283,6 +280,23 @@ pub fn isWriteCommand(args: []const []const u8) bool {
         if (std.mem.eql(u8, upper[6..], "DELEDGE")) return true;
     }
     return false;
+}
+
+fn parseIpv4(s: []const u8) ?u32 {
+    var octets: [4]u8 = undefined;
+    var octet_idx: usize = 0;
+    var start: usize = 0;
+    for (s, 0..) |c, i| {
+        if (c == '.') {
+            if (octet_idx >= 3) return null;
+            octets[octet_idx] = std.fmt.parseInt(u8, s[start..i], 10) catch return null;
+            octet_idx += 1;
+            start = i + 1;
+        }
+    }
+    if (octet_idx != 3) return null;
+    octets[3] = std.fmt.parseInt(u8, s[start..], 10) catch return null;
+    return @as(u32, octets[0]) | (@as(u32, octets[1]) << 8) | (@as(u32, octets[2]) << 16) | (@as(u32, octets[3]) << 24);
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────

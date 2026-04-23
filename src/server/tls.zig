@@ -160,16 +160,16 @@ fn loadLib(name: [*:0]const u8) ?*anyopaque {
     for (suffixes) |suffix| {
         var buf: [256]u8 = undefined;
         const full = std.fmt.bufPrintZ(&buf, "lib{s}{s}", .{ std.mem.span(name), std.mem.span(suffix) }) catch continue;
-        if (std.c.dlopen(full, 2)) |handle| return handle; // RTLD_NOW = 2
+        if (std.c.dlopen(full, .{ .LAZY = true })) |handle| return handle;
     }
     // Try bare name
-    if (std.c.dlopen(name, 2)) |handle| return handle;
+    if (std.c.dlopen(name, .{ .LAZY = true })) |handle| return handle;
     return null;
 }
 
 fn loadSym(comptime T: type, handle: *anyopaque, name: [*:0]const u8) ?T {
     const ptr = std.c.dlsym(handle, name) orelse return null;
-    return @ptrCast(ptr);
+    return @ptrCast(@alignCast(ptr));
 }
 
 // ── Tests ───────────────────────────────────────────────────────────

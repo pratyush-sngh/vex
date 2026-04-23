@@ -51,10 +51,12 @@ pub fn main(init: std.process.Init) !void {
     defer graph.deinit();
 
     // ── Persistence setup ────────────────────────────────────────────
-    std.Io.Dir.cwd().createDirPath(io, config.data_dir) catch |err| {
-        log("fatal: cannot create data directory '{s}': {s}", .{ config.data_dir, @errorName(err) });
-        return;
-    };
+    if (!config.no_persistence) {
+        std.Io.Dir.cwd().createDirPath(io, config.data_dir) catch |err| {
+            log("fatal: cannot create data directory '{s}': {s}", .{ config.data_dir, @errorName(err) });
+            return;
+        };
+    }
 
     const snapshot_path = try std.fmt.allocPrint(allocator, "{s}/vex.zdb", .{config.data_dir});
     defer allocator.free(snapshot_path);
@@ -110,6 +112,46 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     defer if (tls_ctx) |*t| t.deinit();
+
+    // ── Cluster setup ─────────────────────────────────────────────────
+    const cluster_config_mod = @import("cluster/config.zig");
+    const repl_mod = @import("cluster/replication.zig");
+
+    var cluster_conf: ?cluster_config_mod.ClusterConfig = null;
+    defer if (cluster_conf) |*cc| cc.deinit();
+
+    var repl_leader: ?repl_mod.ReplicationLeader = null;
+    defer if (repl_leader) |*rl| rl.deinit();
+    var repl_follower: ?repl_mod.ReplicationFollower = null;
+    defer if (repl_follower) |*rf| rf.deinit();
+
+    if (config.cluster_config) |cc_path| {
+        cluster_conf = cluster_config_mod.parse(allocator, io, cc_path) catch |err| blk: {
+            log("warning: cluster config parse failed: {s}", .{@errorName(err)});
+            break :blk null;
+        };
+
+        if (cluster_conf) |*cc| {
+            if (cc.isLeader()) {
+                log("cluster mode: LEADER (node {d})", .{cc.self_id});
+                var rl = repl_mod.ReplicationLeader.init(allocator, cc, config.port);
+                rl.start() catch |err| {
+                    log("warning: replication listener failed: {s}", .{@errorName(err)});
+                };
+                repl_leader = rl;
+            } else {
+                log("cluster mode: FOLLOWER (node {d})", .{cc.self_id});
+                var rf = repl_mod.ReplicationFollower.init(allocator, cc);
+                rf.connectToLeader() catch |err| {
+                    log("warning: cannot connect to leader: {s}", .{@errorName(err)});
+                };
+                rf.start() catch |err| {
+                    log("warning: replication receiver failed: {s}", .{@errorName(err)});
+                };
+                repl_follower = rf;
+            }
+        }
+    }
 
     printBanner(config.port, kv.dbsize(), graph.nodeCount(), replayed);
 

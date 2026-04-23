@@ -1,0 +1,47 @@
+services:
+  vex-leader:
+    build:
+      context: .
+      dockerfile: Dockerfile.vex
+    container_name: vex-leader
+    command: ["--port", "6380", "--no-persistence", "--reactor", "--cluster-config", "/etc/vex/cluster.conf"]
+    volumes:
+      - ./test/cluster-leader.conf:/etc/vex/cluster.conf:ro
+    ports:
+      - "16380:6380"
+    networks:
+      - vex-cluster
+
+  vex-follower1:
+    build:
+      context: .
+      dockerfile: Dockerfile.vex
+    container_name: vex-follower1
+    command: ["--port", "6380", "--no-persistence", "--reactor", "--cluster-config", "/etc/vex/cluster.conf"]
+    volumes:
+      - ./test/cluster-follower1.conf:/etc/vex/cluster.conf:ro
+    ports:
+      - "16381:6380"
+    depends_on:
+      - vex-leader
+    networks:
+      - vex-cluster
+
+  vex-follower2:
+    build:
+      context: .
+      dockerfile: Dockerfile.vex
+    container_name: vex-follower2
+    command: ["--port", "6380", "--no-persistence", "--reactor", "--cluster-config", "/etc/vex/cluster.conf"]
+    volumes:
+      - ./test/cluster-follower2.conf:/etc/vex/cluster.conf:ro
+    ports:
+      - "16382:6380"
+    depends_on:
+      - vex-leader
+    networks:
+      - vex-cluster
+
+networks:
+  vex-cluster:
+    driver: bridge
