@@ -260,8 +260,17 @@ pub const ConcurrentKV = struct {
     }
 
     fn lockStripe(s: *Stripe) void {
+        if (s.mutex.tryLock()) return;
+        // Contended: spin 4 times then yield
+        var spin: u32 = 0;
         while (!s.mutex.tryLock()) {
-            std.atomic.spinLoopHint();
+            if (spin < 4) {
+                std.atomic.spinLoopHint();
+                spin += 1;
+            } else {
+                std.Thread.yield() catch {};
+                spin = 0;
+            }
         }
     }
 
