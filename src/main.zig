@@ -342,6 +342,8 @@ test {
     _ = @import("engine/pool_arena.zig");
     _ = @import("engine/property_store.zig");
     _ = @import("command/comptime_dispatch.zig");
+    _ = @import("server/tls.zig");
     _ = @import("cluster/config.zig");
     _ = @import("cluster/protocol.zig");
+    _ = @import("cluster/replication.zig");
 }

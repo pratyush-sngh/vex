@@ -9,6 +9,7 @@ const CommandHandler = @import("../command/handler.zig").CommandHandler;
 const KeysMode = @import("../command/handler.zig").KeysMode;
 const AOF = @import("../storage/aof.zig").AOF;
 const span = @import("../perf/span.zig");
+const TlsContext = @import("tls.zig").TlsContext;
 
 const READ_BUF_SIZE = 64 * 1024; // 64 KiB per client
 const JOB_QUEUE_CAP: usize = 65_536;
@@ -780,6 +781,7 @@ pub const Server = struct {
     requirepass: ?[]const u8,
     maxclients: u32,
     max_client_buffer: usize,
+    tls_ctx: ?*TlsContext,
     active_connections: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     pub fn init(
@@ -798,6 +800,7 @@ pub const Server = struct {
         requirepass: ?[]const u8,
         maxclients: u32,
         max_client_buffer: usize,
+        tls_ctx: ?*TlsContext,
     ) !Server {
         const resolved = try std.Io.net.IpAddress.resolve(io, host, port);
         const bind_address: std.Io.net.IpAddress = switch (resolved) {
@@ -823,6 +826,7 @@ pub const Server = struct {
             .requirepass = requirepass,
             .maxclients = maxclients,
             .max_client_buffer = max_client_buffer,
+            .tls_ctx = tls_ctx,
         };
     }
 
