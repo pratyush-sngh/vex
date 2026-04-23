@@ -133,30 +133,41 @@ pub const ConcurrentKV = struct {
         return self.setInternal(key, value, 0);
     }
 
-    /// SET with pre-allocated value — caller provides owned memory.
-    /// The value is NOT copied; ConcurrentKV takes ownership.
-    /// Caller must NOT free the value after this call.
-    /// If the key already exists, the old value is freed via self.allocator.
-    pub fn setPrealloc(self: *ConcurrentKV, key: []const u8, owned_value: []u8, expires_at: i64) !void {
+    /// SET with pre-allocated key+value. Caller provides owned memory.
+    /// ConcurrentKV takes ownership. Old value freed OUTSIDE the lock.
+    /// On insert, owned_key is used. On update, owned_key is freed by caller
+    /// (returned as stale_key).
+    pub fn setPrealloc(
+        self: *ConcurrentKV,
+        key: []const u8,
+        owned_key: []u8,
+        owned_value: []u8,
+        expires_at: i64,
+    ) struct { stale_val: ?[]const u8, stale_key: ?[]const u8 } {
         const s = self.getStripe(key);
         lockStripe(s);
-        defer unlockStripe(s);
 
         const has_ttl = expires_at != 0;
         const result = s.map.getPtr(key);
         if (result) |existing| {
-            self.allocator.free(existing.value);
+            const old_val = existing.value;
             existing.value = owned_value;
             existing.expires_at = expires_at;
             existing.flags = .{ .has_ttl = has_ttl };
+            unlockStripe(s);
+            // Free old value + unused key OUTSIDE lock
+            return .{ .stale_val = old_val, .stale_key = owned_key };
         } else {
-            const owned_key = try self.allocator.dupe(u8, key);
-            errdefer self.allocator.free(owned_key);
-            try s.map.put(owned_key, .{
+            s.map.put(owned_key, .{
                 .value = owned_value,
                 .expires_at = expires_at,
                 .flags = .{ .has_ttl = has_ttl },
-            });
+            }) catch {
+                unlockStripe(s);
+                return .{ .stale_val = owned_value, .stale_key = owned_key };
+            };
+            unlockStripe(s);
+            return .{ .stale_val = null, .stale_key = null };
         }
     }
 
@@ -169,18 +180,23 @@ pub const ConcurrentKV = struct {
         return self.setInternal(key, value, self.nowMillis() + ttl_millis);
     }
 
-    pub fn delete(self: *ConcurrentKV, key: []const u8) bool {
+    /// Delete a key. Returns stale key+value for caller to free OUTSIDE any lock.
+    pub fn deleteStale(self: *ConcurrentKV, key: []const u8) struct { found: bool, stale_key: ?[]const u8, stale_val: ?[]const u8 } {
         const s = self.getStripe(key);
         lockStripe(s);
-        defer unlockStripe(s);
-
         const result = s.map.fetchRemove(key);
+        unlockStripe(s);
         if (result) |kv| {
-            self.allocator.free(kv.key);
-            self.allocator.free(kv.value.value);
-            return true;
+            return .{ .found = true, .stale_key = kv.key, .stale_val = kv.value.value };
         }
-        return false;
+        return .{ .found = false, .stale_key = null, .stale_val = null };
+    }
+
+    pub fn delete(self: *ConcurrentKV, key: []const u8) bool {
+        const stale = self.deleteStale(key);
+        if (stale.stale_key) |k| self.allocator.free(k);
+        if (stale.stale_val) |v| self.allocator.free(v);
+        return stale.found;
     }
 
     pub fn exists(self: *ConcurrentKV, key: []const u8) bool {

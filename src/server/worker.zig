@@ -414,9 +414,12 @@ pub const Worker = struct {
                 },
                 'S' => if (args.len >= 3 and equalsAsciiUpper(cmd, "SET")) {
                     const ns_key = nsKey(conn.selected_db, args[1]) orelse return false;
-                    // Pre-allocate value OUTSIDE the stripe lock (reduces lock hold time)
-                    const val_copy = self.allocator.dupe(u8, args[2]) catch return false;
-                    errdefer self.allocator.free(val_copy);
+                    // Pre-allocate key+value OUTSIDE the stripe lock
+                    const key_copy = self.allocator.dupe(u8, ns_key) catch return false;
+                    const val_copy = self.allocator.dupe(u8, args[2]) catch {
+                        self.allocator.free(key_copy);
+                        return false;
+                    };
                     var expires: i64 = 0;
                     if (args.len >= 5 and equalsAsciiUpper(args[3], "EX")) {
                         const t = std.fmt.parseInt(i64, args[4], 10) catch return false;
@@ -425,14 +428,22 @@ pub const Worker = struct {
                         const t = std.fmt.parseInt(i64, args[4], 10) catch return false;
                         expires = ckv.nowMillis() + t;
                     }
-                    ckv.setPrealloc(ns_key, val_copy, expires) catch return false;
+                    // Lock held only for HashMap update (~20ns), not malloc (~60ns)
+                    const stale = ckv.setPrealloc(ns_key, key_copy, val_copy, expires);
+                    // Free stale data OUTSIDE the lock
+                    if (stale.stale_val) |v| self.allocator.free(v);
+                    if (stale.stale_key) |k| self.allocator.free(k);
                     if (self.aof) |a| a.logCommand(args);
                     conn.write_buf.appendSlice(ct.resp_ok) catch {};
                     return true;
                 },
                 'D' => if (args.len >= 2 and equalsAsciiUpper(cmd, "DEL")) {
                     const ns_key = nsKey(conn.selected_db, args[1]) orelse return false;
-                    if (ckv.delete(ns_key)) {
+                    const stale = ckv.deleteStale(ns_key);
+                    // Free OUTSIDE lock
+                    if (stale.stale_key) |k| self.allocator.free(k);
+                    if (stale.stale_val) |v| self.allocator.free(v);
+                    if (stale.found) {
                         if (self.aof) |a| a.logCommand(args);
                         conn.write_buf.appendSlice(ct.RespInts.@"1") catch {};
                     } else {
