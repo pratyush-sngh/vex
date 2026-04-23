@@ -285,6 +285,41 @@ Clients must `AUTH mysecret` before any command (except PING). Password comparis
 | `--profile` | off | Enable latency profiling |
 | `--profile-every N` | 100000 | Print profile every N commands |
 
+## Roadmap
+
+### v0.3 — Distributed KV + Graph Read Replicas
+- Hash-partition KV across N machines (16384 slots, Redis Cluster compatible)
+- Shard map with epoch-based routing
+- Binary frame protocol for inter-node communication
+- Graph read replicas: full graph replicated to followers, reads on any replica, writes forwarded to leader
+- Leader/follower replication via mutation log streaming
+- Cluster config via `--cluster-config`
+
+### v0.4 — Production Hardening
+- TLS support (encrypted connections)
+- `maxmemory` with LRU eviction policy
+- True background save (`BGSAVE` without blocking)
+- AOF group commit (batch writes per event loop tick)
+- `MULTI`/`EXEC` transactions
+- Pub/Sub (`SUBSCRIBE`/`PUBLISH`)
+- Structured logging (JSON format, log levels)
+- Config file support (`vex.conf`)
+
+### v0.5 — Partitioned Graph
+- Hash-partition graph nodes across machines
+- Ghost nodes for 1-hop boundary cache
+- BSP (Bulk Synchronous Parallel) BFS for cross-partition traversals
+- Distributed Dijkstra with batched priority queue
+- Consistent hash ring with vnodes for rebalancing
+- Autoscaling: add/remove nodes based on load metrics
+
+### Future
+- Graph secondary indexes on properties
+- Cypher query language subset
+- io_uring batched read/write (Linux)
+- PageRank, connected components, betweenness centrality algorithms
+- WebSocket protocol support
+
 ## License
 
 MIT
