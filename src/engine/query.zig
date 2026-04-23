@@ -30,6 +30,9 @@ pub const PathResult = struct {
 ///   1. all_base_edges_alive fast path — skips edge_alive check + edge_idx load
 ///   2. Flat delta scan — linear scan of small delta edge list
 ///   3. Prefetching — prefetch next node's CSR offsets during current node processing
+/// Frontier-based BFS traversal. Processes entire levels at once using
+/// bitset frontiers instead of a per-node queue. More cache-friendly
+/// CSR access and enables bulk bitset operations.
 pub fn traverse(
     g: *const GraphEngine,
     allocator: Allocator,
@@ -42,12 +45,14 @@ pub fn traverse(
     var visited = try std.DynamicBitSet.initEmpty(allocator, node_cap);
     defer visited.deinit();
 
+    // Two frontiers: current level and next level (swap each iteration)
+    var frontier_a = try std.DynamicBitSet.initEmpty(allocator, node_cap);
+    defer frontier_a.deinit();
+    var frontier_b = try std.DynamicBitSet.initEmpty(allocator, node_cap);
+    defer frontier_b.deinit();
+
     var result = std.array_list.Managed(NodeId).init(allocator);
     errdefer result.deinit();
-
-    const QueueItem = struct { id: NodeId, depth: u32 };
-    var queue = std.array_list.Managed(QueueItem).init(allocator);
-    defer queue.deinit();
 
     // Resolve type filter to bitmask once
     const edge_type_mask: TypeMask = if (opts.edge_type_filter) |filter|
@@ -64,99 +69,113 @@ pub fn traverse(
         return result.toOwnedSlice();
     }
 
-    try queue.append(.{ .id = start_id, .depth = 0 });
     visited.set(start_id);
+    frontier_a.set(start_id);
+    try result.append(start_id);
 
     const all_alive = g.all_base_edges_alive;
     const has_delta = g.delta_edges.items.len > 0;
+    const csrs = getCSRSlice(g, opts.direction);
 
-    var head: usize = 0;
-    while (head < queue.items.len) {
-        const item = queue.items[head];
-        head += 1;
+    var current = &frontier_a;
+    var next = &frontier_b;
+    var depth: u32 = 0;
 
-        try result.append(item.id);
-        if (item.depth >= opts.max_depth) continue;
+    while (depth < opts.max_depth) {
+        // Clear next frontier
+        next.setRangeValue(.{ .start = 0, .end = node_cap }, false);
 
-        // ── FIX 3: Prefetch next node's CSR offsets ──
-        if (head < queue.items.len) {
-            const next_id = queue.items[head].id;
-            prefetchCSROffsets(&g.base_out, next_id);
-        }
+        var any_in_next = false;
 
-        // Early exit: check node's edge type mask
-        if (edge_type_mask != 0) {
-            const node_mask = switch (opts.direction) {
-                .outgoing => g.node_out_type_mask.items[item.id],
-                .incoming => g.node_in_type_mask.items[item.id],
-                .both => g.node_out_type_mask.items[item.id] | g.node_in_type_mask.items[item.id],
-            };
-            if (node_mask & edge_type_mask == 0) continue;
-        }
+        // Iterate set bits in current frontier
+        var iter = current.iterator(.{});
+        while (iter.next()) |node_id_usize| {
+            const node_id: NodeId = @intCast(node_id_usize);
 
-        // ── Scan base CSR ──
-        const csrs = getCSRSlice(g, opts.direction);
-        for (csrs) |csr| {
-            const targets = csr.neighbors(item.id);
-            if (targets.len == 0) continue;
+            // Early exit: check node's edge type mask
+            if (edge_type_mask != 0) {
+                const node_mask = switch (opts.direction) {
+                    .outgoing => g.node_out_type_mask.items[node_id],
+                    .incoming => g.node_in_type_mask.items[node_id],
+                    .both => g.node_out_type_mask.items[node_id] | g.node_in_type_mask.items[node_id],
+                };
+                if (node_mask & edge_type_mask == 0) continue;
+            }
 
-            if (all_alive and edge_type_mask == 0 and node_type_id == null) {
-                // ── FIX 1: Fast path — no edge_idx load, no alive check ──
-                for (targets) |neighbor_id| {
-                    if (!g.node_alive.isSet(neighbor_id)) continue;
-                    if (visited.isSet(neighbor_id)) continue;
-                    visited.set(neighbor_id);
-                    try queue.append(.{ .id = neighbor_id, .depth = item.depth + 1 });
+            // Scan CSR neighbors
+            for (csrs) |csr| {
+                const targets = csr.neighbors(node_id);
+                if (targets.len == 0) continue;
+
+                if (all_alive and edge_type_mask == 0 and node_type_id == null) {
+                    for (targets) |nid| {
+                        if (!g.node_alive.isSet(nid)) continue;
+                        if (visited.isSet(nid)) continue;
+                        visited.set(nid);
+                        next.set(nid);
+                        any_in_next = true;
+                        try result.append(nid);
+                    }
+                } else {
+                    const edge_indices = csr.edgeIndices(node_id);
+                    for (targets, edge_indices) |nid, eidx| {
+                        if (!g.edge_alive.isSet(eidx)) continue;
+                        if (!g.node_alive.isSet(nid)) continue;
+                        if (visited.isSet(nid)) continue;
+
+                        if (edge_type_mask != 0) {
+                            const emask = StringIntern.mask(g.edge_type_id.items[eidx]);
+                            if (edge_type_mask & emask == 0) continue;
+                        }
+                        if (node_type_id) |ntid| {
+                            if (g.node_type_id.items[nid] != ntid) continue;
+                        }
+
+                        visited.set(nid);
+                        next.set(nid);
+                        any_in_next = true;
+                        try result.append(nid);
+                    }
                 }
-            } else {
-                // Slow path — need edge_idx for alive/type checks
-                const edge_indices = csr.edgeIndices(item.id);
-                for (targets, edge_indices) |neighbor_id, eidx| {
-                    if (!g.edge_alive.isSet(eidx)) continue;
-                    if (!g.node_alive.isSet(neighbor_id)) continue;
-                    if (visited.isSet(neighbor_id)) continue;
+            }
+
+            // Delta edges
+            if (has_delta) {
+                for (g.delta_edges.items) |de| {
+                    const matches = switch (opts.direction) {
+                        .outgoing => de.from == node_id,
+                        .incoming => de.to == node_id,
+                        .both => de.from == node_id or de.to == node_id,
+                    };
+                    if (!matches) continue;
+                    if (!g.edge_alive.isSet(de.eidx)) continue;
+                    const nid = if (de.from == node_id) de.to else de.from;
+                    if (!g.node_alive.isSet(nid)) continue;
+                    if (visited.isSet(nid)) continue;
 
                     if (edge_type_mask != 0) {
-                        const emask = StringIntern.mask(g.edge_type_id.items[eidx]);
+                        const emask = StringIntern.mask(g.edge_type_id.items[de.eidx]);
                         if (edge_type_mask & emask == 0) continue;
                     }
                     if (node_type_id) |ntid| {
-                        if (g.node_type_id.items[neighbor_id] != ntid) continue;
+                        if (g.node_type_id.items[nid] != ntid) continue;
                     }
 
-                    visited.set(neighbor_id);
-                    try queue.append(.{ .id = neighbor_id, .depth = item.depth + 1 });
+                    visited.set(nid);
+                    next.set(nid);
+                    any_in_next = true;
+                    try result.append(nid);
                 }
             }
         }
 
-        // ── FIX 2: Scan flat delta edges (linear, typically <100 entries) ──
-        if (has_delta) {
-            for (g.delta_edges.items) |de| {
-                const matches = switch (opts.direction) {
-                    .outgoing => de.from == item.id,
-                    .incoming => de.to == item.id,
-                    .both => de.from == item.id or de.to == item.id,
-                };
-                if (!matches) continue;
-                if (!g.edge_alive.isSet(de.eidx)) continue;
+        if (!any_in_next) break; // no new nodes discovered
+        depth += 1;
 
-                const neighbor_id = if (de.from == item.id) de.to else de.from;
-                if (!g.node_alive.isSet(neighbor_id)) continue;
-                if (visited.isSet(neighbor_id)) continue;
-
-                if (edge_type_mask != 0) {
-                    const emask = StringIntern.mask(g.edge_type_id.items[de.eidx]);
-                    if (edge_type_mask & emask == 0) continue;
-                }
-                if (node_type_id) |ntid| {
-                    if (g.node_type_id.items[neighbor_id] != ntid) continue;
-                }
-
-                visited.set(neighbor_id);
-                try queue.append(.{ .id = neighbor_id, .depth = item.depth + 1 });
-            }
-        }
+        // Swap frontiers
+        const tmp = current;
+        current = next;
+        next = tmp;
     }
 
     return result.toOwnedSlice();
