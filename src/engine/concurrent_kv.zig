@@ -12,12 +12,18 @@ pub const ConcurrentKV = struct {
     stripes: [STRIPE_COUNT]Stripe,
     allocator: Allocator,
     io: std.Io,
+    cached_now_ms: i64 = 0,
 
     pub const Entry = KVStore.Entry;
 
+    /// Cache-line aligned to prevent false sharing between workers.
+    /// Without alignment, two adjacent stripes share a cache line and
+    /// CAS operations bounce that line between cores (~30-60ns per bounce).
     const Stripe = struct {
-        mutex: std.atomic.Mutex,
+        mutex: std.atomic.Mutex align(64),
         map: std.StringHashMap(Entry),
+        ttl_count: u32 = 0,
+        tombstone_count: u32 = 0,
     };
 
     /// Owned value returned by get(). Caller must call deinit() to free.
@@ -102,20 +108,24 @@ pub const ConcurrentKV = struct {
             out.appendSlice("$-1\r\n") catch {};
             return false;
         };
-        if (self.isExpired(entry)) {
+        if (entry.flags.deleted) {
+            out.appendSlice("$-1\r\n") catch {};
+            return false;
+        }
+        if (entry.flags.has_ttl and self.cached_now_ms > entry.expires_at) {
             self.evictLocked(s, key);
             out.appendSlice("$-1\r\n") catch {};
             return false;
         }
-        // Write RESP bulk string while holding lock (value memory is valid)
+        // Write RESP bulk string: "$len\r\nvalue\r\n"
+        // Pre-allocate total needed to avoid multiple capacity checks
+        const vlen = entry.value.len;
         var hdr: [32]u8 = undefined;
-        const h = std.fmt.bufPrint(&hdr, "${d}\r\n", .{entry.value.len}) catch {
-            out.appendSlice("$-1\r\n") catch {};
-            return false;
-        };
-        out.appendSlice(h) catch {};
-        out.appendSlice(entry.value) catch {};
-        out.appendSlice("\r\n") catch {};
+        const h = std.fmt.bufPrint(&hdr, "${d}\r\n", .{vlen}) catch return false;
+        out.ensureTotalCapacity(out.items.len + h.len + vlen + 2) catch {};
+        out.appendSliceAssumeCapacity(h);
+        out.appendSliceAssumeCapacity(entry.value);
+        out.appendSliceAssumeCapacity("\r\n");
         return true;
     }
 
@@ -286,13 +296,18 @@ pub const ConcurrentKV = struct {
         for (&self.stripes) |*s| unlockStripe(s);
     }
 
+    /// Update cached clock. Call once per event loop tick.
+    pub fn updateClock(self: *ConcurrentKV) void {
+        self.cached_now_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
+    }
+
     fn nowMillis(self: *const ConcurrentKV) i64 {
-        return std.Io.Timestamp.now(self.io, .real).toMilliseconds();
+        return self.cached_now_ms;
     }
 
     fn isExpired(self: *const ConcurrentKV, entry: *const Entry) bool {
         if (!entry.flags.has_ttl) return false;
-        return self.nowMillis() > entry.expires_at;
+        return self.cached_now_ms > entry.expires_at;
     }
 
     /// Remove an expired entry while the stripe is already locked.

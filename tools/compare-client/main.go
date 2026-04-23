@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"flag"
 	"fmt"
@@ -48,6 +49,7 @@ func main() {
 		concurrency  = flag.Int("c", 1, "parallel workers (connections) per scenario")
 		timeout      = flag.Duration("timeout", 3*time.Second, "dial/read/write timeout")
 		vexFirst = flag.Bool("vex-first", false, "run vex before redis for KV scenarios")
+		pipeline     = flag.Int("pipeline", 0, "commands per pipeline batch (0=no pipeline)")
 	)
 	flag.Parse()
 	if *concurrency < 1 {
@@ -123,6 +125,39 @@ func main() {
 			key := fmt.Sprintf("k:%d", i)
 			return clients[worker%len(clients)].cmd("DEL", key)
 		})
+
+		// Pipeline benchmarks (if -pipeline > 0)
+		if *pipeline > 0 {
+			pipeSize := *pipeline
+			// Repopulate for pipelined GET
+			if err := clients[0].cmd("FLUSHDB"); err != nil {
+				fmt.Printf("flushdb failed: %v\n\n", err)
+				continue
+			}
+			// Seed data
+			for i := 0; i < cfg.n; i++ {
+				_ = clients[0].cmd("SET", fmt.Sprintf("k:%d", i), fmt.Sprintf("v:%d", i))
+			}
+
+			printBench(fmt.Sprintf("PIPE-SET(%d)", pipeSize), cfg, func(i int, worker int) error {
+				batch := make([][]string, 0, pipeSize)
+				for j := 0; j < pipeSize; j++ {
+					idx := i*pipeSize + j
+					batch = append(batch, []string{"SET", fmt.Sprintf("pk:%d", idx), fmt.Sprintf("pv:%d", idx)})
+				}
+				return clients[worker%len(clients)].cmdPipeline(batch)
+			})
+
+			printBench(fmt.Sprintf("PIPE-GET(%d)", pipeSize), cfg, func(i int, worker int) error {
+				batch := make([][]string, 0, pipeSize)
+				for j := 0; j < pipeSize; j++ {
+					idx := i*pipeSize + j
+					batch = append(batch, []string{"GET", fmt.Sprintf("k:%d", idx%cfg.n)})
+				}
+				return clients[worker%len(clients)].cmdPipeline(batch)
+			})
+		}
+
 		fmt.Println()
 	}
 
@@ -421,6 +456,25 @@ func (c *client) cmd(parts ...string) error {
 	}
 	_, err := readRESP(c.rd)
 	return err
+}
+
+// cmdPipeline sends N commands in one write, then reads N responses.
+// This is how real Redis clients work — batching amortizes syscall overhead.
+func (c *client) cmdPipeline(cmds [][]string) error {
+	_ = c.conn.SetDeadline(time.Now().Add(c.timeout))
+	var buf bytes.Buffer
+	for _, parts := range cmds {
+		buf.Write(encodeArray(parts))
+	}
+	if _, err := c.conn.Write(buf.Bytes()); err != nil {
+		return err
+	}
+	for range cmds {
+		if _, err := readRESP(c.rd); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func encodeArray(parts []string) []byte {

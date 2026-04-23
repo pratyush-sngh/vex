@@ -161,6 +161,9 @@ pub const Worker = struct {
         var event_buf: [128]EventLoop.Event = undefined;
 
         while (true) {
+            // Update cached clocks once per event loop tick
+            if (self.ckv) |ckv| ckv.updateClock();
+
             const events = self.loop.poll(&event_buf, 100) catch continue;
 
             for (events) |ev| {
