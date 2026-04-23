@@ -133,6 +133,33 @@ pub const ConcurrentKV = struct {
         return self.setInternal(key, value, 0);
     }
 
+    /// SET with pre-allocated value — caller provides owned memory.
+    /// The value is NOT copied; ConcurrentKV takes ownership.
+    /// Caller must NOT free the value after this call.
+    /// If the key already exists, the old value is freed via self.allocator.
+    pub fn setPrealloc(self: *ConcurrentKV, key: []const u8, owned_value: []u8, expires_at: i64) !void {
+        const s = self.getStripe(key);
+        lockStripe(s);
+        defer unlockStripe(s);
+
+        const has_ttl = expires_at != 0;
+        const result = s.map.getPtr(key);
+        if (result) |existing| {
+            self.allocator.free(existing.value);
+            existing.value = owned_value;
+            existing.expires_at = expires_at;
+            existing.flags = .{ .has_ttl = has_ttl };
+        } else {
+            const owned_key = try self.allocator.dupe(u8, key);
+            errdefer self.allocator.free(owned_key);
+            try s.map.put(owned_key, .{
+                .value = owned_value,
+                .expires_at = expires_at,
+                .flags = .{ .has_ttl = has_ttl },
+            });
+        }
+    }
+
     pub fn setEx(self: *ConcurrentKV, key: []const u8, value: []const u8, ttl_seconds: i64) !void {
         const expires = self.nowMillis() + ttl_seconds * 1000;
         return self.setInternal(key, value, expires);
@@ -301,7 +328,7 @@ pub const ConcurrentKV = struct {
         self.cached_now_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
     }
 
-    fn nowMillis(self: *const ConcurrentKV) i64 {
+    pub fn nowMillis(self: *const ConcurrentKV) i64 {
         return self.cached_now_ms;
     }
 

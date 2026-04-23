@@ -414,15 +414,18 @@ pub const Worker = struct {
                 },
                 'S' => if (args.len >= 3 and equalsAsciiUpper(cmd, "SET")) {
                     const ns_key = nsKey(conn.selected_db, args[1]) orelse return false;
+                    // Pre-allocate value OUTSIDE the stripe lock (reduces lock hold time)
+                    const val_copy = self.allocator.dupe(u8, args[2]) catch return false;
+                    errdefer self.allocator.free(val_copy);
+                    var expires: i64 = 0;
                     if (args.len >= 5 and equalsAsciiUpper(args[3], "EX")) {
                         const t = std.fmt.parseInt(i64, args[4], 10) catch return false;
-                        ckv.setEx(ns_key, args[2], t) catch return false;
+                        expires = ckv.nowMillis() + t * 1000;
                     } else if (args.len >= 5 and equalsAsciiUpper(args[3], "PX")) {
                         const t = std.fmt.parseInt(i64, args[4], 10) catch return false;
-                        ckv.setPx(ns_key, args[2], t) catch return false;
-                    } else {
-                        ckv.set(ns_key, args[2]) catch return false;
+                        expires = ckv.nowMillis() + t;
                     }
+                    ckv.setPrealloc(ns_key, val_copy, expires) catch return false;
                     if (self.aof) |a| a.logCommand(args);
                     conn.write_buf.appendSlice(ct.resp_ok) catch {};
                     return true;
