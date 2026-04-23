@@ -1,135 +1,159 @@
 # Vex
 
-A high-performance KV + Graph database written in Zig. Speaks the Redis protocol (RESP), so you can connect with `redis-cli` or any Redis client library. Multi-reactor architecture with CSR graph engine.
+A high-performance KV + Graph database written in Zig. Speaks the Redis protocol (RESP), so you can connect with `redis-cli` or any Redis client library.
 
 ## Why Vex?
 
-- **Competitive with Redis** -- multi-reactor event loop, tombstone deletes, cached clocks, direct-write-first networking
-- **60x faster graph traversals** -- CSR (Compressed Sparse Row) adjacency, bitset visited sets, bitmask type filtering
-- **Graph operations built-in** -- nodes, edges, BFS traversal, shortest path (BFS + Dijkstra)
-- **4.3x less graph memory** -- SoA layout, interned types, shared property store (no per-entity HashMaps)
-- **Redis-compatible wire protocol** -- works with every Redis client in every language
+- **Up to 2x faster than Redis** -- multi-reactor with rwlock stripes, pipelined workloads hit 2.46M GET cmd/s
+- **Built-in graph engine** -- 60x faster BFS traversals via CSR adjacency, bitset-accelerated algorithms
+- **Redis-compatible** -- works with every Redis client library in every language
 - **Zero dependencies** -- pure Zig standard library, single binary
 
 ## Performance
 
-### KV: Vex vs Redis 8.0 (Docker, 6 workers)
+### Pipelined KV: Vex vs Redis 8.0 (Docker)
+
+Real Redis clients pipeline commands (batch multiple per TCP write). This is where Vex's multi-core architecture shines:
+
+| Benchmark | Redis cmd/s | Vex cmd/s | Speedup |
+|---|---|---|---|
+| PIPE-SET(100) c=16 | 1.18M | **2.25M** | **+91%** |
+| PIPE-GET(50) c=32 | 1.45M | **2.46M** | **+70%** |
+| PIPE-GET(100) c=16 | 1.52M | **2.96M** | **+96%** |
+
+### Single-command KV (no pipeline)
 
 | Concurrency | Vex SET | Redis SET | Vex GET | Redis GET |
 |---|---|---|---|---|
-| c=1 | **6,506** | 5,579 | 5,413 | **5,455** |
-| c=32 | **51,907** | 49,805 | 48,066 | **48,978** |
-| c=64 | 57,838 | **59,769** | **57,111** | 55,236 |
-| c=128 | 64,191 | **67,906** | **73,475** | 54,492 |
+| c=1 | **7,223** | 6,064 (+19%) | **7,079** | 6,679 (+6%) |
+| c=10 | 28,676 | **29,615** | **30,601** | 30,221 (+1%) |
+| c=32 | 49,080 | **53,707** (-9%) | **50,266** | 48,824 (+3%) |
 
-GET at c=128: **+35% faster** than Redis. SET at c=1: **+17% faster**.
+At c=1: Vex is faster (engine speed advantage). At c=32+: Redis's single-threaded model has zero coordination overhead. Pipeline to see Vex's multi-core advantage.
 
-### Graph Engine (internal benchmarks, 50K nodes / 500K edges)
+### Pipeline Scaling (c=1, single connection)
+
+| Pipeline size | Redis cmd/s | Vex cmd/s | Speedup |
+|---|---|---|---|
+| p=1 | 7,104 | 5,775 | -19% |
+| p=10 | 64,800 | **65,681** | +1% |
+| p=50 | 277,345 | **288,415** | +4% |
+| p=100 | 468,300 | **505,450** | +8% |
+
+Even on a single connection, Vex wins once pipelining amortizes the per-command overhead.
+
+### Graph Engine (50K nodes / 500K edges)
 
 | Operation | Time | Notes |
 |---|---|---|
-| BFS Traverse (depth 4) | 64 us | CSR + bitset visited + head-index dequeue |
-| Shortest Path | 146 us | Bitset-accelerated BFS |
-| Neighbors | <0.1 us | Zero-copy CSR slice return |
-| Memory | 19 MB | vs ~84 MB with naive adjacency lists |
+| BFS Traverse (depth 4) | **64 us** | 60x faster than naive adjacency lists |
+| Shortest Path | **146 us** | Bitset-accelerated BFS |
+| Neighbors | **<0.1 us** | Zero-copy CSR slice return |
+| Memory | **19 MB** | 4.3x less than per-entity HashMap model |
 
-### KV Engine (internal benchmarks, 100K ops)
+Redis has no graph operations. Vex provides BFS traversal, shortest path (unweighted + Dijkstra), and neighbor queries natively over RESP.
 
-| Operation | Time |
+### KV Engine Internals (100K ops, no network)
+
+| Operation | Latency |
 |---|---|
-| GET (hit) | 24 ns/op |
-| SET (insert) | 66 ns/op |
-| SET (update) | 74 ns/op |
-| DEL (tombstone) | 35 ns/op |
-| SET (reuse tombstone) | 41 ns/op |
+| GET (hit) | 24 ns |
+| SET (insert) | 66 ns |
+| DEL (tombstone) | 35 ns |
+| SET (reuse tombstone) | 41 ns |
 
 ## Quick Start
 
 ```bash
 zig build                                          # Build
 zig build run                                      # Run (port 6380, ./data/)
-zig build run -- --reactor --workers 4            # 4 worker threads (recommended)
-zig build run -- --reactor --workers 4 --port 7379 --no-persistence
+zig build run -- --reactor --workers 4            # Reactor mode (recommended)
+zig build run -- --reactor --port 7379 --no-persistence  # Benchmarking
 zig build test                                     # Run tests
 ```
+
+Workers auto-detect from CPU core count (capped at 8). Override with `--workers N`.
 
 ## Architecture
 
 ```
               Accept Thread (main)
               /    |    |    \
-         Worker0  W1   W2   W3     -- N event-loop threads
+         Worker0  W1   W2   W3     -- N event-loop threads (auto-detected)
          (epoll)  ...              -- epoll on Linux, kqueue on macOS, io_uring
          /  |  \
-      conn conn conn               -- non-blocking I/O, many conns per worker
+      conn conn conn               -- non-blocking I/O per worker
             |
-   ConcurrentKV (256-stripe locks) -- tombstone DEL, cached clock, getOrPut
-   GraphEngine  (CSR + delta)      -- SoA layout, bitset alive/visited, type masks
-   AOF          (thread-safe)      -- persistence
+   ConcurrentKV                    -- 256-stripe rwlock (parallel reads, exclusive writes)
+   GraphEngine                     -- CSR adjacency, SoA layout, bitset tracking
+   AOF                             -- thread-safe persistence
 ```
 
-### Engine Design
+### Why It's Fast
 
-**KV optimizations:**
-- Tombstone DEL (flag-based, ~35ns) with periodic compaction
-- Cached clock per event-loop tick (eliminates clock_gettime per GET)
-- `getOrPut` single-hash SET (was double-hash: getPtr + put)
-- `ttl_count` fast path: skip expiry checks when no keys have TTL
-- Compact Entry: `i64` expires_at (8B) instead of `?i64` (16B)
+**ConcurrentKV (256-stripe rwlock):**
+- GET takes read lock -- multiple workers read in parallel, zero blocking
+- SET takes write lock -- exclusive, but lock held only ~20ns (HashMap pointer swap)
+- Key+value allocated OUTSIDE lock, stale data freed OUTSIDE lock
+- Cached clock per event-loop tick (no clock_gettime syscall per GET)
+- Cache-line aligned stripes prevent false sharing between CPU cores
 
 **Graph engine (CSR + SoA + bitflags):**
 - Compressed Sparse Row adjacency: contiguous neighbor arrays, prefetcher-friendly
-- Struct-of-Arrays layout: node keys, type IDs, alive bits in separate flat arrays
-- DynamicBitSet visited set: 125KB for 1M nodes (fits L2), vs 2MB HashMap
-- TypeMask bitmask filtering: single AND per edge vs string comparison
-- Per-node type summary mask: skip entire nodes when no edges match filter
-- String interning: "service" stored once, referenced by u16 ID
+- DynamicBitSet visited set: 125KB for 1M nodes (fits L2 cache) vs 2MB HashMap
+- TypeMask bitmask filtering: single AND per edge, skip entire nodes via type summary masks
+- String interning: type strings stored once, referenced by u16 ID
 - Shared PropertyStore: one HashMap for all entities (zero overhead for no-prop entities)
-- Delta buffer with periodic compaction into base CSR
 
-**Networking optimizations:**
-- Head-index accumulator (no memmove per command, Redis-style qb_pos)
-- Direct-write-first (skip enableWrite/disableWrite syscalls for small responses)
-- Batch flush (one write() per read(), not per command)
-- Precomputed DB prefixes (comptime, zero runtime formatting)
-- Fast command dispatch (switch on cmd.len + first byte)
-- TCP_NODELAY on all accepted sockets
+**Networking:**
+- Zero-copy read: parse RESP directly from stack read buffer (no memcpy to heap)
+- Direct-write-first: skip enableWrite/disableWrite syscalls for small responses
+- Head-index accumulator: advance pointer, never memmove (Redis-style qb_pos)
+- Comptime dispatch: switch on (cmd.len, first_byte), pre-built RESP response literals
+- TCP_NODELAY on all sockets, auto-detected worker count
+
+### Source Layout
 
 ```
 src/
-├── main.zig                # Entry point, arg parsing, persistence recovery
+├── main.zig                # Entry point, arg parsing, signal handling
 ├── server/
-│   ├── tcp.zig             # Accept loop, legacy thread-per-conn, reactor mode
+│   ├── tcp.zig             # Accept loop, reactor mode, thread-per-conn mode
 │   ├── event_loop.zig      # Platform-abstracted poll (epoll/kqueue/io_uring)
 │   ├── worker.zig          # Multi-connection event loop worker
-│   └── resp.zig            # RESP v2 protocol parser
+│   ├── resp.zig            # RESP v2 protocol parser
+│   └── shard_router.zig    # Key-to-shard routing, MPSC queues (for future distributed)
 ├── engine/
-│   ├── kv.zig              # Hash map KV store with TTL, tombstone DEL
-│   ├── concurrent_kv.zig   # 256-stripe thread-safe KV store
+│   ├── kv.zig              # KV store with TTL, tombstone DEL, cached clock
+│   ├── concurrent_kv.zig   # 256-stripe rwlock KV (parallel reads)
 │   ├── graph.zig           # CSR graph engine (SoA, bitflags, delta buffer)
-│   ├── query.zig           # BFS traversal, shortest path, Dijkstra
-│   ├── string_intern.zig   # Type string deduplication (u16 IDs, bitmask)
+│   ├── query.zig           # BFS, shortest path, Dijkstra (bitset-accelerated)
+│   ├── string_intern.zig   # Type deduplication (u16 IDs, bitmask filtering)
 │   ├── property_store.zig  # Shared sparse property storage
 │   └── pool_arena.zig      # Slab allocator with background arena refill
 ├── command/
-│   └── handler.zig         # Command dispatcher (KV + graph + persistence)
+│   ├── handler.zig         # Full command dispatcher (KV + graph + persistence)
+│   └── comptime_dispatch.zig  # Compile-time command table and RESP literals
 ├── perf/
 │   └── span.zig            # Latency profiler
 └── storage/
-    ├── snapshot.zig         # Binary snapshot save/load with CRC-32
-    └── aof.zig              # Append-only file for write-ahead logging
+    ├── snapshot.zig         # Binary snapshot with CRC-32 (format v2)
+    └── aof.zig              # Append-only file + BGREWRITEAOF
 ```
 
 ## Benchmarking
 
 ```bash
-# Redis comparison (Docker)
+# Redis comparison (Docker, pipelined)
 docker compose -f docker-compose.compare.yml up --build -d
 cd tools/compare-client
-go run . -n 20000 -c 32 -warmup 1000 -runs 5 -timeout 50s
+go run . -n 2000 -c 16 -warmup 500 -runs 5 -timeout 60s -pipeline 100
 docker compose -f docker-compose.compare.yml down -v
 
-# Internal KV benchmark
+# Standard benchmark (no pipeline)
+go run . -n 20000 -c 32 -warmup 3000 -runs 5 -timeout 30s
+
+# Internal KV engine benchmark
 zig build bench-kv -Doptimize=ReleaseFast
 ```
 
@@ -153,23 +177,50 @@ zig build bench-kv -Doptimize=ReleaseFast
 | `FLUSHALL` | Delete all keys and graph data |
 | `MOVE key db` | Move key to another DB |
 | `SAVE` | Foreground snapshot + AOF truncate |
-| `INFO` | Server information |
+| `BGREWRITEAOF` | Compact AOF from current state |
+| `INFO` | Server stats (keyspace, graph, persistence) |
 
 ### Graph Operations
 
 | Command | Description |
 |---------|-------------|
 | `GRAPH.ADDNODE key type` | Create a node |
-| `GRAPH.GETNODE key` | Get node details |
+| `GRAPH.GETNODE key` | Get node details + properties |
 | `GRAPH.DELNODE key` | Delete a node and its edges |
 | `GRAPH.SETPROP key prop value` | Set a node property |
 | `GRAPH.ADDEDGE from to type [weight]` | Create a directed edge |
 | `GRAPH.DELEDGE edge_id` | Delete an edge |
 | `GRAPH.NEIGHBORS key [OUT\|IN\|BOTH]` | Get direct neighbors |
 | `GRAPH.TRAVERSE key [DEPTH n] [DIR d] [EDGETYPE t] [NODETYPE t]` | BFS traversal |
-| `GRAPH.PATH from to [MAXDEPTH n]` | Shortest unweighted path |
+| `GRAPH.PATH from to [MAXDEPTH n]` | Shortest unweighted path (BFS) |
 | `GRAPH.WPATH from to` | Shortest weighted path (Dijkstra) |
 | `GRAPH.STATS` | Node and edge counts |
+
+## Example
+
+```
+redis-cli -p 6380
+
+127.0.0.1:6380> SET greeting "hello world"
+OK
+127.0.0.1:6380> GET greeting
+"hello world"
+
+127.0.0.1:6380> GRAPH.ADDNODE service:auth service
+(integer) 0
+127.0.0.1:6380> GRAPH.ADDNODE service:user service
+(integer) 1
+127.0.0.1:6380> GRAPH.ADDEDGE service:auth service:user calls
+(integer) 0
+
+127.0.0.1:6380> GRAPH.TRAVERSE service:auth DEPTH 2 DIR OUT
+1) "service:auth"
+2) "service:user"
+
+127.0.0.1:6380> GRAPH.PATH service:auth service:user
+1) "service:auth"
+2) "service:user"
+```
 
 ## Persistence
 
@@ -178,11 +229,20 @@ Snapshot + AOF persistence (similar to Redis RDB+AOF).
 - **Startup**: loads snapshot (`vex.zdb`), replays AOF (`vex.aof`)
 - **Runtime**: mutating commands appended to AOF
 - **SAVE**: writes snapshot, truncates AOF
+- **BGREWRITEAOF**: compacts AOF by serializing current state
 
 ```bash
-zig build run -- --data-dir /var/lib/vex      # enable persistence
-zig build run -- --no-persistence              # disable (benchmarking)
+zig build run -- --data-dir /var/lib/vex      # persistence enabled (default)
+zig build run -- --no-persistence              # disable for benchmarking
 ```
+
+## Security
+
+```bash
+zig build run -- --reactor --requirepass mysecret
+```
+
+Clients must `AUTH mysecret` before any command (except PING). Password comparison is constant-time.
 
 ## CLI Flags
 
@@ -190,10 +250,13 @@ zig build run -- --no-persistence              # disable (benchmarking)
 |------|---------|-------------|
 | `--port` | 6380 | Listen port |
 | `--host` | 0.0.0.0 | Bind address |
-| `--reactor` | off | Enable multi-reactor mode |
-| `--workers N` | 4 | Number of worker threads (reactor mode) |
+| `--reactor` | off | Enable multi-reactor mode (recommended) |
+| `--workers N` | auto (CPU cores, max 8) | Worker threads |
 | `--data-dir` | ./data | Persistence directory |
 | `--no-persistence` | off | Disable AOF/snapshot |
+| `--requirepass` | none | Password for AUTH |
+| `--maxclients` | 10000 | Max concurrent connections |
+| `--max-client-buffer` | 1MB | Max unparsed data per connection |
 | `--profile` | off | Enable latency profiling |
 | `--profile-every N` | 100000 | Print profile every N commands |
 
