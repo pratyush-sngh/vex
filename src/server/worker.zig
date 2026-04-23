@@ -262,26 +262,55 @@ pub const Worker = struct {
         }
         const n: usize = @intCast(rc);
 
-        conn.accum.appendSlice(read_buf[0..n]) catch {
-            self.closeConn(conn.fd);
-            return;
-        };
+        // FAST PATH: if accumulator is empty (no partial command from previous read),
+        // parse directly from the read buffer — eliminates memcpy to accumulator.
+        // This is the common case: pipelined batches fit in one read().
+        if (conn.accum_pos >= conn.accum.items.len) {
+            conn.accum.clearRetainingCapacity();
+            conn.accum_pos = 0;
 
-        // Buffer limit check — disconnect clients sending too much unparsed data
-        if (conn.accum.items.len > self.max_client_buffer) {
-            _ = std.c.write(conn.fd, "-ERR max client buffer exceeded\r\n", 33);
-            self.closeConn(conn.fd);
-            return;
+            var pos: usize = 0;
+            while (pos < n) {
+                const data = read_buf[pos..n];
+                if (data.len >= 4 and data[0] == '*') {
+                    if (parseFastResp(data)) |result| {
+                        self.dispatchCommand(conn, result.args[0..result.argc]);
+                        pos += result.consumed;
+                        continue;
+                    }
+                }
+                break; // incomplete or non-fast-path — move to accumulator
+            }
+
+            // Only copy leftover (partial command) to accumulator
+            if (pos < n) {
+                conn.accum.appendSlice(read_buf[pos..n]) catch {
+                    self.closeConn(conn.fd);
+                    return;
+                };
+                // Try parsing the accumulator for inline/full RESP commands
+                while (conn.accumData().len > 0) {
+                    if (!self.processOneCommand(conn)) break;
+                }
+            }
+        } else {
+            // SLOW PATH: accumulator has leftover from previous read
+            conn.accum.appendSlice(read_buf[0..n]) catch {
+                self.closeConn(conn.fd);
+                return;
+            };
+
+            if (conn.accum.items.len > self.max_client_buffer) {
+                _ = std.c.write(conn.fd, "-ERR max client buffer exceeded\r\n", 33);
+                self.closeConn(conn.fd);
+                return;
+            }
+
+            while (conn.accumData().len > 0) {
+                if (!self.processOneCommand(conn)) break;
+            }
         }
 
-        // Process ALL complete commands from this read
-        while (conn.accumData().len > 0) {
-            if (!self.processOneCommand(conn)) break;
-        }
-
-        // FIX #2+3: Single flush attempt after processing all commands.
-        // Try direct write first — avoids enableWrite/disableWrite syscalls
-        // for small responses that fit in the TCP send buffer.
         if (conn.write_buf.items.len > conn.write_offset) {
             self.directFlush(conn);
         }
