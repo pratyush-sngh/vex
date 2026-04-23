@@ -58,39 +58,94 @@ pub const CommandHandler = struct {
         var cmd_buf: [64]u8 = undefined;
         const cmd = toUpper(args[0], &cmd_buf);
 
-        // ── Standard Redis KV commands ────────────────────────────────
-        if (std.mem.eql(u8, cmd, "PING")) return self.cmdPing(args, w);
-        if (std.mem.eql(u8, cmd, "SET")) return self.cmdSet(args, w);
-        if (std.mem.eql(u8, cmd, "GET")) return self.cmdGet(args, w);
-        if (std.mem.eql(u8, cmd, "DEL")) return self.cmdDel(args, w);
-        if (std.mem.eql(u8, cmd, "EXISTS")) return self.cmdExists(args, w);
-        if (std.mem.eql(u8, cmd, "KEYS")) return self.cmdKeys(args, w);
-        if (std.mem.eql(u8, cmd, "SCAN")) return self.cmdScan(args, w);
-        if (std.mem.eql(u8, cmd, "DBSIZE")) return self.cmdDbsize(w);
-        if (std.mem.eql(u8, cmd, "FLUSHDB")) return self.cmdFlushdb(args, w);
-        if (std.mem.eql(u8, cmd, "FLUSHALL")) return self.cmdFlushall(args, w);
-        if (std.mem.eql(u8, cmd, "MOVE")) return self.cmdMove(args, w);
-        if (std.mem.eql(u8, cmd, "SELECT")) return self.cmdSelect(args, w);
-        if (std.mem.eql(u8, cmd, "TTL")) return self.cmdTtl(args, w);
-        if (std.mem.eql(u8, cmd, "INFO")) return self.cmdInfo(w);
-        if (std.mem.eql(u8, cmd, "COMMAND")) return self.cmdCommand(w);
-        if (std.mem.eql(u8, cmd, "SAVE")) return self.cmdSave(w);
-        if (std.mem.eql(u8, cmd, "LASTSAVE")) return self.cmdLastSave(w);
-        if (std.mem.eql(u8, cmd, "BGREWRITEAOF")) return self.cmdBgRewriteAof(w);
+        // ── Fast dispatch: switch on (cmd.len, first_byte) ────────────
+        // Most commands resolved in 1-2 comparisons instead of linear scan.
+        const first = if (cmd.len > 0) std.ascii.toUpper(cmd[0]) else 0;
+        switch (cmd.len) {
+            3 => switch (first) {
+                'S' => if (std.mem.eql(u8, cmd, "SET")) return self.cmdSet(args, w),
+                'G' => if (std.mem.eql(u8, cmd, "GET")) return self.cmdGet(args, w),
+                'D' => if (std.mem.eql(u8, cmd, "DEL")) return self.cmdDel(args, w),
+                'T' => if (std.mem.eql(u8, cmd, "TTL")) return self.cmdTtl(args, w),
+                else => {},
+            },
+            4 => switch (first) {
+                'P' => if (std.mem.eql(u8, cmd, "PING")) return self.cmdPing(args, w),
+                'M' => {
+                    if (std.mem.eql(u8, cmd, "MGET")) return self.cmdMget(args, w);
+                    if (std.mem.eql(u8, cmd, "MSET")) return self.cmdMset(args, w);
+                    if (std.mem.eql(u8, cmd, "MOVE")) return self.cmdMove(args, w);
+                },
+                'K' => if (std.mem.eql(u8, cmd, "KEYS")) return self.cmdKeys(args, w),
+                'S' => {
+                    if (std.mem.eql(u8, cmd, "SCAN")) return self.cmdScan(args, w);
+                    if (std.mem.eql(u8, cmd, "SAVE")) return self.cmdSave(w);
+                },
+                'I' => {
+                    if (std.mem.eql(u8, cmd, "INFO")) return self.cmdInfo(w);
+                    if (std.mem.eql(u8, cmd, "INCR")) return self.cmdIncr(args, w);
+                },
+                'D' => if (std.mem.eql(u8, cmd, "DECR")) return self.cmdDecr(args, w),
+                else => {},
+            },
+            5 => switch (first) {
+                'E' => {},
+                else => {},
+            },
+            6 => switch (first) {
+                'E' => {
+                    if (std.mem.eql(u8, cmd, "EXISTS")) return self.cmdExists(args, w);
+                    if (std.mem.eql(u8, cmd, "EXPIRE")) return self.cmdExpire(args, w);
+                },
+                'D' => {
+                    if (std.mem.eql(u8, cmd, "DBSIZE")) return self.cmdDbsize(w);
+                    if (std.mem.eql(u8, cmd, "DECRBY")) return self.cmdDecrBy(args, w);
+                },
+                'S' => if (std.mem.eql(u8, cmd, "SELECT")) return self.cmdSelect(args, w),
+                'I' => if (std.mem.eql(u8, cmd, "INCRBY")) return self.cmdIncrBy(args, w),
+                'A' => if (std.mem.eql(u8, cmd, "APPEND")) return self.cmdAppend(args, w),
+                else => {},
+            },
+            7 => switch (first) {
+                'F' => {
+                    if (std.mem.eql(u8, cmd, "FLUSHDB")) return self.cmdFlushdb(args, w);
+                },
+                'C' => if (std.mem.eql(u8, cmd, "COMMAND")) return self.cmdCommand(w),
+                'P' => if (std.mem.eql(u8, cmd, "PERSIST")) return self.cmdPersist(args, w),
+                else => {},
+            },
+            8 => if (first == 'F' and std.mem.eql(u8, cmd, "FLUSHALL")) return self.cmdFlushall(args, w)
+                else if (first == 'L' and std.mem.eql(u8, cmd, "LASTSAVE")) return self.cmdLastSave(w),
+            12 => if (first == 'B' and std.mem.eql(u8, cmd, "BGREWRITEAOF")) return self.cmdBgRewriteAof(w),
+            else => {},
+        }
 
-        // ── Graph commands (GRAPH.*) ──────────────────────────────────
-        if (std.mem.eql(u8, cmd, "GRAPH.ADDNODE")) return self.cmdGraphAddNode(args, w);
-        if (std.mem.eql(u8, cmd, "GRAPH.GETNODE")) return self.cmdGraphGetNode(args, w);
-        if (std.mem.eql(u8, cmd, "GRAPH.DELNODE")) return self.cmdGraphDelNode(args, w);
-        if (std.mem.eql(u8, cmd, "GRAPH.SETPROP")) return self.cmdGraphSetProp(args, w);
-        if (std.mem.eql(u8, cmd, "GRAPH.ADDEDGE")) return self.cmdGraphAddEdge(args, w);
-        if (std.mem.eql(u8, cmd, "GRAPH.DELEDGE")) return self.cmdGraphDelEdge(args, w);
-        if (std.mem.eql(u8, cmd, "GRAPH.NEIGHBORS")) return self.cmdGraphNeighbors(args, w);
-        if (std.mem.eql(u8, cmd, "GRAPH.TRAVERSE")) return self.cmdGraphTraverse(args, w);
-        if (std.mem.eql(u8, cmd, "GRAPH.PATH")) return self.cmdGraphPath(args, w);
-        if (std.mem.eql(u8, cmd, "GRAPH.WPATH")) return self.cmdGraphWPath(args, w);
-        if (std.mem.eql(u8, cmd, "GRAPH.STATS")) return self.cmdGraphStats(w);
-        if (std.mem.eql(u8, cmd, "GRAPH.COMPACT")) return self.cmdGraphCompact(w);
+        // ── Graph commands (GRAPH.*) — dispatch on suffix ────────────
+        if (cmd.len >= 6 and std.mem.eql(u8, cmd[0..6], "GRAPH.")) {
+            const sub = cmd[6..];
+            const sub_first = if (sub.len > 0) std.ascii.toUpper(sub[0]) else 0;
+            switch (sub_first) {
+                'A' => {
+                    if (std.mem.eql(u8, sub, "ADDNODE")) return self.cmdGraphAddNode(args, w);
+                    if (std.mem.eql(u8, sub, "ADDEDGE")) return self.cmdGraphAddEdge(args, w);
+                },
+                'G' => if (std.mem.eql(u8, sub, "GETNODE")) return self.cmdGraphGetNode(args, w),
+                'D' => {
+                    if (std.mem.eql(u8, sub, "DELNODE")) return self.cmdGraphDelNode(args, w);
+                    if (std.mem.eql(u8, sub, "DELEDGE")) return self.cmdGraphDelEdge(args, w);
+                },
+                'S' => {
+                    if (std.mem.eql(u8, sub, "SETPROP")) return self.cmdGraphSetProp(args, w);
+                    if (std.mem.eql(u8, sub, "STATS")) return self.cmdGraphStats(w);
+                },
+                'N' => if (std.mem.eql(u8, sub, "NEIGHBORS")) return self.cmdGraphNeighbors(args, w),
+                'T' => if (std.mem.eql(u8, sub, "TRAVERSE")) return self.cmdGraphTraverse(args, w),
+                'P' => if (std.mem.eql(u8, sub, "PATH")) return self.cmdGraphPath(args, w),
+                'W' => if (std.mem.eql(u8, sub, "WPATH")) return self.cmdGraphWPath(args, w),
+                'C' => if (std.mem.eql(u8, sub, "COMPACT")) return self.cmdGraphCompact(w),
+                else => {},
+            }
+        }
 
         try resp.serializeErrorTyped(w, "ERR", "unknown command");
     }
@@ -478,6 +533,212 @@ pub const CommandHandler = struct {
             try resp.serializeInteger(w, t);
         } else {
             try resp.serializeInteger(w, -2); // key doesn't exist
+        }
+    }
+
+    /// MGET key [key ...] — get multiple keys
+    fn cmdMget(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 2) {
+            try resp.serializeError(w, "wrong number of arguments for 'MGET'");
+            return;
+        }
+        try resp.serializeArrayHeader(w, args.len - 1);
+        for (args[1..]) |user_key| {
+            var key_buf: [512]u8 = undefined;
+            var key_ref = namespacedKeyRef(self, user_key, &key_buf) catch {
+                try resp.serializeBulkString(w, null);
+                continue;
+            };
+            defer key_ref.deinit(self.allocator);
+            if (self.kv.get(key_ref.key)) |val| {
+                try resp.serializeBulkString(w, val);
+            } else {
+                try resp.serializeBulkString(w, null);
+            }
+        }
+    }
+
+    /// MSET key value [key value ...] — set multiple keys
+    fn cmdMset(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 3 or (args.len - 1) % 2 != 0) {
+            try resp.serializeError(w, "wrong number of arguments for 'MSET'");
+            return;
+        }
+        var i: usize = 1;
+        while (i + 1 < args.len) : (i += 2) {
+            var key_buf: [512]u8 = undefined;
+            var key_ref = namespacedKeyRef(self, args[i], &key_buf) catch continue;
+            defer key_ref.deinit(self.allocator);
+            self.kv.set(key_ref.key, args[i + 1]) catch continue;
+        }
+        self.logToAOF(args);
+        try resp.serializeSimpleString(w, "OK");
+    }
+
+    /// INCR key — increment integer value by 1
+    fn cmdIncr(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        return self.incrByN(args, w, 1);
+    }
+
+    /// DECR key — decrement integer value by 1
+    fn cmdDecr(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        return self.incrByN(args, w, -1);
+    }
+
+    /// INCRBY key increment
+    fn cmdIncrBy(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 3) {
+            try resp.serializeError(w, "wrong number of arguments for 'INCRBY'");
+            return;
+        }
+        const delta = std.fmt.parseInt(i64, args[2], 10) catch {
+            try resp.serializeError(w, "value is not an integer or out of range");
+            return;
+        };
+        return self.incrByN(args, w, delta);
+    }
+
+    /// DECRBY key decrement
+    fn cmdDecrBy(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 3) {
+            try resp.serializeError(w, "wrong number of arguments for 'DECRBY'");
+            return;
+        }
+        const delta = std.fmt.parseInt(i64, args[2], 10) catch {
+            try resp.serializeError(w, "value is not an integer or out of range");
+            return;
+        };
+        return self.incrByN(args, w, -delta);
+    }
+
+    fn incrByN(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer, delta: i64) !void {
+        if (args.len < 2) {
+            try resp.serializeError(w, "wrong number of arguments");
+            return;
+        }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch {
+            try resp.serializeError(w, "internal error");
+            return;
+        };
+        defer key_ref.deinit(self.allocator);
+
+        // Get current value (default 0)
+        var current: i64 = 0;
+        if (self.kv.get(key_ref.key)) |val| {
+            current = std.fmt.parseInt(i64, val, 10) catch {
+                try resp.serializeError(w, "value is not an integer or out of range");
+                return;
+            };
+        }
+
+        const new_val = current + delta;
+        var val_buf: [32]u8 = undefined;
+        const val_str = std.fmt.bufPrint(&val_buf, "{d}", .{new_val}) catch {
+            try resp.serializeError(w, "internal error");
+            return;
+        };
+        self.kv.set(key_ref.key, val_str) catch {
+            try resp.serializeError(w, "internal error");
+            return;
+        };
+        self.logToAOF(args);
+        try resp.serializeInteger(w, new_val);
+    }
+
+    /// EXPIRE key seconds — set TTL on existing key
+    fn cmdExpire(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 3) {
+            try resp.serializeError(w, "wrong number of arguments for 'EXPIRE'");
+            return;
+        }
+        const ttl_seconds = std.fmt.parseInt(i64, args[2], 10) catch {
+            try resp.serializeError(w, "value is not an integer or out of range");
+            return;
+        };
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch {
+            try resp.serializeError(w, "internal error");
+            return;
+        };
+        defer key_ref.deinit(self.allocator);
+
+        // Get current value, re-set with TTL
+        if (self.kv.get(key_ref.key)) |val| {
+            self.kv.setEx(key_ref.key, val, ttl_seconds) catch {
+                try resp.serializeInteger(w, 0);
+                return;
+            };
+            self.logToAOF(args);
+            try resp.serializeInteger(w, 1);
+        } else {
+            try resp.serializeInteger(w, 0); // key doesn't exist
+        }
+    }
+
+    /// PERSIST key — remove TTL from key
+    fn cmdPersist(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 2) {
+            try resp.serializeError(w, "wrong number of arguments for 'PERSIST'");
+            return;
+        }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch {
+            try resp.serializeError(w, "internal error");
+            return;
+        };
+        defer key_ref.deinit(self.allocator);
+
+        // Get current value, re-set without TTL
+        if (self.kv.get(key_ref.key)) |val| {
+            self.kv.set(key_ref.key, val) catch {
+                try resp.serializeInteger(w, 0);
+                return;
+            };
+            self.logToAOF(args);
+            try resp.serializeInteger(w, 1);
+        } else {
+            try resp.serializeInteger(w, 0);
+        }
+    }
+
+    /// APPEND key value — append to existing value
+    fn cmdAppend(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 3) {
+            try resp.serializeError(w, "wrong number of arguments for 'APPEND'");
+            return;
+        }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch {
+            try resp.serializeError(w, "internal error");
+            return;
+        };
+        defer key_ref.deinit(self.allocator);
+
+        if (self.kv.get(key_ref.key)) |existing| {
+            // Concatenate existing + new
+            const new_len = existing.len + args[2].len;
+            const new_val = self.allocator.alloc(u8, new_len) catch {
+                try resp.serializeError(w, "internal error");
+                return;
+            };
+            defer self.allocator.free(new_val);
+            @memcpy(new_val[0..existing.len], existing);
+            @memcpy(new_val[existing.len..], args[2]);
+            self.kv.set(key_ref.key, new_val) catch {
+                try resp.serializeError(w, "internal error");
+                return;
+            };
+            self.logToAOF(args);
+            try resp.serializeInteger(w, @intCast(new_len));
+        } else {
+            // Key doesn't exist — create with just the append value
+            self.kv.set(key_ref.key, args[2]) catch {
+                try resp.serializeError(w, "internal error");
+                return;
+            };
+            self.logToAOF(args);
+            try resp.serializeInteger(w, @intCast(args[2].len));
         }
     }
 

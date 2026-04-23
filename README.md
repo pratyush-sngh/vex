@@ -182,8 +182,15 @@ zig build bench-kv -Doptimize=ReleaseFast
 | `PING [message]` | Health check |
 | `SET key value [EX seconds\|PX ms]` | Set a key with optional TTL |
 | `GET key` | Get a key's value |
+| `MGET key [key ...]` | Get multiple keys |
+| `MSET key value [key value ...]` | Set multiple keys |
 | `DEL key [key ...]` | Delete keys |
 | `EXISTS key [key ...]` | Check key existence |
+| `INCR key` / `DECR key` | Increment/decrement integer value |
+| `INCRBY key n` / `DECRBY key n` | Increment/decrement by N |
+| `APPEND key value` | Append to existing value |
+| `EXPIRE key seconds` | Set TTL on existing key |
+| `PERSIST key` | Remove TTL from key |
 | `KEYS pattern` | List keys matching glob pattern |
 | `SCAN cursor [MATCH pattern] [COUNT n]` | Incremental key scan |
 | `TTL key` | Get remaining TTL in seconds |
