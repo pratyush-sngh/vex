@@ -81,15 +81,25 @@ pub fn traverse(
     var next = &frontier_b;
     var depth: u32 = 0;
 
+    var t_clear: u64 = 0;
+    var t_iter: u64 = 0;
+    _ = &t_iter;
+    var t_expand: u64 = 0;
+    var frontier_nodes: u64 = 0;
+
     while (depth < opts.max_depth) {
+        const tc0 = nowNsQuery();
         // Clear next frontier
         next.setRangeValue(.{ .start = 0, .end = node_cap }, false);
+        t_clear += nowNsQuery() - tc0;
 
         var any_in_next = false;
 
+        const ti0 = nowNsQuery();
         // Iterate set bits in current frontier
         var iter = current.iterator(.{});
         while (iter.next()) |node_id_usize| {
+            frontier_nodes += 1;
             const node_id: NodeId = @intCast(node_id_usize);
 
             // Early exit: check node's edge type mask
@@ -169,16 +179,28 @@ pub fn traverse(
             }
         }
 
-        if (!any_in_next) break; // no new nodes discovered
+        t_expand += nowNsQuery() - ti0;
+
+        if (!any_in_next) break;
         depth += 1;
 
-        // Swap frontiers
         const tmp = current;
         current = next;
         next = tmp;
     }
 
+    std.debug.print("[bfs] depth={d} frontier_nodes={d} result={d} clear={d}us iter+expand={d}us\n", .{
+        depth, frontier_nodes, result.items.len,
+        t_clear / 1000, t_expand / 1000,
+    });
+
     return result.toOwnedSlice();
+}
+
+fn nowNsQuery() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
 }
 
 /// Bidirectional BFS shortest path (unweighted).

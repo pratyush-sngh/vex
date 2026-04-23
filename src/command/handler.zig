@@ -90,6 +90,7 @@ pub const CommandHandler = struct {
         if (std.mem.eql(u8, cmd, "GRAPH.PATH")) return self.cmdGraphPath(args, w);
         if (std.mem.eql(u8, cmd, "GRAPH.WPATH")) return self.cmdGraphWPath(args, w);
         if (std.mem.eql(u8, cmd, "GRAPH.STATS")) return self.cmdGraphStats(w);
+        if (std.mem.eql(u8, cmd, "GRAPH.COMPACT")) return self.cmdGraphCompact(w);
 
         try resp.serializeErrorTyped(w, "ERR", "unknown command");
     }
@@ -710,6 +711,8 @@ pub const CommandHandler = struct {
             return;
         }
 
+        const t0 = nowNs();
+
         var opts = query.TraversalOptions{};
         var i: usize = 2;
         while (i < args.len) {
@@ -740,16 +743,23 @@ pub const CommandHandler = struct {
             }
         }
 
+        const t1 = nowNs(); // parse done
+
         const nk = graphNamespacedKey(self, args[1]) catch {
             try resp.serializeError(w, "internal error");
             return;
         };
         defer self.allocator.free(nk);
+
+        const t2 = nowNs(); // key namespace done
+
         const ids = query.traverse(self.graph, self.allocator, nk, opts) catch |err| {
             try resp.serializeError(w, @errorName(err));
             return;
         };
         defer self.allocator.free(ids);
+
+        const t3 = nowNs(); // BFS engine done
 
         try resp.serializeArrayHeader(w, ids.len);
         for (ids) |nid| {
@@ -761,6 +771,24 @@ pub const CommandHandler = struct {
                 try resp.serializeBulkString(w, null);
             }
         }
+
+        const t4 = nowNs(); // serialization done
+
+        // Log timing breakdown (visible in container logs)
+        std.debug.print("[traverse] nodes={d} parse={d}us nskey={d}us bfs={d}us serialize={d}us total={d}us\n", .{
+            ids.len,
+            (t1 - t0) / 1000,
+            (t2 - t1) / 1000,
+            (t3 - t2) / 1000,
+            (t4 - t3) / 1000,
+            (t4 - t0) / 1000,
+        });
+    }
+
+    fn nowNs() u64 {
+        var ts: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+        return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
     }
 
     /// GRAPH.PATH <from_key> <to_key> [MAXDEPTH <n>]
@@ -849,6 +877,15 @@ pub const CommandHandler = struct {
     }
 
     /// GRAPH.STATS
+    /// GRAPH.COMPACT -- rebuild CSR from delta edges for fast traversals
+    fn cmdGraphCompact(self: *CommandHandler, w: *std.Io.Writer) !void {
+        self.graph.compact() catch |err| {
+            try resp.serializeError(w, @errorName(err));
+            return;
+        };
+        try resp.serializeSimpleString(w, "OK");
+    }
+
     fn cmdGraphStats(self: *CommandHandler, w: *std.Io.Writer) !void {
         var nodes: usize = 0;
         var key_iter = self.graph.key_to_id.iterator();

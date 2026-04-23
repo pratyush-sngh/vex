@@ -268,6 +268,14 @@ pub const GraphEngine = struct {
         // Append to flat delta — O(1), no CSR rebuild
         if (!self.bulk_loading) {
             try self.delta_edges.append(.{ .from = from_id, .to = to_id, .eidx = eid });
+
+            // Auto-compact: when delta grows large, rebuild CSR.
+            // Without this, traversals scan the entire delta linearly (O(E) per node).
+            if (self.delta_edges.items.len > 1000 and
+                self.delta_edges.items.len > self.base_out.targets.len / 5)
+            {
+                try self.compact();
+            }
         }
 
         return eid;
