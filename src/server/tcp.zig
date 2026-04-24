@@ -999,10 +999,13 @@ pub const Server = struct {
 
         const LS = @import("../engine/list.zig").ListStore;
         const HS = @import("../engine/hash.zig").HashStore;
+        const WM = @import("worker.zig").WatchMap;
         var list_store = LS.init(self.allocator);
         defer list_store.deinit();
         var hash_store = HS.init(self.allocator);
         defer hash_store.deinit();
+        var watch_map = WM.init(self.allocator);
+        defer watch_map.deinit();
 
         const workers = try self.allocator.alloc(Worker, num_workers);
         defer self.allocator.free(workers);
@@ -1030,6 +1033,7 @@ pub const Server = struct {
                 &pubsub,
                 &list_store,
                 &hash_store,
+                &watch_map,
             );
         }
 

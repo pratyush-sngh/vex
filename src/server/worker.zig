@@ -117,6 +117,52 @@ pub const PubSubRegistry = struct {
     }
 };
 
+/// Shared per-key version tracking for WATCH/EXEC optimistic locking.
+/// Every write to a key bumps its version. WATCH snapshots versions.
+/// EXEC aborts if any watched key's version changed.
+pub const WatchMap = struct {
+    versions: std.StringHashMap(u64),
+    mutex: std.c.pthread_mutex_t,
+    allocator: Allocator,
+
+    pub fn init(allocator: Allocator) WatchMap {
+        return .{
+            .versions = std.StringHashMap(u64).init(allocator),
+            .mutex = std.c.PTHREAD_MUTEX_INITIALIZER,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *WatchMap) void {
+        var it = self.versions.iterator();
+        while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.versions.deinit();
+    }
+
+    pub fn getVersion(self: *WatchMap, key: []const u8) u64 {
+        _ = std.c.pthread_mutex_lock(&self.mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.mutex);
+        return self.versions.get(key) orelse 0;
+    }
+
+    pub fn bumpVersion(self: *WatchMap, key: []const u8) void {
+        _ = std.c.pthread_mutex_lock(&self.mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.mutex);
+        const gop = self.versions.getOrPut(key) catch return;
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.allocator.dupe(u8, key) catch return;
+            gop.value_ptr.* = 1;
+        } else {
+            gop.value_ptr.* += 1;
+        }
+    }
+};
+
+const WatchEntry = struct {
+    key: []u8,
+    version: u64,
+};
+
 const Connection = struct {
     fd: i32,
     selected_db: u8,
@@ -134,6 +180,10 @@ const Connection = struct {
     client_id: u64,
     /// Transaction queue: non-null when MULTI is active
     tx_queue: ?std.array_list.Managed(TxCommand),
+    /// WATCH: list of key version snapshots
+    watched_keys: ?std.array_list.Managed(WatchEntry),
+    /// Set to true if a watched key was modified (dirty flag)
+    watch_dirty: bool,
 
     const TxCommand = struct {
         args: [][]u8,
@@ -163,6 +213,8 @@ const Connection = struct {
             .client_name = null,
             .client_id = next_client_id.fetchAdd(1, .monotonic),
             .tx_queue = null,
+            .watched_keys = null,
+            .watch_dirty = false,
         };
         return conn;
     }
@@ -171,6 +223,10 @@ const Connection = struct {
         if (self.tx_queue) |*q| {
             for (q.items) |*cmd| cmd.deinit(allocator);
             q.deinit();
+        }
+        if (self.watched_keys) |*wk| {
+            for (wk.items) |entry| allocator.free(entry.key);
+            wk.deinit();
         }
         if (self.client_name) |name| allocator.free(name);
         self.accum.deinit();
@@ -226,6 +282,7 @@ pub const Worker = struct {
     pubsub: ?*PubSubRegistry,
     list_store: ?*ListStore,
     hash_store: ?*HashStore,
+    watch_map: ?*WatchMap,
     new_fds: [MAX_NEW_FDS]i32,
     new_fd_head: std.atomic.Value(usize),
     new_fd_tail: std.atomic.Value(usize),
@@ -252,6 +309,7 @@ pub const Worker = struct {
         pubsub: ?*PubSubRegistry,
         list_store: ?*ListStore,
         hash_store: ?*HashStore,
+        watch_map: ?*WatchMap,
     ) !Worker {
         return .{
             .id = id,
@@ -277,6 +335,7 @@ pub const Worker = struct {
             .pubsub = pubsub,
             .list_store = list_store,
             .hash_store = hash_store,
+            .watch_map = watch_map,
             .new_fds = [_]i32{-1} ** MAX_NEW_FDS,
             .new_fd_head = std.atomic.Value(usize).init(0),
             .new_fd_tail = std.atomic.Value(usize).init(0),
@@ -598,6 +657,17 @@ pub const Worker = struct {
             return;
         }
 
+        // ── WATCH/UNWATCH (optimistic locking) ────────────────────────
+        if (args[0].len == 5 and equalsAsciiUpper(args[0], "WATCH")) {
+            self.handleWatch(conn, args);
+            return;
+        }
+        if (args[0].len == 7 and equalsAsciiUpper(args[0], "UNWATCH")) {
+            self.clearWatches(conn);
+            conn.write_buf.appendSlice("+OK\r\n") catch {};
+            return;
+        }
+
         // ── MULTI/EXEC/DISCARD transactions ─────────────────────────────
         if (args[0].len == 5 and equalsAsciiUpper(args[0], "MULTI")) {
             if (conn.tx_queue != null) {
@@ -613,6 +683,7 @@ pub const Worker = struct {
                 for (q.items) |*cmd| cmd.deinit(self.allocator);
                 q.deinit();
                 conn.tx_queue = null;
+                self.clearWatches(conn);
                 conn.write_buf.appendSlice("+OK\r\n") catch {};
             } else {
                 conn.write_buf.appendSlice("-ERR DISCARD without MULTI\r\n") catch {};
@@ -822,6 +893,63 @@ pub const Worker = struct {
         defer self.allocator.free(payload);
         std.debug.print("[repl-broadcast] cmd={s} payload_len={d}\n", .{ if (args.len > 0) args[0] else "?", payload.len });
         leader.broadcastMutation(payload);
+    }
+
+    // ── WATCH/UNWATCH ─────────────────────────────────────────────────
+
+    fn handleWatch(self: *Worker, conn: *Connection, args: []const []const u8) void {
+        if (args.len < 2) {
+            conn.write_buf.appendSlice("-ERR wrong number of arguments for 'WATCH'\r\n") catch {};
+            return;
+        }
+        if (conn.tx_queue != null) {
+            conn.write_buf.appendSlice("-ERR WATCH inside MULTI is not allowed\r\n") catch {};
+            return;
+        }
+        const wm = self.watch_map orelse {
+            conn.write_buf.appendSlice("+OK\r\n") catch {};
+            return;
+        };
+        if (conn.watched_keys == null) {
+            conn.watched_keys = std.array_list.Managed(WatchEntry).init(self.allocator);
+        }
+        var wk = &conn.watched_keys.?;
+        for (args[1..]) |user_key| {
+            const ns = nsKey(conn.selected_db, user_key) orelse continue;
+            const version = wm.getVersion(ns);
+            const key_copy = self.allocator.dupe(u8, ns) catch continue;
+            wk.append(.{ .key = key_copy, .version = version }) catch {
+                self.allocator.free(key_copy);
+            };
+        }
+        conn.write_buf.appendSlice("+OK\r\n") catch {};
+    }
+
+    fn clearWatches(self: *Worker, conn: *Connection) void {
+        if (conn.watched_keys) |*wk| {
+            for (wk.items) |entry| self.allocator.free(entry.key);
+            wk.deinit();
+            conn.watched_keys = null;
+        }
+        conn.watch_dirty = false;
+    }
+
+    /// Check if any watched key was modified since WATCH. Returns true if dirty.
+    fn isWatchDirty(self: *Worker, conn: *Connection) bool {
+        if (conn.watch_dirty) return true;
+        const wm = self.watch_map orelse return false;
+        const wk = conn.watched_keys orelse return false;
+        for (wk.items) |entry| {
+            if (wm.getVersion(entry.key) != entry.version) return true;
+        }
+        return false;
+    }
+
+    /// Bump version for a key after a write (for WATCH tracking).
+    fn bumpWatchVersion(self: *Worker, selected_db: u8, user_key: []const u8) void {
+        const wm = self.watch_map orelse return;
+        const ns = nsKey(selected_db, user_key) orelse return;
+        wm.bumpVersion(ns);
     }
 
     // ── CLIENT subcommand handler ──────────────────────────────────────
@@ -1140,6 +1268,17 @@ pub const Worker = struct {
             return;
         };
 
+        // WATCH check: if any watched key was modified, abort the transaction
+        if (self.isWatchDirty(conn)) {
+            // Abort: return nil array (Redis convention for WATCH failure)
+            conn.write_buf.appendSlice("*-1\r\n") catch {};
+            for (q.items) |*cmd| cmd.deinit(self.allocator);
+            q.deinit();
+            conn.tx_queue = null;
+            self.clearWatches(conn);
+            return;
+        }
+
         // Write array header for the number of queued commands
         var hdr: [32]u8 = undefined;
         const h = std.fmt.bufPrint(&hdr, "*{d}\r\n", .{q.items.len}) catch {
@@ -1178,10 +1317,11 @@ pub const Worker = struct {
             conn.write_buf.appendSlice(aw.written()) catch {};
         }
 
-        // Clean up transaction queue
+        // Clean up transaction queue + watched keys
         for (q.items) |*cmd| cmd.deinit(self.allocator);
         q.deinit();
         conn.tx_queue = null;
+        self.clearWatches(conn);
     }
 
     /// Hot-path command dispatch using nested switch (compiler generates jump tables).
@@ -1221,6 +1361,7 @@ pub const Worker = struct {
                     if (stale.stale_val) |v| self.allocator.free(v);
                     if (stale.stale_key) |k| self.allocator.free(k);
                     if (self.aof) |a| a.logCommand(args);
+                    self.bumpWatchVersion(conn.selected_db, args[1]);
                     conn.write_buf.appendSlice(ct.resp_ok) catch {};
                     return true;
                 },
@@ -1232,6 +1373,7 @@ pub const Worker = struct {
                     if (stale.stale_val) |v| self.allocator.free(v);
                     if (stale.found) {
                         if (self.aof) |a| a.logCommand(args);
+                        self.bumpWatchVersion(conn.selected_db, args[1]);
                         conn.write_buf.appendSlice(ct.RespInts.@"1") catch {};
                     } else {
                         conn.write_buf.appendSlice(ct.RespInts.@"0") catch {};
