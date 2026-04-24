@@ -4,8 +4,8 @@ A high-performance KV + Graph database written in Zig 0.16. Speaks the Redis pro
 
 ## Why Vex?
 
-- **Up to 34% faster than Redis** on pipelined KV workloads with equal resources (3.00M GET cmd/s)
-- **18x faster shortest path than Memgraph** via bidirectional BFS + CSR adjacency
+- **Up to 2x faster than Redis** on pipelined KV workloads with equal resources (3.08M EXISTS cmd/s)
+- **22x faster shortest path than Memgraph** via bidirectional BFS + CSR adjacency
 - **Wins all 5 graph operations** vs Memgraph (add, traverse, path, neighbors)
 - **Redis-compatible** -- works with every Redis client library
 - **Zero dependencies** -- pure Zig standard library, single binary
@@ -73,11 +73,11 @@ All benchmarks run in Docker with **equal, isolated resources**: 4 CPU cores + 4
 
 | Command | Redis | Vex | Speedup |
 |---|---|---|---|
-| PIPE-SET(100) | 1.82M cmd/s | **2.33M cmd/s** | **+28%** |
-| PIPE-GET(100) | 2.40M cmd/s | **2.99M cmd/s** | **+25%** |
-| PIPE-INCR(100) | 2.44M cmd/s | **2.58M cmd/s** | **+6%** |
-| PIPE-EXISTS(100) | 2.45M cmd/s | **2.88M cmd/s** | **+18%** |
-| PIPE-DEL(100) | 2.09M cmd/s | **2.69M cmd/s** | **+29%** |
+| PIPE-SET(100) | 1.14M cmd/s | **2.40M cmd/s** | **+111%** |
+| PIPE-GET(100) | 1.54M cmd/s | **3.02M cmd/s** | **+96%** |
+| PIPE-INCR(100) | 1.55M cmd/s | **2.61M cmd/s** | **+69%** |
+| PIPE-EXISTS(100) | 1.57M cmd/s | **3.08M cmd/s** | **+96%** |
+| PIPE-DEL(100) | 1.20M cmd/s | **2.67M cmd/s** | **+123%** |
 
 Single-command (SET, GET, DEL, EXISTS, INCR, APPEND, MSET, MGET): tied at ~41K ops/s -- network-bound.
 
@@ -85,11 +85,11 @@ Single-command (SET, GET, DEL, EXISTS, INCR, APPEND, MSET, MGET): tied at ~41K o
 
 | Operation | Memgraph | Vex | Speedup |
 |---|---|---|---|
-| Shortest Path | 4,029 us | **213 us** | **19x faster** |
-| AddNode | 176.5 us | **137.6 us** | **+22%** |
-| AddEdge | 190.8 us | **138.2 us** | **+28%** |
-| Traverse (depth 3) | 283 us | **263 us** | **+7%** |
-| Neighbors | 255 us | **138 us** | **+46%** |
+| Shortest Path | 4,524 us | **210 us** | **22x faster** |
+| AddNode | 175.4 us | **138.1 us** | **+21%** |
+| AddEdge | 185.9 us | **140.5 us** | **+24%** |
+| Traverse (depth 3) | 334 us | **228 us** | **+32%** |
+| Neighbors | 202 us | **130 us** | **+36%** |
 
 Full benchmark data, single-command results, and methodology: [Benchmarks](docs/benchmarks.md)
 

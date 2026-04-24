@@ -48,15 +48,15 @@ This ensures neither container can steal CPU time from the other. Redis is singl
 
 | Command | Redis ops/s | Vex ops/s | Delta |
 |---|---|---|---|
-| SET | 43,377 | 41,821 | tied |
-| GET (hit) | 44,058 | 41,167 | tied |
-| DEL | 41,353 | 42,423 | tied |
-| EXISTS (hit) | 42,175 | 40,087 | tied |
-| INCR | 41,930 | 41,381 | tied |
-| APPEND | 40,531 | 41,498 | tied |
-| EXPIRE+TTL | 20,518 | 20,932 | tied |
-| MSET(10) | 37,425 | **38,470** | +3% |
-| MGET(10) | 39,225 | **41,253** | +5% |
+| SET | 42,185 | 40,805 | tied |
+| GET (hit) | 43,195 | 41,132 | tied |
+| DEL | 43,796 | 42,308 | tied |
+| EXISTS (hit) | 42,877 | 40,183 | tied |
+| INCR | 43,632 | 41,529 | tied |
+| APPEND | 44,008 | 42,083 | tied |
+| EXPIRE+TTL | 21,756 | 21,358 | tied |
+| MSET(10) | 41,502 | 41,150 | tied |
+| MGET(10) | 41,794 | 41,460 | tied |
 
 Single-command throughput is dominated by TCP round-trip latency (~370us). Both databases process the command in nanoseconds -- the network is the bottleneck.
 
@@ -64,11 +64,11 @@ Single-command throughput is dominated by TCP round-trip latency (~370us). Both 
 
 | Command | Redis cmd/s | Vex cmd/s | Speedup |
 |---|---|---|---|
-| PIPE-SET(100) | 1.82M | **2.33M** | **+28%** |
-| PIPE-GET(100) | 2.40M | **2.99M** | **+25%** |
-| PIPE-INCR(100) | 2.44M | **2.58M** | **+6%** |
-| PIPE-EXISTS(100) | 2.45M | **2.88M** | **+18%** |
-| PIPE-DEL(100) | 2.09M | **2.69M** | **+29%** |
+| PIPE-SET(100) | 1.14M | **2.40M** | **+111%** |
+| PIPE-GET(100) | 1.54M | **3.02M** | **+96%** |
+| PIPE-INCR(100) | 1.55M | **2.61M** | **+69%** |
+| PIPE-EXISTS(100) | 1.57M | **3.08M** | **+96%** |
+| PIPE-DEL(100) | 1.20M | **2.67M** | **+123%** |
 
 Pipelining amortizes network overhead, exposing the engine's raw throughput. Vex's multi-reactor workers process batches in parallel across 4 cores while Redis serializes everything on one thread.
 
@@ -89,11 +89,11 @@ At c=1, both are bottlenecked by TCP round-trip latency. The multi-reactor advan
 
 | Operation | Memgraph | Vex | Speedup |
 |---|---|---|---|
-| AddNode | 176.5 us | **137.6 us** | **+22%** |
-| AddEdge | 190.8 us | **138.2 us** | **+28%** |
-| BFS Traverse (depth 3) | 283 us | **263 us** | **+7%** |
-| Shortest Path | 4,029 us | **213 us** | **19x faster** |
-| Neighbors | 255 us | **138 us** | **+46%** |
+| AddNode | 175.4 us | **138.1 us** | **+21%** |
+| AddEdge | 185.9 us | **140.5 us** | **+24%** |
+| BFS Traverse (depth 3) | 334 us | **228 us** | **+32%** |
+| Shortest Path | 4,524 us | **210 us** | **22x faster** |
+| Neighbors | 202 us | **130 us** | **+36%** |
 
 Vex wins all 5 operations. Shortest path uses bidirectional BFS (meet-in-the-middle), which explores ~sqrt(N) nodes instead of N -- dramatically faster than Memgraph's standard BFS.
 
