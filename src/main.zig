@@ -16,6 +16,12 @@ const vex_log = @import("log.zig");
 var g_kv: ?*KVStore = null;
 var g_graph: ?*GraphEngine = null;
 var g_io: ?std.Io = null;
+var g_allocator: ?std.mem.Allocator = null;
+var g_repl_follower: ?*@import("cluster/replication.zig").ReplicationFollower = null;
+var g_cluster_conf: ?*@import("cluster/config.zig").ClusterConfig = null;
+// Storage for the ReplicationLeader created during failover promotion.
+// Must be a global so the pointer survives the promote_fn call.
+var g_promoted_leader: ?@import("cluster/replication.zig").ReplicationLeader = null;
 
 /// Execute a forwarded write by sending it to the local RESP port as a client.
 /// This ensures it goes through the worker → ConcurrentKV path (not plain KVStore).
@@ -63,6 +69,36 @@ fn executeForwardedWrite(allocator: std.mem.Allocator, args: []const []const u8)
 }
 
 var g_local_port: u16 = 6380;
+
+/// Failover: promote this follower to leader.
+/// Called from the ReplicationFollower's receiver thread when heartbeat times out.
+fn promoteToLeader() void {
+    const allocator = g_allocator orelse return;
+    const rf = g_repl_follower orelse return;
+    const cc = g_cluster_conf orelse return;
+
+    std.debug.print("[failover] promoting to leader...\n", .{});
+
+    // Close forward connection — we no longer forward writes
+    if (rf.forward_fd >= 0) {
+        _ = std.c.close(rf.forward_fd);
+        rf.forward_fd = -1;
+    }
+
+    // Create and start a ReplicationLeader
+    g_promoted_leader = @import("cluster/replication.zig").ReplicationLeader.init(allocator, cc, g_local_port);
+    g_promoted_leader.?.execute_fn = executeForwardedWrite;
+    g_promoted_leader.?.snapshot_fn = getSnapshot;
+    g_promoted_leader.?.start() catch {
+        std.debug.print("[failover] failed to start replication leader\n", .{});
+        return;
+    };
+
+    // Publish the new leader pointer so workers can find it via getPromotedLeader()
+    rf.promoted_leader_ptr.store(@intFromPtr(&g_promoted_leader.?), .release);
+
+    std.debug.print("[failover] promotion complete — now accepting writes and follower connections on :{d}\n", .{g_local_port + 10000});
+}
 
 /// Get a binary snapshot of KV + Graph for full sync to followers.
 fn getSnapshot(allocator: std.mem.Allocator) ?[]u8 {
@@ -243,10 +279,22 @@ pub fn main(init: std.process.Init) !void {
             g_kv = &kv;
             g_graph = &graph;
             g_io = io;
+            g_allocator = allocator;
+            g_local_port = config.port;
+            g_cluster_conf = cc;
 
-            if (cc.isLeader()) {
+            // Determine effective role: config says leader, but probe first
+            // to check if another node already claimed leadership (old leader rejoining).
+            var start_as_leader = cc.isLeader();
+            if (start_as_leader) {
+                if (ReplMod.probeForLeader(allocator, cc)) |existing| {
+                    log("cluster: config says leader, but node {d} is already leader — starting as FOLLOWER", .{existing.id});
+                    start_as_leader = false;
+                }
+            }
+
+            if (start_as_leader) {
                 log("cluster mode: LEADER (node {d})", .{cc.self_id});
-                g_local_port = config.port;
 
                 repl_leader = ReplMod.ReplicationLeader.init(allocator, cc, config.port);
                 repl_leader.?.execute_fn = executeForwardedWrite;
@@ -258,6 +306,8 @@ pub fn main(init: std.process.Init) !void {
                 log("cluster mode: FOLLOWER (node {d})", .{cc.self_id});
                 repl_follower = ReplMod.ReplicationFollower.init(allocator, cc, config.port);
                 repl_follower.?.load_snapshot_fn = loadSnapshot;
+                repl_follower.?.promote_fn = promoteToLeader;
+                g_repl_follower = &repl_follower.?;
                 repl_follower.?.connectToLeader() catch |err| {
                     log("warning: cannot connect to leader: {s}", .{@errorName(err)});
                 };
@@ -358,6 +408,44 @@ fn parseArgs(init: std.process.Init) Config {
     var maxmemory_policy: @import("engine/kv.zig").EvictionPolicy = .noeviction;
     var log_level: vex_log.Level = .info;
 
+    // ── Config file loading (order: default vex.conf → VEX_CONFIG env → --config flag)
+    // Each source overrides the previous; CLI args override everything.
+    {
+        // 1. Try default config file: ./vex.conf
+        applyConfigFile(init.io, "vex.conf", &host, &port, &data_dir, &requirepass,
+            &maxclients, &max_client_buffer, &maxmemory, &maxmemory_policy,
+            &reactor, &workers, &log_level, &tls_cert, &tls_key);
+
+        // 2. Try VEX_CONFIG environment variable
+        const env_config = std.c.getenv("VEX_CONFIG");
+        if (env_config) |env_path| {
+            const path = std.mem.span(env_path);
+            if (path.len > 0) {
+                applyConfigFile(init.io, path, &host, &port, &data_dir, &requirepass,
+                    &maxclients, &max_client_buffer, &maxmemory, &maxmemory_policy,
+                    &reactor, &workers, &log_level, &tls_cert, &tls_key);
+            }
+        }
+
+        // 3. Explicit --config flag (highest priority among config files)
+        var pre_it = std.process.Args.Iterator.init(init.minimal.args);
+        defer pre_it.deinit();
+        _ = pre_it.skip();
+        while (pre_it.next()) |pre_arg_z| {
+            const pre_arg = std.mem.sliceTo(pre_arg_z, 0);
+            if (std.mem.eql(u8, pre_arg, "--config")) {
+                if (pre_it.next()) |cfg_path_z| {
+                    const cfg_path = std.mem.sliceTo(cfg_path_z, 0);
+                    applyConfigFile(init.io, cfg_path, &host, &port, &data_dir, &requirepass,
+                        &maxclients, &max_client_buffer, &maxmemory, &maxmemory_policy,
+                        &reactor, &workers, &log_level, &tls_cert, &tls_key);
+                }
+                break;
+            }
+        }
+    }
+
+    // ── Second pass: CLI args override config file ───────────────────
     var it = std.process.Args.Iterator.init(init.minimal.args);
     defer it.deinit();
     _ = it.skip();
@@ -436,6 +524,9 @@ fn parseArgs(init: std.process.Init) Config {
             if (it.next()) |p| {
                 tls_key = std.mem.sliceTo(p, 0);
             }
+        } else if (std.mem.eql(u8, arg, "--config")) {
+            // Already handled in first pass, skip the value
+            _ = it.next();
         } else if (std.mem.eql(u8, arg, "--log-level")) {
             if (it.next()) |l| {
                 log_level = vex_log.Level.parse(std.mem.sliceTo(l, 0));
@@ -507,6 +598,53 @@ fn printBanner(port: u16, kv_keys: usize, graph_nodes: usize, aof_replayed: u64)
     std.debug.print("\n", .{});
 }
 
+fn applyConfigFile(
+    io: std.Io,
+    cfg_path: []const u8,
+    host: *[]const u8,
+    port: *u16,
+    data_dir: *[]const u8,
+    requirepass: *?[]const u8,
+    maxclients: *u32,
+    max_client_buffer: *usize,
+    maxmemory: *usize,
+    maxmemory_policy: *@import("engine/kv.zig").EvictionPolicy,
+    reactor: *bool,
+    workers: *usize,
+    log_level: *vex_log.Level,
+    tls_cert: *?[]const u8,
+    tls_key: *?[]const u8,
+) void {
+    const config_mod = @import("config.zig");
+    // Use a page allocator since we can't access the gpa in parseArgs easily.
+    // Config values are string slices that live for the process lifetime.
+    var cfg = config_mod.ConfigFile.loadFile(std.heap.page_allocator, io, cfg_path) catch |err| {
+        // Silently skip file-not-found (for default vex.conf / optional env var)
+        if (err != error.FileNotFound) {
+            std.debug.print("[vex] warning: cannot load config file '{s}': {s}\n", .{ cfg_path, @errorName(err) });
+        }
+        return;
+    };
+    // Note: we intentionally don't deinit cfg — the strings are used by the Config struct
+    // for the process lifetime. In a short-lived server this is fine.
+
+    if (cfg.get("port")) |v| port.* = std.fmt.parseInt(u16, v, 10) catch port.*;
+    if (cfg.get("host") orelse cfg.get("bind")) |v| host.* = v;
+    if (cfg.get("data-dir") orelse cfg.get("dir")) |v| data_dir.* = v;
+    if (cfg.get("requirepass")) |v| requirepass.* = v;
+    if (cfg.get("maxclients")) |v| maxclients.* = std.fmt.parseInt(u32, v, 10) catch maxclients.*;
+    if (cfg.get("max-client-buffer")) |v| max_client_buffer.* = std.fmt.parseInt(usize, v, 10) catch max_client_buffer.*;
+    if (cfg.get("maxmemory")) |v| maxmemory.* = parseMemorySize(v);
+    if (cfg.get("maxmemory-policy")) |v| {
+        if (std.mem.eql(u8, v, "allkeys-lru")) maxmemory_policy.* = .allkeys_lru;
+    }
+    if (cfg.get("reactor")) |_| reactor.* = true;
+    if (cfg.get("workers")) |v| workers.* = std.fmt.parseInt(usize, v, 10) catch workers.*;
+    if (cfg.get("log-level") orelse cfg.get("loglevel")) |v| log_level.* = vex_log.Level.parse(v);
+    if (cfg.get("tls-cert")) |v| tls_cert.* = v;
+    if (cfg.get("tls-key")) |v| tls_key.* = v;
+}
+
 /// Parse memory size with optional suffix: "256mb", "1gb", "1024" (bytes)
 fn parseMemorySize(s: []const u8) usize {
     if (s.len == 0) return 0;
@@ -533,6 +671,16 @@ fn log(comptime fmt: []const u8, args: anytype) void {
     vex_log.info(fmt, args);
 }
 
+test "parseMemorySize" {
+    try std.testing.expectEqual(@as(usize, 1024), parseMemorySize("1024"));
+    try std.testing.expectEqual(@as(usize, 256 * 1024 * 1024), parseMemorySize("256mb"));
+    try std.testing.expectEqual(@as(usize, 256 * 1024 * 1024), parseMemorySize("256MB"));
+    try std.testing.expectEqual(@as(usize, 1024 * 1024 * 1024), parseMemorySize("1gb"));
+    try std.testing.expectEqual(@as(usize, 64 * 1024), parseMemorySize("64kb"));
+    try std.testing.expectEqual(@as(usize, 0), parseMemorySize(""));
+    try std.testing.expectEqual(@as(usize, 0), parseMemorySize("abc"));
+}
+
 test {
     _ = @import("server/resp.zig");
     _ = @import("engine/kv.zig");
@@ -551,6 +699,7 @@ test {
     _ = @import("command/comptime_dispatch.zig");
     _ = @import("server/tls.zig");
     _ = @import("log.zig");
+    _ = @import("config.zig");
     _ = @import("cluster/config.zig");
     _ = @import("cluster/protocol.zig");
     _ = @import("cluster/replication.zig");

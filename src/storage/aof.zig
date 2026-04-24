@@ -351,3 +351,35 @@ const MockHandler = struct {
         self.count.* += 1;
     }
 };
+
+test "aof group commit buffer" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const path = "/tmp/vex_group_test.aof";
+    defer std.Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    {
+        var a = try AOF.init(io, path, "/tmp/dummy.zdb");
+        defer a.deinit();
+        a.initGroupBuf(allocator);
+
+        // logCommand should buffer, not write to file
+        const set1 = [_][]const u8{ "SET", "k1", "v1" };
+        a.logCommand(&set1);
+        const set2 = [_][]const u8{ "SET", "k2", "v2" };
+        a.logCommand(&set2);
+
+        // Buffer should have data, file should be empty (or just have old data)
+        try std.testing.expect(a.group_buf.items.len > 0);
+
+        // flush() should write everything to file
+        a.flush();
+        try std.testing.expectEqual(@as(usize, 0), a.group_buf.items.len);
+    }
+
+    // Replay should find both commands
+    var exec_count: u64 = 0;
+    var mock = MockHandler{ .count = &exec_count };
+    const replayed = try replayFile(io, allocator, path, &mock);
+    try std.testing.expectEqual(@as(u64, 2), replayed);
+}

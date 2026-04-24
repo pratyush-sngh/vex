@@ -1649,3 +1649,28 @@ test "APPEND" {
     defer allocator.free(r3);
     try std.testing.expectEqualStrings("$11\r\nhello world\r\n", r3);
 }
+
+test "BGSAVE without persistence returns error" {
+    const allocator = std.testing.allocator;
+    var kv = KVStore.init(allocator, std.testing.io);
+    defer kv.deinit();
+    var g = GraphEngine.init(allocator);
+    defer g.deinit();
+    var db = std.atomic.Value(u8).init(0);
+    var handler = CommandHandler.init(allocator, std.testing.io, &kv, &g, null, &db, .strict);
+
+    const bgsave = [_][]const u8{"BGSAVE"};
+    const r = try testExec(&handler, allocator, &bgsave);
+    defer allocator.free(r);
+    try std.testing.expect(std.mem.indexOf(u8, r, "-ERR") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "persistence") != null);
+}
+
+test "bgsave_in_progress flag" {
+    // Verify the atomic flag prevents concurrent saves
+    try std.testing.expect(!bgsave_in_progress.load(.acquire));
+    bgsave_in_progress.store(true, .release);
+    try std.testing.expect(bgsave_in_progress.load(.acquire));
+    bgsave_in_progress.store(false, .release);
+    try std.testing.expect(!bgsave_in_progress.load(.acquire));
+}

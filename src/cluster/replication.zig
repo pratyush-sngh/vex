@@ -5,6 +5,12 @@ const config_mod = @import("config.zig");
 const ClusterConfig = config_mod.ClusterConfig;
 const ClusterNode = config_mod.ClusterNode;
 
+fn nowMs() i64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+    return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
+}
+
 /// Leader-side replication: accepts follower connections and streams mutations.
 /// Callback type for executing a forwarded write command on the leader.
 /// Returns the RESP response bytes (caller must free).
@@ -13,6 +19,42 @@ pub const ExecuteWriteFn = *const fn (allocator: Allocator, args: []const []cons
 pub const GetSnapshotFn = *const fn (allocator: Allocator) ?[]u8;
 
 pub const HEARTBEAT_INTERVAL_MS: i64 = 5000; // 5 seconds
+pub const HEARTBEAT_TIMEOUT_MS: i64 = 15000; // 3 missed heartbeats = leader dead
+
+/// Probe if any other node in the cluster is already acting as leader.
+/// Tries connecting to each node's replication port (base_port + 10000).
+/// Returns the node that responded, or null if no leader found.
+pub fn probeForLeader(allocator: Allocator, config: *const config_mod.ClusterConfig) ?config_mod.ClusterNode {
+    for (config.nodes) |node| {
+        if (node.id == config.self_id) continue;
+
+        const repl_port = node.port + 10000;
+        const sock = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
+        if (sock < 0) continue;
+
+        var addr: std.c.sockaddr.in = .{
+            .family = std.c.AF.INET,
+            .port = std.mem.nativeToBig(u16, repl_port),
+            .addr = 0,
+        };
+        addr.addr = resolveHost(allocator, node.host) orelse {
+            _ = std.c.close(sock);
+            continue;
+        };
+
+        // Set a short connection timeout (2 seconds)
+        var tv: std.c.timeval = .{ .sec = 2, .usec = 0 };
+        _ = std.c.setsockopt(sock, std.c.SOL.SOCKET, std.c.SO.SNDTIMEO, @ptrCast(&tv), @sizeOf(std.c.timeval));
+
+        if (std.c.connect(sock, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) >= 0) {
+            _ = std.c.close(sock);
+            std.debug.print("[failover] found active leader: node {d} at {s}:{d}\n", .{ node.id, node.host, repl_port });
+            return node;
+        }
+        _ = std.c.close(sock);
+    }
+    return null;
+}
 
 pub const ReplicationLeader = struct {
     allocator: Allocator,
@@ -284,6 +326,12 @@ pub const ReplicationFollower = struct {
     /// Callback to load a snapshot (full sync)
     load_snapshot_fn: ?*const fn (data: []const u8) bool,
     local_port: u16,
+    /// Set when this follower promotes to leader
+    promoted: std.atomic.Value(bool),
+    /// Callback: called when this follower should promote to leader
+    promote_fn: ?*const fn () void,
+    /// After promotion, points to the new ReplicationLeader (stored as usize for atomics)
+    promoted_leader_ptr: std.atomic.Value(usize),
     /// Replication state — updated by heartbeat
     leader_seq: std.atomic.Value(u64),
     local_seq: std.atomic.Value(u64),
@@ -301,6 +349,9 @@ pub const ReplicationFollower = struct {
             .replay_fn = null,
             .load_snapshot_fn = null,
             .local_port = local_port,
+            .promoted = std.atomic.Value(bool).init(false),
+            .promote_fn = null,
+            .promoted_leader_ptr = std.atomic.Value(usize).init(0),
             .leader_seq = std.atomic.Value(u64).init(0),
             .local_seq = std.atomic.Value(u64).init(0),
             .last_heartbeat_ms = std.atomic.Value(i64).init(0),
@@ -371,9 +422,17 @@ pub const ReplicationFollower = struct {
         }
     }
 
+    /// Get the ReplicationLeader created after this follower was promoted.
+    /// Returns null if not promoted or leader not yet initialized.
+    pub fn getPromotedLeader(self: *const ReplicationFollower) ?*ReplicationLeader {
+        const v = self.promoted_leader_ptr.load(.acquire);
+        return if (v == 0) null else @ptrFromInt(v);
+    }
+
     /// Forward a write command to the leader and get the response.
     /// Returns the RESP response bytes to send back to the client.
     pub fn forwardWrite(self: *ReplicationFollower, args: []const []const u8) ![]u8 {
+        if (self.promoted.load(.acquire)) return error.Promoted;
         if (self.forward_fd < 0) return error.NotConnected;
 
         // Mutex: multiple worker threads may call forwardWrite concurrently
@@ -442,9 +501,84 @@ pub const ReplicationFollower = struct {
     }
 
     fn receiverLoop(self: *ReplicationFollower) void {
+        self.runReceiverOnce();
+
+        // If not promoted and still running, attempt reconnection to a new leader
+        while (self.running.load(.acquire) and !self.promoted.load(.acquire)) {
+            std.debug.print("[failover] lost leader connection, attempting reconnection...\n", .{});
+
+            // Close stale fds
+            if (self.leader_fd >= 0) {
+                _ = std.c.close(self.leader_fd);
+                self.leader_fd = -1;
+            }
+            if (self.forward_fd >= 0) {
+                _ = std.c.close(self.forward_fd);
+                self.forward_fd = -1;
+            }
+
+            var attempts: u32 = 0;
+            var reconnected = false;
+            while (self.running.load(.acquire) and !self.promoted.load(.acquire) and attempts < 30) : (attempts += 1) {
+                // Wait 2s between attempts
+                var dummy_pfd = [1]std.c.pollfd{.{ .fd = -1, .events = 0, .revents = 0 }};
+                _ = std.c.poll(&dummy_pfd, 0, 2000);
+
+                if (probeForLeader(self.allocator, self.config)) |leader_node| {
+                    const repl_port = leader_node.port + 10000;
+                    const sock = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
+                    if (sock < 0) continue;
+
+                    var addr: std.c.sockaddr.in = .{
+                        .family = std.c.AF.INET,
+                        .port = std.mem.nativeToBig(u16, repl_port),
+                        .addr = 0,
+                    };
+                    addr.addr = resolveHost(self.allocator, leader_node.host) orelse {
+                        _ = std.c.close(sock);
+                        continue;
+                    };
+
+                    if (std.c.connect(sock, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) >= 0) {
+                        self.leader_fd = sock;
+
+                        // Open forward connection
+                        const fwd_sock = std.c.socket(std.c.AF.INET, std.c.SOCK.STREAM, 0);
+                        if (fwd_sock >= 0) {
+                            if (std.c.connect(fwd_sock, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) >= 0) {
+                                self.forward_fd = fwd_sock;
+                            } else {
+                                _ = std.c.close(fwd_sock);
+                            }
+                        }
+
+                        std.debug.print("[failover] reconnected to new leader node {d} at {s}:{d}\n", .{ leader_node.id, leader_node.host, repl_port });
+                        reconnected = true;
+                        break;
+                    }
+                    _ = std.c.close(sock);
+                }
+            }
+
+            if (!reconnected) {
+                std.debug.print("[failover] exhausted reconnection attempts\n", .{});
+                break;
+            }
+
+            // Re-enter the receive loop with new leader connection
+            self.runReceiverOnce();
+        }
+    }
+
+    /// Inner receive loop: sends repl_request, processes frames until disconnect or promotion.
+    fn runReceiverOnce(self: *ReplicationFollower) void {
         // Send initial repl_request with seq=0
         const req = protocol.encodeReplRequest(0);
         protocol.writeFrame(self.leader_fd, .repl_request, &req) catch return;
+
+        // Record initial time for heartbeat tracking
+        self.last_heartbeat_ms.store(nowMs(), .release);
+        var failover_wait_count: u32 = 0;
 
         while (self.running.load(.acquire)) {
             // Poll for data with timeout
@@ -454,13 +588,42 @@ pub const ReplicationFollower = struct {
                 .revents = 0,
             }};
             const poll_rc = std.c.poll(&pfd, 1, 500);
+
+            // Check heartbeat timeout
+            const now = nowMs();
+            const last_hb = self.last_heartbeat_ms.load(.acquire);
+            if (last_hb > 0 and (now - last_hb) > HEARTBEAT_TIMEOUT_MS) {
+                std.debug.print("[failover] leader heartbeat timeout ({d}ms since last)\n", .{now - last_hb});
+                if (self.config.amIHighestPriority()) {
+                    std.debug.print("[failover] I am highest priority follower — PROMOTING TO LEADER\n", .{});
+                    self.promoted.store(true, .release);
+                    if (self.promote_fn) |promote| promote();
+                    return; // Exit — we're the leader now
+                } else {
+                    failover_wait_count += 1;
+                    if (failover_wait_count > 3) {
+                        // Higher priority follower hasn't promoted — check if a new leader appeared
+                        if (probeForLeader(self.allocator, self.config)) |_| {
+                            std.debug.print("[failover] detected new leader — reconnecting\n", .{});
+                            return; // Exit to reconnect in outer loop
+                        }
+                    }
+                    std.debug.print("[failover] waiting for higher priority follower to promote (attempt {d})\n", .{failover_wait_count});
+                    // Reset timer — give higher priority node time to promote
+                    self.last_heartbeat_ms.store(now, .release);
+                }
+            }
+
             if (poll_rc <= 0) continue;
 
             const frame = protocol.readFrame(self.leader_fd, self.allocator) catch |err| {
                 std.debug.print("[repl-follower] read error: {s}\n", .{@errorName(err)});
-                break;
+                return; // Exit to reconnect
             };
             std.debug.print("[repl-follower] received frame type={d}\n", .{@intFromEnum(frame.frame_type)});
+
+            // Reset failover counter on any valid frame
+            failover_wait_count = 0;
 
             switch (frame.frame_type) {
                 .repl_data => {
@@ -588,6 +751,47 @@ fn parseIpv4(s: []const u8) ?u32 {
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────
+
+test "follower promoted flag blocks forwarding" {
+    const config_data =
+        \\node 1 leader 10.0.0.1:6380
+        \\node 2 follower 10.0.0.2:6380 priority=1
+        \\self 2
+        \\
+    ;
+    var cc = try config_mod.parseString(std.testing.allocator, config_data);
+    defer cc.deinit();
+
+    var follower = ReplicationFollower.init(std.testing.allocator, &cc, 6380);
+    defer follower.deinit();
+
+    // Not promoted — forwardWrite should fail with NotConnected (no fd)
+    const result1 = follower.forwardWrite(&[_][]const u8{ "SET", "foo", "bar" });
+    try std.testing.expectError(error.NotConnected, result1);
+
+    // Set promoted — forwardWrite should fail with Promoted
+    follower.promoted.store(true, .release);
+    const result2 = follower.forwardWrite(&[_][]const u8{ "SET", "foo", "bar" });
+    try std.testing.expectError(error.Promoted, result2);
+
+    // getPromotedLeader returns null when not set
+    try std.testing.expect(follower.getPromotedLeader() == null);
+}
+
+test "probeForLeader returns null when no nodes listening" {
+    const config_data =
+        \\node 1 leader 127.0.0.1:19999
+        \\node 2 follower 127.0.0.1:19998
+        \\self 2
+        \\
+    ;
+    var cc = try config_mod.parseString(std.testing.allocator, config_data);
+    defer cc.deinit();
+
+    // No node is listening on port 29999 — should return null
+    const result = probeForLeader(std.testing.allocator, &cc);
+    try std.testing.expect(result == null);
+}
 
 test "isWriteCommand" {
     try std.testing.expect(isWriteCommand(&[_][]const u8{"SET"}));

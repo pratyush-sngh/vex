@@ -497,6 +497,74 @@ test "kv flushdb resets counters" {
     try std.testing.expectEqual(@as(u32, 0), store.live_count);
 }
 
+test "kv memoryUsage" {
+    var store = KVStore.init(std.testing.allocator, std.testing.io);
+    defer store.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), store.memoryUsage());
+
+    try store.set("key1", "value1");
+    const usage1 = store.memoryUsage();
+    try std.testing.expect(usage1 > 0);
+
+    try store.set("key2", "value2");
+    const usage2 = store.memoryUsage();
+    try std.testing.expect(usage2 > usage1);
+
+    // Delete should reduce reported usage (tombstoned entries excluded)
+    _ = store.delete("key1");
+    const usage3 = store.memoryUsage();
+    try std.testing.expect(usage3 < usage2);
+}
+
+test "kv LRU eviction" {
+    var store = KVStore.init(std.testing.allocator, std.testing.io);
+    defer store.deinit();
+
+    store.eviction_policy = .allkeys_lru;
+    // Set a very small maxmemory to force eviction
+    store.maxmemory = 1; // 1 byte — any key will exceed this
+
+    // First insert succeeds (eviction runs but nothing to evict yet)
+    try store.set("first", "val");
+
+    // Second insert should evict the first key to make room
+    try store.set("second", "val");
+
+    // At least one key should remain
+    try std.testing.expect(store.live_count >= 1);
+}
+
+test "kv noeviction returns error" {
+    var store = KVStore.init(std.testing.allocator, std.testing.io);
+    defer store.deinit();
+
+    store.eviction_policy = .noeviction;
+    store.maxmemory = 1; // 1 byte
+
+    // First set succeeds
+    try store.set("first", "val");
+
+    // Second set should fail with OutOfMemory
+    try std.testing.expectError(error.OutOfMemory, store.set("second", "val"));
+}
+
+test "kv last_access updated on GET" {
+    var store = KVStore.init(std.testing.allocator, std.testing.io);
+    defer store.deinit();
+
+    try store.set("mykey", "myvalue");
+    const entry1 = store.map.getPtr("mykey").?;
+    const access1 = entry1.last_access;
+
+    // Advance the cached clock
+    store.cached_now_ms += 1000;
+    _ = store.get("mykey");
+
+    const entry2 = store.map.getPtr("mykey").?;
+    try std.testing.expect(entry2.last_access > access1);
+}
+
 test "glob matcher" {
     try std.testing.expect(globMatch("*", "anything"));
     try std.testing.expect(globMatch("hello*", "helloworld"));

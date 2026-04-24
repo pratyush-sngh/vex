@@ -993,6 +993,10 @@ pub const Server = struct {
         defer ckv.deinit();
         try ckv.importFrom(self.kv);
 
+        const PubSubRegistry = @import("worker.zig").PubSubRegistry;
+        var pubsub = PubSubRegistry.init(self.allocator);
+        defer pubsub.deinit();
+
         const workers = try self.allocator.alloc(Worker, num_workers);
         defer self.allocator.free(workers);
 
@@ -1016,6 +1020,7 @@ pub const Server = struct {
                 self.tls_ctx,
                 self.repl_follower,
                 self.repl_leader,
+                &pubsub,
             );
         }
 

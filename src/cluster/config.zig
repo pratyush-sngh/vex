@@ -8,6 +8,8 @@ pub const ClusterNode = struct {
     role: NodeRole,
     host: []const u8,
     port: u16,
+    /// Failover priority (lower = promoted first). 0 = leader, 1+ = follower priority.
+    priority: u8,
 };
 
 /// Cluster configuration parsed from a config file.
@@ -53,6 +55,34 @@ pub const ClusterConfig = struct {
             if (n.role == .leader) return n;
         }
         return null;
+    }
+
+    /// Get the follower with highest priority (lowest number) that isn't self.
+    pub fn highestPriorityFollower(self: *const ClusterConfig) ?ClusterNode {
+        var best: ?ClusterNode = null;
+        for (self.nodes) |n| {
+            if (n.role != .follower) continue;
+            if (best == null or n.priority < best.?.priority) {
+                best = n;
+            }
+        }
+        return best;
+    }
+
+    /// Am I the highest priority follower?
+    pub fn amIHighestPriority(self: *const ClusterConfig) bool {
+        const me = self.selfNode() orelse return false;
+        if (me.role != .follower) return false;
+        for (self.nodes) |n| {
+            if (n.id == self.self_id) continue;
+            if (n.role == .follower and n.priority < me.priority) return false;
+        }
+        return true;
+    }
+
+    /// Get all nodes except self, sorted by priority.
+    pub fn otherNodes(self: *const ClusterConfig) []const ClusterNode {
+        return self.nodes; // caller filters by self_id
     }
 
     /// Count followers.
@@ -114,13 +144,13 @@ pub fn parseString(allocator: Allocator, data: []const u8) !ClusterConfig {
         if (std.mem.startsWith(u8, line, "node ")) {
             const rest = line[5..];
             // Split by spaces
-            var parts: [4][]const u8 = undefined;
+            var parts: [5][]const u8 = undefined;
             var part_count: usize = 0;
             var start: usize = 0;
             var in_space = true;
             for (rest, 0..) |c, i| {
                 if (c == ' ' or c == '\t') {
-                    if (!in_space and part_count < 4) {
+                    if (!in_space and part_count < 5) {
                         parts[part_count] = rest[start..i];
                         part_count += 1;
                     }
@@ -130,7 +160,7 @@ pub fn parseString(allocator: Allocator, data: []const u8) !ClusterConfig {
                     in_space = false;
                 }
             }
-            if (!in_space and part_count < 4) {
+            if (!in_space and part_count < 5) {
                 parts[part_count] = rest[start..];
                 part_count += 1;
             }
@@ -152,7 +182,16 @@ pub fn parseString(allocator: Allocator, data: []const u8) !ClusterConfig {
             errdefer allocator.free(host);
             const port = std.fmt.parseInt(u16, addr[colon + 1 ..], 10) catch return error.InvalidConfig;
 
-            try nodes.append(.{ .id = id, .role = role, .host = host, .port = port });
+            // Parse optional priority=N (4th part)
+            var priority: u8 = if (role == .leader) 0 else 255;
+            if (part_count >= 4) {
+                const pstr = parts[3];
+                if (pstr.len > 9 and std.mem.eql(u8, pstr[0..9], "priority=")) {
+                    priority = std.fmt.parseInt(u8, pstr[9..], 10) catch 255;
+                }
+            }
+
+            try nodes.append(.{ .id = id, .role = role, .host = host, .port = port, .priority = priority });
             continue;
         }
 

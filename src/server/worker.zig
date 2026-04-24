@@ -30,6 +30,91 @@ const DB_PREFIXES = blk: {
 
 // ─── Connection ──────────────────────────────────────────────────────
 
+/// Shared pub/sub registry (thread-safe, shared across all workers).
+pub const PubSubRegistry = struct {
+    /// channel_name → list of subscriber fds
+    channels: std.StringHashMap(std.array_list.Managed(i32)),
+    mutex: std.c.pthread_mutex_t,
+    allocator: Allocator,
+
+    pub fn init(allocator: Allocator) PubSubRegistry {
+        return .{
+            .channels = std.StringHashMap(std.array_list.Managed(i32)).init(allocator),
+            .mutex = std.c.PTHREAD_MUTEX_INITIALIZER,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *PubSubRegistry) void {
+        var it = self.channels.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit();
+        }
+        self.channels.deinit();
+    }
+
+    pub fn subscribe(self: *PubSubRegistry, channel: []const u8, fd: i32) !void {
+        _ = std.c.pthread_mutex_lock(&self.mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.mutex);
+
+        const gop = try self.channels.getOrPut(channel);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try self.allocator.dupe(u8, channel);
+            gop.value_ptr.* = std.array_list.Managed(i32).init(self.allocator);
+        }
+        // Avoid duplicate subscriptions
+        for (gop.value_ptr.items) |existing_fd| {
+            if (existing_fd == fd) return;
+        }
+        try gop.value_ptr.append(fd);
+    }
+
+    pub fn unsubscribe(self: *PubSubRegistry, channel: []const u8, fd: i32) void {
+        _ = std.c.pthread_mutex_lock(&self.mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.mutex);
+
+        if (self.channels.getPtr(channel)) |list| {
+            var i: usize = 0;
+            while (i < list.items.len) {
+                if (list.items[i] == fd) {
+                    _ = list.orderedRemove(i);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    pub fn unsubscribeAll(self: *PubSubRegistry, fd: i32) void {
+        _ = std.c.pthread_mutex_lock(&self.mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.mutex);
+
+        var it = self.channels.iterator();
+        while (it.next()) |entry| {
+            var i: usize = 0;
+            while (i < entry.value_ptr.items.len) {
+                if (entry.value_ptr.items[i] == fd) {
+                    _ = entry.value_ptr.orderedRemove(i);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    /// Publish: returns list of subscriber fds (caller writes to them).
+    /// Caller must NOT hold the mutex while writing to fds.
+    pub fn getSubscribers(self: *PubSubRegistry, channel: []const u8, out: *std.array_list.Managed(i32)) void {
+        _ = std.c.pthread_mutex_lock(&self.mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.mutex);
+
+        if (self.channels.get(channel)) |list| {
+            out.appendSlice(list.items) catch {};
+        }
+    }
+};
+
 const Connection = struct {
     fd: i32,
     selected_db: u8,
@@ -40,6 +125,18 @@ const Connection = struct {
     write_registered: bool,
     authenticated: bool,
     ssl: ?*SSL,
+    pubsub_mode: bool,
+    /// Transaction queue: non-null when MULTI is active
+    tx_queue: ?std.array_list.Managed(TxCommand),
+
+    const TxCommand = struct {
+        args: [][]u8,
+
+        fn deinit(self: *TxCommand, alloc: Allocator) void {
+            for (self.args) |arg| alloc.free(arg);
+            alloc.free(self.args);
+        }
+    };
 
     fn init(allocator: Allocator, fd: i32, auth_required: bool) !*Connection {
         const conn = try allocator.create(Connection);
@@ -53,11 +150,17 @@ const Connection = struct {
             .write_registered = false,
             .authenticated = !auth_required,
             .ssl = null,
+            .pubsub_mode = false,
+            .tx_queue = null,
         };
         return conn;
     }
 
     fn deinit(self: *Connection, allocator: Allocator) void {
+        if (self.tx_queue) |*q| {
+            for (q.items) |*cmd| cmd.deinit(allocator);
+            q.deinit();
+        }
         self.accum.deinit();
         self.write_buf.deinit();
         allocator.destroy(self);
@@ -108,6 +211,7 @@ pub const Worker = struct {
     tls_ctx: ?*TlsContext,
     repl_follower: ?*replication.ReplicationFollower,
     repl_leader: ?*replication.ReplicationLeader,
+    pubsub: ?*PubSubRegistry,
     new_fds: [MAX_NEW_FDS]i32,
     new_fd_head: std.atomic.Value(usize),
     new_fd_tail: std.atomic.Value(usize),
@@ -131,6 +235,7 @@ pub const Worker = struct {
         tls_ctx: ?*TlsContext,
         repl_follower: ?*replication.ReplicationFollower,
         repl_leader: ?*replication.ReplicationLeader,
+        pubsub: ?*PubSubRegistry,
     ) !Worker {
         return .{
             .id = id,
@@ -153,6 +258,7 @@ pub const Worker = struct {
             .tls_ctx = tls_ctx,
             .repl_follower = repl_follower,
             .repl_leader = repl_leader,
+            .pubsub = pubsub,
             .new_fds = [_]i32{-1} ** MAX_NEW_FDS,
             .new_fd_head = std.atomic.Value(usize).init(0),
             .new_fd_tail = std.atomic.Value(usize).init(0),
@@ -274,6 +380,8 @@ pub const Worker = struct {
 
     fn closeConn(self: *Worker, fd: i32) void {
         self.loop.removeFd(fd);
+        // Unsubscribe from all pub/sub channels
+        if (self.pubsub) |ps| ps.unsubscribeAll(fd);
         if (self.conns.fetchRemove(fd)) |kv| {
             if (kv.value.ssl) |s| {
                 if (self.tls_ctx) |tls| tls.sslClose(s);
@@ -450,6 +558,80 @@ pub const Worker = struct {
             return;
         }
 
+        // ── Pub/Sub commands ────────────────────────────────────────────
+        if (self.pubsub) |ps| {
+            if (args[0].len >= 7 and equalsAsciiUpper(args[0], "PUBLISH")) {
+                self.handlePublish(conn, args, ps);
+                return;
+            }
+            if (args[0].len >= 9 and equalsAsciiUpper(args[0], "SUBSCRIBE")) {
+                self.handleSubscribe(conn, args, ps);
+                return;
+            }
+            if (args[0].len >= 11 and equalsAsciiUpper(args[0], "UNSUBSCRIBE")) {
+                self.handleUnsubscribe(conn, args, ps);
+                return;
+            }
+        }
+
+        // In pub/sub mode, only SUBSCRIBE/UNSUBSCRIBE/PING/QUIT are allowed
+        if (conn.pubsub_mode) {
+            conn.write_buf.appendSlice("-ERR only (P)SUBSCRIBE / (P)UNSUBSCRIBE / PING / QUIT allowed in this context\r\n") catch {};
+            return;
+        }
+
+        // ── MULTI/EXEC/DISCARD transactions ─────────────────────────────
+        if (args[0].len == 5 and equalsAsciiUpper(args[0], "MULTI")) {
+            if (conn.tx_queue != null) {
+                conn.write_buf.appendSlice("-ERR MULTI calls can not be nested\r\n") catch {};
+            } else {
+                conn.tx_queue = std.array_list.Managed(Connection.TxCommand).init(self.allocator);
+                conn.write_buf.appendSlice("+OK\r\n") catch {};
+            }
+            return;
+        }
+        if (args[0].len == 7 and equalsAsciiUpper(args[0], "DISCARD")) {
+            if (conn.tx_queue) |*q| {
+                for (q.items) |*cmd| cmd.deinit(self.allocator);
+                q.deinit();
+                conn.tx_queue = null;
+                conn.write_buf.appendSlice("+OK\r\n") catch {};
+            } else {
+                conn.write_buf.appendSlice("-ERR DISCARD without MULTI\r\n") catch {};
+            }
+            return;
+        }
+        if (args[0].len == 4 and equalsAsciiUpper(args[0], "EXEC")) {
+            self.handleExec(conn);
+            return;
+        }
+
+        // If inside MULTI, queue the command
+        if (conn.tx_queue) |*q| {
+            // Copy args since they'll be freed after this call
+            const owned_args = self.allocator.alloc([]u8, args.len) catch {
+                conn.write_buf.appendSlice("-ERR out of memory\r\n") catch {};
+                return;
+            };
+            for (args, 0..) |arg, i| {
+                owned_args[i] = self.allocator.dupe(u8, arg) catch {
+                    // Clean up partially allocated
+                    for (owned_args[0..i]) |a| self.allocator.free(a);
+                    self.allocator.free(owned_args);
+                    conn.write_buf.appendSlice("-ERR out of memory\r\n") catch {};
+                    return;
+                };
+            }
+            q.append(.{ .args = owned_args }) catch {
+                for (owned_args) |a| self.allocator.free(a);
+                self.allocator.free(owned_args);
+                conn.write_buf.appendSlice("-ERR out of memory\r\n") catch {};
+                return;
+            };
+            conn.write_buf.appendSlice("+QUEUED\r\n") catch {};
+            return;
+        }
+
         // ── Replication replay marker: _REPL prefix means this is a replayed
         // command. Execute locally, skip forwarding AND broadcasting.
         if (args.len >= 2 and std.mem.eql(u8, args[0], "_REPL")) {
@@ -463,8 +645,9 @@ pub const Worker = struct {
         }
 
         // ── Follower write forwarding: send writes to leader ──
+        // If this follower has been promoted to leader, skip forwarding and execute locally.
         if (self.repl_follower) |rf| {
-            if (replication.isWriteCommand(args)) {
+            if (!rf.promoted.load(.acquire) and replication.isWriteCommand(args)) {
                 const resp_bytes = rf.forwardWrite(args) catch {
                     conn.write_buf.appendSlice("-ERR leader unavailable\r\n") catch {};
                     return;
@@ -500,14 +683,21 @@ pub const Worker = struct {
 
     /// If this node is the leader and the command is a write, broadcast to followers.
     fn maybeBroadcast(self: *Worker, args: []const []const u8) void {
-        const rl = self.repl_leader orelse return;
+        // Check original leader pointer, or promoted leader if this was a follower
+        var rl = self.repl_leader;
+        if (rl == null) {
+            if (self.repl_follower) |rf| {
+                rl = rf.getPromotedLeader();
+            }
+        }
+        const leader = rl orelse return;
         if (!replication.isWriteCommand(args)) return;
 
         // Encode command as write_forward payload (same format followers use)
         const payload = @import("../cluster/protocol.zig").encodeWriteForward(self.allocator, args) catch return;
         defer self.allocator.free(payload);
         std.debug.print("[repl-broadcast] cmd={s} payload_len={d}\n", .{ if (args.len > 0) args[0] else "?", payload.len });
-        rl.broadcastMutation(payload);
+        leader.broadcastMutation(payload);
     }
 
     fn handleAuth(self: *Worker, conn: *Connection, args: []const []const u8) void {
@@ -528,6 +718,127 @@ pub const Worker = struct {
         } else {
             conn.write_buf.appendSlice("-ERR invalid password\r\n") catch {};
         }
+    }
+
+    // ── Pub/Sub handlers ─────────────────────────────────────────────
+
+    fn handleSubscribe(self: *Worker, conn: *Connection, args: []const []const u8, ps: *PubSubRegistry) void {
+        if (args.len < 2) {
+            conn.write_buf.appendSlice("-ERR wrong number of arguments for 'SUBSCRIBE'\r\n") catch {};
+            return;
+        }
+        conn.pubsub_mode = true;
+        for (args[1..]) |channel| {
+            ps.subscribe(channel, conn.fd) catch continue;
+            // RESP push: *3\r\n$9\r\nsubscribe\r\n$<chanlen>\r\n<chan>\r\n:<count>\r\n
+            conn.write_buf.appendSlice("*3\r\n$9\r\nsubscribe\r\n") catch {};
+            writeBulkTo(&conn.write_buf, channel);
+            writeIntTo(&conn.write_buf, 1);
+        }
+        _ = self;
+    }
+
+    fn handleUnsubscribe(self: *Worker, conn: *Connection, args: []const []const u8, ps: *PubSubRegistry) void {
+        _ = self;
+        if (args.len < 2) {
+            // Unsubscribe from all channels
+            ps.unsubscribeAll(conn.fd);
+            conn.pubsub_mode = false;
+            conn.write_buf.appendSlice("*3\r\n$11\r\nunsubscribe\r\n$-1\r\n:0\r\n") catch {};
+            return;
+        }
+        for (args[1..]) |channel| {
+            ps.unsubscribe(channel, conn.fd);
+            conn.write_buf.appendSlice("*3\r\n$11\r\nunsubscribe\r\n") catch {};
+            writeBulkTo(&conn.write_buf, channel);
+            writeIntTo(&conn.write_buf, 0);
+        }
+        conn.pubsub_mode = false;
+    }
+
+    fn handlePublish(self: *Worker, conn: *Connection, args: []const []const u8, ps: *PubSubRegistry) void {
+        if (args.len < 3) {
+            conn.write_buf.appendSlice("-ERR wrong number of arguments for 'PUBLISH'\r\n") catch {};
+            return;
+        }
+        const channel = args[1];
+        const message = args[2];
+
+        // Get subscriber fds
+        var subs = std.array_list.Managed(i32).init(self.allocator);
+        defer subs.deinit();
+        ps.getSubscribers(channel, &subs);
+
+        // Format the push message: *3\r\n$7\r\nmessage\r\n$<chanlen>\r\n<chan>\r\n$<msglen>\r\n<msg>\r\n
+        var push_buf = std.array_list.Managed(u8).init(self.allocator);
+        defer push_buf.deinit();
+        push_buf.appendSlice("*3\r\n$7\r\nmessage\r\n") catch {};
+        writeBulkTo(&push_buf, channel);
+        writeBulkTo(&push_buf, message);
+
+        // Write to all subscribers (direct write to their fds)
+        for (subs.items) |fd| {
+            if (self.conns.get(fd)) |sub_conn| {
+                sub_conn.write_buf.appendSlice(push_buf.items) catch {};
+            } else {
+                // Subscriber on different worker — write directly to fd
+                _ = std.c.write(fd, push_buf.items.ptr, push_buf.items.len);
+            }
+        }
+
+        // Reply with count of subscribers who received the message
+        writeIntTo(&conn.write_buf, @intCast(subs.items.len));
+    }
+
+    /// EXEC: execute all queued commands atomically under engine lock.
+    fn handleExec(self: *Worker, conn: *Connection) void {
+        var q = conn.tx_queue orelse {
+            conn.write_buf.appendSlice("-ERR EXEC without MULTI\r\n") catch {};
+            return;
+        };
+
+        // Write array header for the number of queued commands
+        var hdr: [32]u8 = undefined;
+        const h = std.fmt.bufPrint(&hdr, "*{d}\r\n", .{q.items.len}) catch {
+            conn.write_buf.appendSlice("-ERR internal error\r\n") catch {};
+            return;
+        };
+        conn.write_buf.appendSlice(h) catch {};
+
+        // Execute all commands under engine lock
+        while (!self.kv_mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.kv_mutex.unlock();
+
+        for (q.items) |cmd| {
+            // Cast [][]u8 to []const []const u8
+            const args: []const []const u8 = @ptrCast(cmd.args);
+
+            if (self.ckv) |ckv| {
+                if (self.executeHotFast(conn, args, ckv)) continue;
+            }
+
+            // Fall back to CommandHandler for non-hot-path commands
+            var selected_db = std.atomic.Value(u8).init(conn.selected_db);
+            var handler = CommandHandler.init(
+                self.allocator, self.io, self.kv, self.graph, self.aof,
+                &selected_db, self.keys_mode,
+            );
+            var list: std.ArrayList(u8) = .empty;
+            defer list.deinit(self.allocator);
+            var aw = std.Io.Writer.Allocating.fromArrayList(self.allocator, &list);
+            defer aw.deinit();
+            handler.execute(args, &aw.writer) catch {
+                conn.write_buf.appendSlice("-ERR internal error\r\n") catch {};
+                continue;
+            };
+            conn.selected_db = selected_db.load(.monotonic);
+            conn.write_buf.appendSlice(aw.written()) catch {};
+        }
+
+        // Clean up transaction queue
+        for (q.items) |*cmd| cmd.deinit(self.allocator);
+        q.deinit();
+        conn.tx_queue = null;
     }
 
     /// Hot-path command dispatch using nested switch (compiler generates jump tables).
@@ -881,4 +1192,81 @@ fn constantTimeEql(a: []const u8, b: []const u8) bool {
 
 fn log(comptime fmt: []const u8, args: anytype) void {
     std.debug.print("[worker] " ++ fmt ++ "\n", args);
+}
+
+// ─── Tests ──────────────────────────────────────────────────────────
+
+test "PubSubRegistry subscribe and getSubscribers" {
+    var ps = PubSubRegistry.init(std.testing.allocator);
+    defer ps.deinit();
+
+    try ps.subscribe("news", 10);
+    try ps.subscribe("news", 20);
+    try ps.subscribe("sports", 30);
+
+    var subs = std.array_list.Managed(i32).init(std.testing.allocator);
+    defer subs.deinit();
+
+    ps.getSubscribers("news", &subs);
+    try std.testing.expectEqual(@as(usize, 2), subs.items.len);
+
+    subs.clearRetainingCapacity();
+    ps.getSubscribers("sports", &subs);
+    try std.testing.expectEqual(@as(usize, 1), subs.items.len);
+    try std.testing.expectEqual(@as(i32, 30), subs.items[0]);
+
+    subs.clearRetainingCapacity();
+    ps.getSubscribers("nonexistent", &subs);
+    try std.testing.expectEqual(@as(usize, 0), subs.items.len);
+}
+
+test "PubSubRegistry unsubscribe" {
+    var ps = PubSubRegistry.init(std.testing.allocator);
+    defer ps.deinit();
+
+    try ps.subscribe("ch", 10);
+    try ps.subscribe("ch", 20);
+
+    ps.unsubscribe("ch", 10);
+
+    var subs = std.array_list.Managed(i32).init(std.testing.allocator);
+    defer subs.deinit();
+    ps.getSubscribers("ch", &subs);
+    try std.testing.expectEqual(@as(usize, 1), subs.items.len);
+    try std.testing.expectEqual(@as(i32, 20), subs.items[0]);
+}
+
+test "PubSubRegistry unsubscribeAll" {
+    var ps = PubSubRegistry.init(std.testing.allocator);
+    defer ps.deinit();
+
+    try ps.subscribe("a", 10);
+    try ps.subscribe("b", 10);
+    try ps.subscribe("a", 20);
+
+    ps.unsubscribeAll(10);
+
+    var subs = std.array_list.Managed(i32).init(std.testing.allocator);
+    defer subs.deinit();
+
+    ps.getSubscribers("a", &subs);
+    try std.testing.expectEqual(@as(usize, 1), subs.items.len);
+    try std.testing.expectEqual(@as(i32, 20), subs.items[0]);
+
+    subs.clearRetainingCapacity();
+    ps.getSubscribers("b", &subs);
+    try std.testing.expectEqual(@as(usize, 0), subs.items.len);
+}
+
+test "PubSubRegistry duplicate subscribe ignored" {
+    var ps = PubSubRegistry.init(std.testing.allocator);
+    defer ps.deinit();
+
+    try ps.subscribe("ch", 10);
+    try ps.subscribe("ch", 10); // duplicate
+
+    var subs = std.array_list.Managed(i32).init(std.testing.allocator);
+    defer subs.deinit();
+    ps.getSubscribers("ch", &subs);
+    try std.testing.expectEqual(@as(usize, 1), subs.items.len);
 }
