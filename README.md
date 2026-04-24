@@ -285,40 +285,113 @@ Clients must `AUTH mysecret` before any command (except PING). Password comparis
 | `--profile` | off | Enable latency profiling |
 | `--profile-every N` | 100000 | Print profile every N commands |
 
+## Clustering
+
+Vex supports leader/follower replication for read scaling and data safety.
+
+```bash
+# Start a 3-node cluster
+docker compose -f docker-compose.cluster.yml up --build -d
+
+# Write to leader
+redis-cli -p 16380 SET hello world
+
+# Read from any follower (replicated)
+redis-cli -p 16381 GET hello    # → "world"
+redis-cli -p 16382 GET hello    # → "world"
+
+# Writes on followers are forwarded to leader automatically
+redis-cli -p 16381 SET fromfollower value
+redis-cli -p 16380 GET fromfollower  # → "value" (on leader)
+redis-cli -p 16382 GET fromfollower  # → "value" (replicated)
+```
+
+**Cluster config** (`cluster.conf`):
+```
+node 1 leader 10.0.0.1:6380
+node 2 follower 10.0.0.2:6380
+node 3 follower 10.0.0.3:6380
+self 1
+```
+
+**Features:**
+- Leader accepts all writes, broadcasts mutations to followers via binary VX protocol
+- Followers forward writes to leader, serve reads locally
+- Full sync: new followers receive a snapshot on connect
+- Heartbeat every 5s with mutation_seq for lag tracking
+- Replication lag: `leader_seq - local_seq` (available via `replLag()`)
+- Graph replication: ADDNODE/ADDEDGE on leader → TRAVERSE/PATH on followers
+
+**Consistency model:** Eventual consistency for reads on followers. All writes go through the leader. Read-your-own-writes is guaranteed on the leader only.
+
+| CLI Flag | Description |
+|---|---|
+| `--cluster-config <path>` | Path to cluster config file |
+
+## Changelog
+
+### v0.2.0 — Distributed KV + Graph Read Replicas
+
+**Cluster & Replication:**
+- `9cf75ee` Full sync, heartbeat, lag tracking: production-ready replication
+- `121f84e` Heartbeat every 5s with mutation_seq + timestamp
+- `ba255fa` Full replication: leader broadcasts mutations, followers replay locally
+- `210ed41` Working 3-node cluster: write forwarding from follower to leader
+- `c2faca9` 3-node cluster: leader + 2 followers running, replication listener
+- `e6d32fb` Replication module: leader/follower streaming, write forwarding
+- `0453bef` Cluster foundation: config parser, binary VX protocol, graph mutation_seq
+
+**Graph Performance (vs Memgraph):**
+- `be52b79` Auto-compact + GRAPH.COMPACT: Vex wins all 5 ops vs Memgraph
+- `499f20a` Frontier-based BFS traverse: +38% faster, tied with Memgraph
+- `70a426a` Bidirectional BFS: 23x faster shortest path than Memgraph
+- `59c5e37` Graph rwlock: parallel read queries, exclusive writes
+- `e2bdd75` Flat parent arrays + fix getCSRSlice double-loop
+
+**KV Performance (vs Redis 8.0):**
+- `33c32a5` pthread_rwlock per stripe: +70% GET, parallel readers
+- `6ec9b82` Move all malloc/free outside stripe locks: +91% SET
+- `007e3d4` Pre-allocate SET value outside lock: reduce lock hold to ~20ns
+- `8e35b12` Cached clock, cache-line aligned stripes, optimized getAndWriteBulk
+- `da25bd9` Zero-copy read: parse RESP directly from stack buffer
+
+**Networking:**
+- `c85e1f8` Auto-detect worker count from CPU cores
+- `ca5eff9` Comptime command dispatch table + pre-built RESP literals
+- `3953023` Shard router infrastructure (16384 slots, MPSC queues)
+
+**Commands & Prod Hardening:**
+- `b469125` Add MGET, MSET, INCR, DECR, INCRBY, DECRBY, EXPIRE, PERSIST, APPEND
+- `887074c` AUTH, maxclients, max-client-buffer, graceful shutdown, BGREWRITEAOF
+- `c1c7b50` Tests for all new commands
+
+### v0.1.0 — Initial Release
+
+- `0255e74` V2 engine: CSR graph, KV tombstone DEL, networking optimizations
+- `808dba3` Multi-reactor architecture, MIT license
+- `8eaf96e` Redis-compatible KV + Graph DB with epoll/kqueue/io_uring
+
 ## Roadmap
 
-### v0.3 — Distributed KV + Graph Read Replicas
-- Hash-partition KV across N machines (16384 slots, Redis Cluster compatible)
-- Shard map with epoch-based routing
-- Binary frame protocol for inter-node communication
-- Graph read replicas: full graph replicated to followers, reads on any replica, writes forwarded to leader
-- Leader/follower replication via mutation log streaming
-- Cluster config via `--cluster-config`
-
-### v0.4 — Production Hardening
+### v0.3 — Production Hardening
 - TLS support (encrypted connections)
-- `maxmemory` with LRU eviction policy
-- True background save (`BGSAVE` without blocking)
-- AOF group commit (batch writes per event loop tick)
 - `MULTI`/`EXEC` transactions
 - Pub/Sub (`SUBSCRIBE`/`PUBLISH`)
-- Structured logging (JSON format, log levels)
 - Config file support (`vex.conf`)
+- Automatic failover (leader election)
 
-### v0.5 — Partitioned Graph
+### v0.4 — Partitioned Graph
 - Hash-partition graph nodes across machines
 - Ghost nodes for 1-hop boundary cache
-- BSP (Bulk Synchronous Parallel) BFS for cross-partition traversals
-- Distributed Dijkstra with batched priority queue
-- Consistent hash ring with vnodes for rebalancing
-- Autoscaling: add/remove nodes based on load metrics
+- BSP BFS for cross-partition traversals
+- Distributed Dijkstra
+- Consistent hash ring with vnodes
 
 ### Future
 - Graph secondary indexes on properties
 - Cypher query language subset
 - io_uring batched read/write (Linux)
-- PageRank, connected components, betweenness centrality algorithms
-- WebSocket protocol support
+- PageRank, connected components algorithms
 
 ## License
 
