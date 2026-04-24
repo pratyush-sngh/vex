@@ -126,6 +126,55 @@ func main() {
 			return clients[worker%len(clients)].cmd("DEL", key)
 		})
 
+		// Re-seed for remaining benchmarks
+		for i := 0; i < cfg.n; i++ {
+			_ = clients[0].cmd("SET", fmt.Sprintf("k:%d", i), fmt.Sprintf("v:%d", i))
+		}
+
+		printBench("EXISTS (hit)", cfg, func(i int, worker int) error {
+			key := fmt.Sprintf("k:%d", i)
+			return clients[worker%len(clients)].cmd("EXISTS", key)
+		})
+
+		printBench("INCR", cfg, func(i int, worker int) error {
+			key := fmt.Sprintf("ctr:%d", i%100) // 100 counters to avoid contention
+			return clients[worker%len(clients)].cmd("INCR", key)
+		})
+
+		printBench("APPEND", cfg, func(i int, worker int) error {
+			key := fmt.Sprintf("app:%d", i%100)
+			return clients[worker%len(clients)].cmd("APPEND", key, "x")
+		})
+
+		printBench("EXPIRE+TTL", cfg, func(i int, worker int) error {
+			key := fmt.Sprintf("k:%d", i%cfg.n)
+			c := clients[worker%len(clients)]
+			if err := c.cmd("EXPIRE", key, "300"); err != nil {
+				return err
+			}
+			return c.cmd("TTL", key)
+		})
+
+		// MSET: 10 keys per call
+		printBench("MSET(10)", cfg, func(i int, worker int) error {
+			args := make([]string, 0, 21)
+			args = append(args, "MSET")
+			for j := 0; j < 10; j++ {
+				args = append(args, fmt.Sprintf("mk:%d:%d", i, j), fmt.Sprintf("mv:%d:%d", i, j))
+			}
+			return clients[worker%len(clients)].cmdRaw(args...)
+		})
+
+		// MGET: 10 keys per call
+		printBench("MGET(10)", cfg, func(i int, worker int) error {
+			args := make([]string, 0, 11)
+			args = append(args, "MGET")
+			for j := 0; j < 10; j++ {
+				args = append(args, fmt.Sprintf("k:%d", (i*10+j)%cfg.n))
+			}
+			return clients[worker%len(clients)].cmdRaw(args...)
+		})
+
 		// Pipeline benchmarks (if -pipeline > 0)
 		if *pipeline > 0 {
 			pipeSize := *pipeline
@@ -153,6 +202,31 @@ func main() {
 				for j := 0; j < pipeSize; j++ {
 					idx := i*pipeSize + j
 					batch = append(batch, []string{"GET", fmt.Sprintf("k:%d", idx%cfg.n)})
+				}
+				return clients[worker%len(clients)].cmdPipeline(batch)
+			})
+
+			printBench(fmt.Sprintf("PIPE-INCR(%d)", pipeSize), cfg, func(i int, worker int) error {
+				batch := make([][]string, 0, pipeSize)
+				for j := 0; j < pipeSize; j++ {
+					batch = append(batch, []string{"INCR", fmt.Sprintf("pctr:%d", (i*pipeSize+j)%1000)})
+				}
+				return clients[worker%len(clients)].cmdPipeline(batch)
+			})
+
+			printBench(fmt.Sprintf("PIPE-EXISTS(%d)", pipeSize), cfg, func(i int, worker int) error {
+				batch := make([][]string, 0, pipeSize)
+				for j := 0; j < pipeSize; j++ {
+					batch = append(batch, []string{"EXISTS", fmt.Sprintf("k:%d", (i*pipeSize+j)%cfg.n)})
+				}
+				return clients[worker%len(clients)].cmdPipeline(batch)
+			})
+
+			printBench(fmt.Sprintf("PIPE-DEL(%d)", pipeSize), cfg, func(i int, worker int) error {
+				batch := make([][]string, 0, pipeSize)
+				for j := 0; j < pipeSize; j++ {
+					idx := i*pipeSize + j
+					batch = append(batch, []string{"DEL", fmt.Sprintf("pdel:%d", idx)})
 				}
 				return clients[worker%len(clients)].cmdPipeline(batch)
 			})
@@ -456,6 +530,11 @@ func (c *client) cmd(parts ...string) error {
 	}
 	_, err := readRESP(c.rd)
 	return err
+}
+
+// cmdRaw is identical to cmd but takes a pre-built args slice (for MSET/MGET with many keys).
+func (c *client) cmdRaw(parts ...string) error {
+	return c.cmd(parts...)
 }
 
 // cmdPipeline sends N commands in one write, then reads N responses.

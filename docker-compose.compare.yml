@@ -4,7 +4,6 @@ services:
     container_name: redis-compare
     command: ["redis-server", "--appendonly", "no", "--save", ""]
     ports:
-      # Host ports avoid clashing with a local Redis on 6379
       - "16379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
@@ -13,18 +12,23 @@ services:
       retries: 20
     volumes:
       - redis_compare_data:/data
+    cpuset: "0-3"
+    mem_limit: 4g
+    memswap_limit: 4g
 
   vex:
     build:
       context: .
       dockerfile: Dockerfile.vex
     container_name: vex-compare
-    command: ["--port", "6380", "--data-dir", "/data", "--no-persistence", "--reactor"]
+    command: ["--port", "6380", "--data-dir", "/data", "--no-persistence", "--reactor", "--workers", "4"]
     ports:
-      # Host port avoids clashing with a local vex / dev server on 6380
       - "16380:6380"
     volumes:
       - vex_compare_data:/data
+    cpuset: "4-7"
+    mem_limit: 4g
+    memswap_limit: 4g
 
 volumes:
   redis_compare_data:

@@ -7,17 +7,23 @@ services:
     command: ["--also-log-to-stderr", "--log-level=WARNING"]
     volumes:
       - memgraph_data:/var/lib/memgraph
+    cpuset: "0-3"
+    mem_limit: 4g
+    memswap_limit: 4g
 
   vex:
     build:
       context: .
       dockerfile: Dockerfile.vex
     container_name: vex-graph-bench
-    command: ["--port", "6380", "--data-dir", "/data", "--no-persistence", "--reactor"]
+    command: ["--port", "6380", "--data-dir", "/data", "--no-persistence", "--reactor", "--workers", "4"]
     ports:
       - "17380:6380"
     volumes:
       - vex_graph_data:/data
+    cpuset: "4-7"
+    mem_limit: 4g
+    memswap_limit: 4g
 
 volumes:
   memgraph_data:

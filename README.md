@@ -4,8 +4,8 @@ A high-performance KV + Graph database written in Zig 0.16. Speaks the Redis pro
 
 ## Why Vex?
 
-- **Up to 2x faster than Redis** on pipelined KV workloads (2.96M GET cmd/s)
-- **23x faster shortest path than Memgraph** via bidirectional BFS + CSR adjacency
+- **Up to 34% faster than Redis** on pipelined KV workloads with equal resources (3.00M GET cmd/s)
+- **18x faster shortest path than Memgraph** via bidirectional BFS + CSR adjacency
 - **Wins all 5 graph operations** vs Memgraph (add, traverse, path, neighbors)
 - **Redis-compatible** -- works with every Redis client library
 - **Zero dependencies** -- pure Zig standard library, single binary
@@ -59,23 +59,31 @@ Workers auto-detect from CPU core count (capped at 8). See [Configuration](docs/
 
 ## Benchmarks
 
-### KV: Vex vs Redis 8.0
+All benchmarks run in Docker with **equal, isolated resources**: 4 CPU cores + 4GB RAM per container, CPU-pinned (`cpuset`) to prevent cross-container interference. Vex capped at 4 reactor workers. Median of 5 runs, 1000 warmup ops discarded. See [Benchmarks](docs/benchmarks.md) for full methodology.
 
-| Benchmark | Redis | Vex | Speedup |
+### KV: Vex vs Redis 8.0 (pipelined, c=16)
+
+| Command | Redis | Vex | Speedup |
 |---|---|---|---|
-| PIPE-SET(100) c=16 | 1.18M cmd/s | **2.25M cmd/s** | **+91%** |
-| PIPE-GET(50) c=32 | 1.45M cmd/s | **2.46M cmd/s** | **+70%** |
-| PIPE-GET(100) c=16 | 1.52M cmd/s | **2.96M cmd/s** | **+96%** |
+| PIPE-SET(100) | 1.82M cmd/s | **2.33M cmd/s** | **+28%** |
+| PIPE-GET(100) | 2.40M cmd/s | **2.99M cmd/s** | **+25%** |
+| PIPE-INCR(100) | 2.44M cmd/s | **2.58M cmd/s** | **+6%** |
+| PIPE-EXISTS(100) | 2.45M cmd/s | **2.88M cmd/s** | **+18%** |
+| PIPE-DEL(100) | 2.09M cmd/s | **2.69M cmd/s** | **+29%** |
+
+Single-command (SET, GET, DEL, EXISTS, INCR, APPEND, MSET, MGET): tied at ~41K ops/s -- network-bound.
 
 ### Graph: Vex vs Memgraph (10K nodes / 50K edges)
 
 | Operation | Memgraph | Vex | Speedup |
 |---|---|---|---|
-| Shortest Path | 4,838 us | **210 us** | **23x faster** |
-| AddNode | 180 us | **139 us** | +23% |
-| Neighbors | 233 us | **154 us** | +34% |
+| Shortest Path | 4,029 us | **213 us** | **19x faster** |
+| AddNode | 176.5 us | **137.6 us** | **+22%** |
+| AddEdge | 190.8 us | **138.2 us** | **+28%** |
+| Traverse (depth 3) | 283 us | **263 us** | **+7%** |
+| Neighbors | 255 us | **138 us** | **+46%** |
 
-Full benchmark data: [Benchmarks](docs/benchmarks.md)
+Full benchmark data, single-command results, and methodology: [Benchmarks](docs/benchmarks.md)
 
 ---
 

@@ -4,34 +4,84 @@
 
 ---
 
-## KV: Vex vs Redis 8.0 (Docker)
+## Methodology
 
-Real Redis clients pipeline commands. This is where Vex's multi-core architecture shines:
+All benchmarks run under controlled, reproducible conditions:
 
-| Benchmark | Redis | Vex | Speedup |
+- **Environment**: Docker containers on macOS (Apple Silicon, 14 cores / 48GB RAM)
+- **Isolation**: Each container gets **4 dedicated CPU cores** (`cpuset`) and **4GB RAM** (`mem_limit`), with no overlap between competitors
+- **Vex workers**: Capped at 4 (`--workers 4`) to match the 4-core allocation
+- **Redis config**: `--appendonly no --save ""` (persistence disabled, same as Vex `--no-persistence`)
+- **Versions**: Redis 8.0.3, Memgraph latest, Vex built with `-Doptimize=ReleaseFast`
+- **Runs**: Median of 5 runs, 1000 warmup ops discarded before measurement
+- **Client**: Go benchmark tool running on the host (not containerized), connecting via Docker port mapping
+
+### Docker Compose Resource Pinning
+
+```yaml
+# KV benchmark (docker-compose.compare.yml)
+redis:
+  cpuset: "0-3"      # 4 cores
+  mem_limit: 4g
+vex:
+  cpuset: "4-7"      # 4 cores (no overlap)
+  mem_limit: 4g
+  command: ["--reactor", "--workers", "4"]
+
+# Graph benchmark (docker-compose.graph-bench.yml)
+memgraph:
+  cpuset: "0-3"
+  mem_limit: 4g
+vex:
+  cpuset: "4-7"
+  mem_limit: 4g
+  command: ["--reactor", "--workers", "4"]
+```
+
+This ensures neither container can steal CPU time from the other. Redis is single-threaded, so 3 of its 4 cores go unused -- this is intentional to keep the comparison fair (same hardware budget, architectural choices determine throughput).
+
+---
+
+## KV: Vex vs Redis 8.0 (all commands, c=16)
+
+### Single-command (no pipeline)
+
+| Command | Redis ops/s | Vex ops/s | Delta |
 |---|---|---|---|
-| PIPE-SET(100) c=16 | 1.18M cmd/s | **2.25M cmd/s** | **+91%** |
-| PIPE-GET(50) c=32 | 1.45M cmd/s | **2.46M cmd/s** | **+70%** |
-| PIPE-GET(100) c=16 | 1.52M cmd/s | **2.96M cmd/s** | **+96%** |
+| SET | 43,377 | 41,821 | tied |
+| GET (hit) | 44,058 | 41,167 | tied |
+| DEL | 41,353 | 42,423 | tied |
+| EXISTS (hit) | 42,175 | 40,087 | tied |
+| INCR | 41,930 | 41,381 | tied |
+| APPEND | 40,531 | 41,498 | tied |
+| EXPIRE+TTL | 20,518 | 20,932 | tied |
+| MSET(10) | 37,425 | **38,470** | +3% |
+| MGET(10) | 39,225 | **41,253** | +5% |
 
-Single-command (no pipeline):
+Single-command throughput is dominated by TCP round-trip latency (~370us). Both databases process the command in nanoseconds -- the network is the bottleneck.
 
-| Concurrency | Vex SET | Redis SET | Vex GET | Redis GET |
-|---|---|---|---|---|
-| c=1 | **7,223** (+19%) | 6,064 | **7,079** (+6%) | 6,679 |
-| c=10 | 28,676 | **29,615** | **30,601** (+1%) | 30,221 |
-| c=32 | 49,080 | **53,707** | **50,266** (+3%) | 48,824 |
+### Pipelined (100 commands per batch, c=16)
 
-Pipeline scaling (c=1, single connection):
+| Command | Redis cmd/s | Vex cmd/s | Speedup |
+|---|---|---|---|
+| PIPE-SET(100) | 1.82M | **2.33M** | **+28%** |
+| PIPE-GET(100) | 2.40M | **2.99M** | **+25%** |
+| PIPE-INCR(100) | 2.44M | **2.58M** | **+6%** |
+| PIPE-EXISTS(100) | 2.45M | **2.88M** | **+18%** |
+| PIPE-DEL(100) | 2.09M | **2.69M** | **+29%** |
 
-| Pipeline | Redis cmd/s | Vex cmd/s |
-|---|---|---|
-| p=1 | **7,104** | 5,775 |
-| p=10 | 64,800 | **65,681** |
-| p=50 | 277,345 | **288,415** |
-| p=100 | 468,300 | **505,450** |
+Pipelining amortizes network overhead, exposing the engine's raw throughput. Vex's multi-reactor workers process batches in parallel across 4 cores while Redis serializes everything on one thread.
 
-Vex wins at any pipeline size >= 10. Real applications always pipeline.
+### Pipeline scaling (c=1, single connection)
+
+| Pipeline | Redis cmd/s | Vex cmd/s | Delta |
+|---|---|---|---|
+| p=1 | **7,188** | 7,176 | tied |
+| p=10 | 67,500 | **73,200** | +8% |
+| p=50 | 251,000 | **261,000** | +4% |
+| p=100 | 442,000 | **491,000** | +11% |
+
+At c=1, both are bottlenecked by TCP round-trip latency. The multi-reactor advantage only shows with concurrent connections.
 
 ---
 
@@ -39,13 +89,13 @@ Vex wins at any pipeline size >= 10. Real applications always pipeline.
 
 | Operation | Memgraph | Vex | Speedup |
 |---|---|---|---|
-| AddNode | 180 us | **139 us** | **+23%** |
-| AddEdge | 197 us | **145 us** | **+26%** |
-| BFS Traverse (depth 3) | **313 us** | 326 us | ~tied |
-| Shortest Path | 4,838 us | **210 us** | **Vex 23x faster** |
-| Neighbors | 233 us | **154 us** | **+34%** |
+| AddNode | 176.5 us | **137.6 us** | **+22%** |
+| AddEdge | 190.8 us | **138.2 us** | **+28%** |
+| BFS Traverse (depth 3) | 283 us | **263 us** | **+7%** |
+| Shortest Path | 4,029 us | **213 us** | **19x faster** |
+| Neighbors | 255 us | **138 us** | **+46%** |
 
-Vex wins or ties all 5 operations. Shortest path uses bidirectional BFS (meet-in-the-middle), which is dramatically faster than Memgraph's standard BFS.
+Vex wins all 5 operations. Shortest path uses bidirectional BFS (meet-in-the-middle), which explores ~sqrt(N) nodes instead of N -- dramatically faster than Memgraph's standard BFS.
 
 ---
 
@@ -70,17 +120,20 @@ Vex wins or ties all 5 operations. Shortest path uses bidirectional BFS (meet-in
 
 ---
 
-## How to Run Benchmarks
+## How to Reproduce
 
 ```bash
-# KV: Vex vs Redis (Docker, pipelined)
+# KV: Vex vs Redis (Docker, all commands + pipelined)
 docker compose -f docker-compose.compare.yml up --build -d
 cd tools/compare-client
-go run . -n 2000 -c 16 -warmup 500 -runs 5 -timeout 60s -pipeline 100
+go run . -n 3000 -c 16 -warmup 1000 -runs 5 -timeout 60s -pipeline 100
 docker compose -f docker-compose.compare.yml down -v
 
-# KV: Standard benchmark (no pipeline)
-go run . -n 20000 -c 32 -warmup 3000 -runs 5 -timeout 30s
+# KV: Pipeline scaling (c=1)
+go run . -n 5000 -c 1 -warmup 1000 -runs 3 -timeout 30s -pipeline 100
+
+# KV: High concurrency
+go run . -n 3000 -c 32 -warmup 1000 -runs 5 -timeout 60s -pipeline 50
 
 # Graph: Vex vs Memgraph (Docker)
 docker compose -f docker-compose.graph-bench.yml up --build -d
@@ -91,6 +144,8 @@ docker compose -f docker-compose.graph-bench.yml down -v
 # Internal engine benchmarks
 zig build bench-kv -Doptimize=ReleaseFast
 ```
+
+**Important**: Stop all unrelated Docker containers before benchmarking. Background containers competing for CPU will skew results (especially for the pipelined tests where throughput is CPU-bound).
 
 ---
 
