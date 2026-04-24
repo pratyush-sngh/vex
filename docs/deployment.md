@@ -93,47 +93,129 @@ sudo journalctl -u vex -f
 
 ## Docker
 
-### Single Node
+### Pull from GitHub Container Registry
 
-```dockerfile
-FROM alpine:latest
-COPY zig-out/bin/vex /usr/local/bin/vex
-EXPOSE 6380
-CMD ["vex", "--reactor", "--host", "0.0.0.0"]
-```
+Pre-built images for `linux/amd64` and `linux/arm64`:
 
 ```bash
-docker build -t vex .
-docker run -p 6380:6380 -v vex-data:/data vex --reactor --data-dir /data
+docker pull ghcr.io/pratyush-sngh/vex:latest
 ```
+
+Available tags:
+- `ghcr.io/pratyush-sngh/vex:latest` -- latest release
+- `ghcr.io/pratyush-sngh/vex:0.3.2` -- specific version
+- `ghcr.io/pratyush-sngh/vex:0.3` -- latest patch in 0.3.x
+- `ghcr.io/pratyush-sngh/vex:0` -- latest in 0.x
+
+### Run (Quick Start)
+
+```bash
+# Minimal — ephemeral, no persistence
+docker run -p 6380:6380 ghcr.io/pratyush-sngh/vex --reactor
+
+# With persistence volume
+docker run -p 6380:6380 -v vex-data:/data \
+  ghcr.io/pratyush-sngh/vex --reactor --data-dir /data
+
+# Connect
+redis-cli -p 6380
+```
+
+### Run with Config File
+
+The image ships with no config file. Mount your own:
+
+```bash
+# Create a config file
+cat > vex.conf << 'EOF'
+port 6380
+host 0.0.0.0
+reactor
+workers 4
+data-dir /data
+maxmemory 512mb
+maxmemory-policy allkeys-lru
+requirepass mysecret
+loglevel info
+EOF
+
+# Run with config
+docker run -p 6380:6380 \
+  -v ./vex.conf:/etc/vex/vex.conf:ro \
+  -v vex-data:/data \
+  ghcr.io/pratyush-sngh/vex --config /etc/vex/vex.conf
+```
+
+### Run with TLS
+
+```bash
+docker run -p 6380:6380 \
+  -v ./cert.pem:/etc/vex/cert.pem:ro \
+  -v ./key.pem:/etc/vex/key.pem:ro \
+  -v vex-data:/data \
+  ghcr.io/pratyush-sngh/vex --reactor --data-dir /data \
+    --tls-cert /etc/vex/cert.pem --tls-key /etc/vex/key.pem
+```
+
+### Run a 3-Node Cluster
+
+Same image, different config per node:
+
+```bash
+# Leader
+docker run -p 6380:6380 -p 16380:16380 \
+  -v ./leader.conf:/etc/vex/cluster.conf:ro \
+  -v leader-data:/data \
+  ghcr.io/pratyush-sngh/vex --reactor --data-dir /data \
+    --cluster-config /etc/vex/cluster.conf
+
+# Follower 1
+docker run -p 6381:6380 -p 16381:16380 \
+  -v ./follower1.conf:/etc/vex/cluster.conf:ro \
+  -v follower1-data:/data \
+  ghcr.io/pratyush-sngh/vex --reactor --data-dir /data \
+    --cluster-config /etc/vex/cluster.conf
+
+# Follower 2
+docker run -p 6382:6380 -p 16382:16380 \
+  -v ./follower2.conf:/etc/vex/cluster.conf:ro \
+  -v follower2-data:/data \
+  ghcr.io/pratyush-sngh/vex --reactor --data-dir /data \
+    --cluster-config /etc/vex/cluster.conf
+```
+
+Or use the provided compose file:
+```bash
+docker compose -f docker-compose.cluster.yml up --build -d
+```
+
+See [Clustering](clustering.md) for cluster config file format.
 
 ### Docker Compose (Single Node)
 
 ```yaml
-version: '3.8'
 services:
   vex:
-    build: .
+    image: ghcr.io/pratyush-sngh/vex:latest
     ports:
       - "6380:6380"
     volumes:
       - vex-data:/data
       - ./vex.conf:/etc/vex/vex.conf:ro
     command: ["--config", "/etc/vex/vex.conf"]
-    environment:
-      VEX_CONFIG: /etc/vex/vex.conf
 
 volumes:
   vex-data:
 ```
 
-### Docker Compose (3-Node Cluster)
+### Build from Source
+
+If you prefer to build locally instead of pulling from the registry:
 
 ```bash
-docker compose -f docker-compose.cluster.yml up --build -d
+docker build -f Dockerfile.vex -t vex .
+docker run -p 6380:6380 vex --reactor
 ```
-
-See [Clustering](clustering.md) for cluster configuration details.
 
 ---
 

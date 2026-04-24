@@ -32,9 +32,17 @@ A high-performance KV + Graph database written in Zig 0.16. Speaks the Redis pro
 
 ## Quick Start
 
+### Docker (easiest)
+
+```bash
+docker run -p 6380:6380 ghcr.io/pratyush-sngh/vex:latest --reactor
+redis-cli -p 6380
+```
+
+### Build from Source
+
 ```bash
 zig build                                          # Build
-zig build run                                      # Run (port 6380, ./data/)
 zig build run -- --reactor                        # Reactor mode (recommended)
 zig build test                                     # Run tests (107 tests)
 redis-cli -p 6380                                  # Connect
@@ -53,7 +61,7 @@ EOF
 zig build run
 ```
 
-Workers auto-detect from CPU core count (capped at 8). See [Configuration](docs/configuration.md) for all options.
+Workers auto-detect from CPU core count (capped at 8). See [Configuration](docs/configuration.md) for all options, [Deployment](docs/deployment.md) for Docker details.
 
 ---
 
