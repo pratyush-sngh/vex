@@ -48,27 +48,47 @@ This ensures neither container can steal CPU time from the other. Redis is singl
 
 | Command | Redis ops/s | Vex ops/s | Delta |
 |---|---|---|---|
-| SET | 42,185 | 40,805 | tied |
-| GET (hit) | 43,195 | 41,132 | tied |
-| DEL | 43,796 | 42,308 | tied |
-| EXISTS (hit) | 42,877 | 40,183 | tied |
-| INCR | 43,632 | 41,529 | tied |
-| APPEND | 44,008 | 42,083 | tied |
-| EXPIRE+TTL | 21,756 | 21,358 | tied |
-| MSET(10) | 41,502 | 41,150 | tied |
-| MGET(10) | 41,794 | 41,460 | tied |
+| **Strings** | | | |
+| SET | 42,660 | 41,142 | tied |
+| GET (hit) | 43,801 | 41,965 | tied |
+| DEL | 43,613 | 42,138 | tied |
+| EXISTS (hit) | 41,794 | 40,183 | tied |
+| INCR | 41,984 | 42,957 | tied |
+| APPEND | 42,395 | 42,197 | tied |
+| EXPIRE+TTL | 21,265 | 20,863 | tied |
+| MSET(10) | 36,663 | 39,826 | tied |
+| MGET(10) | 38,463 | 41,718 | tied |
+| **Lists** | | | |
+| RPUSH | 42,393 | 41,561 | tied |
+| LPUSH | 44,102 | 39,354 | tied |
+| LRANGE(0,9) | 42,998 | 41,022 | tied |
+| LLEN | 43,680 | 42,471 | tied |
+| LPOP | 43,459 | 42,479 | tied |
+| RPOP | 44,207 | 41,749 | tied |
+| **Hashes** | | | |
+| HSET | 43,641 | 41,703 | tied |
+| HGET | 42,570 | 41,360 | tied |
+| HGETALL | 39,378 | **41,001** | +4% |
+| HLEN | 41,608 | 41,692 | tied |
+| HINCRBY | 41,919 | 41,283 | tied |
+| HDEL | 43,769 | 41,852 | tied |
 
-Single-command throughput is dominated by TCP round-trip latency (~370us). Both databases process the command in nanoseconds -- the network is the bottleneck.
+Single-command throughput is dominated by TCP round-trip latency (~370us). Both databases process the command in nanoseconds -- the network is the bottleneck. All 21 commands are within ~5% of each other.
 
 ### Pipelined (100 commands per batch, c=16)
 
 | Command | Redis cmd/s | Vex cmd/s | Speedup |
 |---|---|---|---|
-| PIPE-SET(100) | 1.14M | **2.40M** | **+111%** |
-| PIPE-GET(100) | 1.54M | **3.02M** | **+96%** |
-| PIPE-INCR(100) | 1.55M | **2.61M** | **+69%** |
-| PIPE-EXISTS(100) | 1.57M | **3.08M** | **+96%** |
-| PIPE-DEL(100) | 1.20M | **2.67M** | **+123%** |
+| **Strings** | | | |
+| PIPE-SET(100) | 1.78M | **1.85M** | **+4%** |
+| PIPE-GET(100) | 2.34M | **3.00M** | **+28%** |
+| PIPE-INCR(100) | 2.34M | **2.64M** | **+13%** |
+| PIPE-EXISTS(100) | 2.41M | **3.04M** | **+26%** |
+| PIPE-DEL(100) | 2.05M | **2.71M** | **+32%** |
+| **Lists** | | | |
+| PIPE-RPUSH(100) | 2.03M | **2.41M** | **+19%** |
+| **Hashes** | | | |
+| PIPE-HSET(100) | 1.94M | **2.30M** | **+18%** |
 
 Pipelining amortizes network overhead, exposing the engine's raw throughput. Vex's multi-reactor workers process batches in parallel across 4 cores while Redis serializes everything on one thread.
 

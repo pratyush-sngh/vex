@@ -175,6 +175,66 @@ func main() {
 			return clients[worker%len(clients)].cmdRaw(args...)
 		})
 
+		// ── List benchmarks ──
+		if err := clients[0].cmd("FLUSHDB"); err != nil {
+			fmt.Printf("flushdb failed: %v\n\n", err)
+			continue
+		}
+
+		printBench("RPUSH", cfg, func(i int, worker int) error {
+			return clients[worker%len(clients)].cmd("RPUSH", fmt.Sprintf("list:%d", i%100), fmt.Sprintf("v:%d", i))
+		})
+
+		printBench("LPUSH", cfg, func(i int, worker int) error {
+			return clients[worker%len(clients)].cmd("LPUSH", fmt.Sprintf("list:%d", i%100), fmt.Sprintf("v:%d", i))
+		})
+
+		printBench("LRANGE(0,9)", cfg, func(i int, worker int) error {
+			return clients[worker%len(clients)].cmd("LRANGE", fmt.Sprintf("list:%d", i%100), "0", "9")
+		})
+
+		printBench("LLEN", cfg, func(i int, worker int) error {
+			return clients[worker%len(clients)].cmd("LLEN", fmt.Sprintf("list:%d", i%100))
+		})
+
+		printBench("LPOP", cfg, func(i int, worker int) error {
+			return clients[worker%len(clients)].cmd("LPOP", fmt.Sprintf("list:%d", i%100))
+		})
+
+		printBench("RPOP", cfg, func(i int, worker int) error {
+			return clients[worker%len(clients)].cmd("RPOP", fmt.Sprintf("list:%d", i%100))
+		})
+
+		// ── Hash benchmarks ──
+		if err := clients[0].cmd("FLUSHDB"); err != nil {
+			fmt.Printf("flushdb failed: %v\n\n", err)
+			continue
+		}
+
+		printBench("HSET", cfg, func(i int, worker int) error {
+			return clients[worker%len(clients)].cmd("HSET", fmt.Sprintf("h:%d", i%100), fmt.Sprintf("f:%d", i), fmt.Sprintf("v:%d", i))
+		})
+
+		printBench("HGET", cfg, func(i int, worker int) error {
+			return clients[worker%len(clients)].cmd("HGET", fmt.Sprintf("h:%d", i%100), fmt.Sprintf("f:%d", i%cfg.n))
+		})
+
+		printBench("HGETALL", cfg, func(i int, worker int) error {
+			return clients[worker%len(clients)].cmd("HGETALL", fmt.Sprintf("h:%d", i%100))
+		})
+
+		printBench("HLEN", cfg, func(i int, worker int) error {
+			return clients[worker%len(clients)].cmd("HLEN", fmt.Sprintf("h:%d", i%100))
+		})
+
+		printBench("HINCRBY", cfg, func(i int, worker int) error {
+			return clients[worker%len(clients)].cmd("HINCRBY", fmt.Sprintf("h:%d", i%100), "counter", "1")
+		})
+
+		printBench("HDEL", cfg, func(i int, worker int) error {
+			return clients[worker%len(clients)].cmd("HDEL", fmt.Sprintf("h:%d", i%100), fmt.Sprintf("f:%d", i))
+		})
+
 		// Pipeline benchmarks (if -pipeline > 0)
 		if *pipeline > 0 {
 			pipeSize := *pipeline
@@ -227,6 +287,22 @@ func main() {
 				for j := 0; j < pipeSize; j++ {
 					idx := i*pipeSize + j
 					batch = append(batch, []string{"DEL", fmt.Sprintf("pdel:%d", idx)})
+				}
+				return clients[worker%len(clients)].cmdPipeline(batch)
+			})
+
+			printBench(fmt.Sprintf("PIPE-RPUSH(%d)", pipeSize), cfg, func(i int, worker int) error {
+				batch := make([][]string, 0, pipeSize)
+				for j := 0; j < pipeSize; j++ {
+					batch = append(batch, []string{"RPUSH", fmt.Sprintf("pl:%d", (i*pipeSize+j)%1000), fmt.Sprintf("v:%d", j)})
+				}
+				return clients[worker%len(clients)].cmdPipeline(batch)
+			})
+
+			printBench(fmt.Sprintf("PIPE-HSET(%d)", pipeSize), cfg, func(i int, worker int) error {
+				batch := make([][]string, 0, pipeSize)
+				for j := 0; j < pipeSize; j++ {
+					batch = append(batch, []string{"HSET", fmt.Sprintf("ph:%d", (i*pipeSize+j)%1000), fmt.Sprintf("f:%d", j), fmt.Sprintf("v:%d", j)})
 				}
 				return clients[worker%len(clients)].cmdPipeline(batch)
 			})

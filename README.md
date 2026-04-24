@@ -73,13 +73,15 @@ All benchmarks run in Docker with **equal, isolated resources**: 4 CPU cores + 4
 
 | Command | Redis | Vex | Speedup |
 |---|---|---|---|
-| PIPE-SET(100) | 1.14M cmd/s | **2.40M cmd/s** | **+111%** |
-| PIPE-GET(100) | 1.54M cmd/s | **3.02M cmd/s** | **+96%** |
-| PIPE-INCR(100) | 1.55M cmd/s | **2.61M cmd/s** | **+69%** |
-| PIPE-EXISTS(100) | 1.57M cmd/s | **3.08M cmd/s** | **+96%** |
-| PIPE-DEL(100) | 1.20M cmd/s | **2.67M cmd/s** | **+123%** |
+| PIPE-GET(100) | 2.34M cmd/s | **3.00M cmd/s** | **+28%** |
+| PIPE-EXISTS(100) | 2.41M cmd/s | **3.04M cmd/s** | **+26%** |
+| PIPE-DEL(100) | 2.05M cmd/s | **2.71M cmd/s** | **+32%** |
+| PIPE-RPUSH(100) | 2.03M cmd/s | **2.41M cmd/s** | **+19%** |
+| PIPE-HSET(100) | 1.94M cmd/s | **2.30M cmd/s** | **+18%** |
+| PIPE-INCR(100) | 2.34M cmd/s | **2.64M cmd/s** | **+13%** |
+| PIPE-SET(100) | 1.78M cmd/s | **1.85M cmd/s** | **+4%** |
 
-Single-command (SET, GET, DEL, EXISTS, INCR, APPEND, MSET, MGET): tied at ~41K ops/s -- network-bound.
+Single-command (21 commands: strings, lists, hashes): tied at ~41K ops/s -- network-bound.
 
 ### Graph: Vex vs Memgraph (10K nodes / 50K edges)
 
