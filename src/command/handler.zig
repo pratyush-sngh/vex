@@ -75,7 +75,10 @@ pub const CommandHandler = struct {
                 else => {},
             },
             4 => switch (first) {
-                'P' => if (std.mem.eql(u8, cmd, "PING")) return self.cmdPing(args, w),
+                'P' => {
+                    if (std.mem.eql(u8, cmd, "PING")) return self.cmdPing(args, w);
+                    if (std.mem.eql(u8, cmd, "PTTL")) return self.cmdPttl(args, w);
+                },
                 'M' => {
                     if (std.mem.eql(u8, cmd, "MGET")) return self.cmdMget(args, w);
                     if (std.mem.eql(u8, cmd, "MSET")) return self.cmdMset(args, w);
@@ -91,10 +94,17 @@ pub const CommandHandler = struct {
                     if (std.mem.eql(u8, cmd, "INCR")) return self.cmdIncr(args, w);
                 },
                 'D' => if (std.mem.eql(u8, cmd, "DECR")) return self.cmdDecr(args, w),
+                'T' => if (std.mem.eql(u8, cmd, "TYPE")) return self.cmdType(args, w),
+                'Q' => if (std.mem.eql(u8, cmd, "QUIT")) return self.cmdQuit(w),
+                'E' => if (std.mem.eql(u8, cmd, "ECHO")) return self.cmdEcho(args, w),
                 else => {},
             },
             5 => switch (first) {
-                'E' => {},
+                'S' => {
+                    if (std.mem.eql(u8, cmd, "SETNX")) return self.cmdSetNx(args, w);
+                    if (std.mem.eql(u8, cmd, "SETEX")) return self.cmdSetEx(args, w);
+                },
+                'G' => if (std.mem.eql(u8, cmd, "GETEX")) return self.cmdGetEx(args, w),
                 else => {},
             },
             6 => switch (first) {
@@ -106,22 +116,36 @@ pub const CommandHandler = struct {
                     if (std.mem.eql(u8, cmd, "DBSIZE")) return self.cmdDbsize(w);
                     if (std.mem.eql(u8, cmd, "DECRBY")) return self.cmdDecrBy(args, w);
                 },
-                'S' => if (std.mem.eql(u8, cmd, "SELECT")) return self.cmdSelect(args, w),
+                'S' => {
+                    if (std.mem.eql(u8, cmd, "SELECT")) return self.cmdSelect(args, w);
+                    if (std.mem.eql(u8, cmd, "STRLEN")) return self.cmdStrlen(args, w);
+                },
                 'I' => if (std.mem.eql(u8, cmd, "INCRBY")) return self.cmdIncrBy(args, w),
                 'A' => if (std.mem.eql(u8, cmd, "APPEND")) return self.cmdAppend(args, w),
                 'B' => if (std.mem.eql(u8, cmd, "BGSAVE")) return self.cmdBgSave(w),
+                'G' => {
+                    if (std.mem.eql(u8, cmd, "GETDEL")) return self.cmdGetDel(args, w);
+                    if (std.mem.eql(u8, cmd, "GETSET")) return self.cmdGetSet(args, w);
+                },
+                'R' => if (std.mem.eql(u8, cmd, "RENAME")) return self.cmdRename(args, w),
                 else => {},
             },
             7 => switch (first) {
-                'F' => {
-                    if (std.mem.eql(u8, cmd, "FLUSHDB")) return self.cmdFlushdb(args, w);
-                },
+                'F' => if (std.mem.eql(u8, cmd, "FLUSHDB")) return self.cmdFlushdb(args, w),
                 'C' => if (std.mem.eql(u8, cmd, "COMMAND")) return self.cmdCommand(w),
-                'P' => if (std.mem.eql(u8, cmd, "PERSIST")) return self.cmdPersist(args, w),
+                'P' => {
+                    if (std.mem.eql(u8, cmd, "PERSIST")) return self.cmdPersist(args, w);
+                    if (std.mem.eql(u8, cmd, "PEXPIRE")) return self.cmdPExpire(args, w);
+                },
                 else => {},
             },
-            8 => if (first == 'F' and std.mem.eql(u8, cmd, "FLUSHALL")) return self.cmdFlushall(args, w)
-                else if (first == 'L' and std.mem.eql(u8, cmd, "LASTSAVE")) return self.cmdLastSave(w),
+            8 => switch (first) {
+                'F' => if (std.mem.eql(u8, cmd, "FLUSHALL")) return self.cmdFlushall(args, w),
+                'L' => if (std.mem.eql(u8, cmd, "LASTSAVE")) return self.cmdLastSave(w),
+                'R' => if (std.mem.eql(u8, cmd, "RENAMENX")) return self.cmdRenameNx(args, w),
+                else => {},
+            },
+            9 => if (first == 'R' and std.mem.eql(u8, cmd, "RANDOMKEY")) return self.cmdRandomKey(w),
             12 => if (first == 'B' and std.mem.eql(u8, cmd, "BGREWRITEAOF")) return self.cmdBgRewriteAof(w),
             else => {},
         }
@@ -173,55 +197,72 @@ pub const CommandHandler = struct {
             return;
         }
 
-        // Parse optional EX/PX flags
-        if (args.len >= 5) {
-            var flag_buf: [64]u8 = undefined;
-            const flag = toUpper(args[3], &flag_buf);
-            const ttl = std.fmt.parseInt(i64, args[4], 10) catch {
-                try resp.serializeError(w, "value is not an integer");
-                return;
-            };
-            if (std.mem.eql(u8, flag, "EX")) {
-                var key_buf: [512]u8 = undefined;
-                var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch {
-                    try resp.serializeError(w, "internal error");
-                    return;
-                };
-                defer key_ref.deinit(self.allocator);
-                self.kv.setEx(key_ref.key, args[2], ttl) catch {
-                    try resp.serializeError(w, "internal error");
-                    return;
-                };
-                self.logToAOF(args);
-                try resp.serializeSimpleString(w, "OK");
-                return;
-            } else if (std.mem.eql(u8, flag, "PX")) {
-                var key_buf: [512]u8 = undefined;
-                var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch {
-                    try resp.serializeError(w, "internal error");
-                    return;
-                };
-                defer key_ref.deinit(self.allocator);
-                self.kv.setPx(key_ref.key, args[2], ttl) catch {
-                    try resp.serializeError(w, "internal error");
-                    return;
-                };
-                self.logToAOF(args);
-                try resp.serializeSimpleString(w, "OK");
-                return;
-            }
-        }
-
         var key_buf: [512]u8 = undefined;
         var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch {
             try resp.serializeError(w, "internal error");
             return;
         };
         defer key_ref.deinit(self.allocator);
-        self.kv.set(key_ref.key, args[2]) catch {
-            try resp.serializeError(w, "internal error");
+
+        // Parse optional flags: EX/PX/NX/XX
+        var ttl_sec: ?i64 = null;
+        var ttl_ms: ?i64 = null;
+        var nx = false;
+        var xx = false;
+        var i: usize = 3;
+        while (i < args.len) {
+            var flag_buf: [64]u8 = undefined;
+            const flag = toUpper(args[i], &flag_buf);
+            if (std.mem.eql(u8, flag, "EX") and i + 1 < args.len) {
+                ttl_sec = std.fmt.parseInt(i64, args[i + 1], 10) catch {
+                    try resp.serializeError(w, "value is not an integer");
+                    return;
+                };
+                i += 2;
+            } else if (std.mem.eql(u8, flag, "PX") and i + 1 < args.len) {
+                ttl_ms = std.fmt.parseInt(i64, args[i + 1], 10) catch {
+                    try resp.serializeError(w, "value is not an integer");
+                    return;
+                };
+                i += 2;
+            } else if (std.mem.eql(u8, flag, "NX")) {
+                nx = true;
+                i += 1;
+            } else if (std.mem.eql(u8, flag, "XX")) {
+                xx = true;
+                i += 1;
+            } else {
+                i += 1;
+            }
+        }
+
+        // NX: only set if key does NOT exist
+        if (nx and self.kv.exists(key_ref.key)) {
+            try resp.serializeBulkString(w, null);
             return;
-        };
+        }
+        // XX: only set if key DOES exist
+        if (xx and !self.kv.exists(key_ref.key)) {
+            try resp.serializeBulkString(w, null);
+            return;
+        }
+
+        if (ttl_sec) |t| {
+            self.kv.setEx(key_ref.key, args[2], t) catch {
+                try resp.serializeError(w, "internal error");
+                return;
+            };
+        } else if (ttl_ms) |t| {
+            self.kv.setPx(key_ref.key, args[2], t) catch {
+                try resp.serializeError(w, "internal error");
+                return;
+            };
+        } else {
+            self.kv.set(key_ref.key, args[2]) catch {
+                try resp.serializeError(w, "internal error");
+                return;
+            };
+        }
         self.logToAOF(args);
         try resp.serializeSimpleString(w, "OK");
     }
@@ -746,6 +787,365 @@ pub const CommandHandler = struct {
             self.logToAOF(args);
             try resp.serializeInteger(w, @intCast(args[2].len));
         }
+    }
+
+    /// ECHO message
+    fn cmdEcho(_: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 2) {
+            try resp.serializeError(w, "wrong number of arguments for 'ECHO'");
+            return;
+        }
+        try resp.serializeBulkString(w, args[1]);
+    }
+
+    /// QUIT — close connection (responds OK, caller handles close)
+    fn cmdQuit(_: *CommandHandler, w: *std.Io.Writer) !void {
+        try resp.serializeSimpleString(w, "OK");
+    }
+
+    /// TYPE key — returns "string" for all KV entries (only type we have), "none" if missing
+    fn cmdType(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 2) {
+            try resp.serializeError(w, "wrong number of arguments for 'TYPE'");
+            return;
+        }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch {
+            try resp.serializeSimpleString(w, "none");
+            return;
+        };
+        defer key_ref.deinit(self.allocator);
+        if (self.kv.exists(key_ref.key)) {
+            try resp.serializeSimpleString(w, "string");
+        } else {
+            try resp.serializeSimpleString(w, "none");
+        }
+    }
+
+    /// STRLEN key — length of the string value
+    fn cmdStrlen(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 2) {
+            try resp.serializeError(w, "wrong number of arguments for 'STRLEN'");
+            return;
+        }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch {
+            try resp.serializeInteger(w, 0);
+            return;
+        };
+        defer key_ref.deinit(self.allocator);
+        if (self.kv.get(key_ref.key)) |val| {
+            try resp.serializeInteger(w, @intCast(val.len));
+        } else {
+            try resp.serializeInteger(w, 0);
+        }
+    }
+
+    /// SETNX key value — set only if key does not exist
+    fn cmdSetNx(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 3) {
+            try resp.serializeError(w, "wrong number of arguments for 'SETNX'");
+            return;
+        }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch {
+            try resp.serializeInteger(w, 0);
+            return;
+        };
+        defer key_ref.deinit(self.allocator);
+        if (self.kv.exists(key_ref.key)) {
+            try resp.serializeInteger(w, 0);
+        } else {
+            self.kv.set(key_ref.key, args[2]) catch {
+                try resp.serializeInteger(w, 0);
+                return;
+            };
+            self.logToAOF(args);
+            try resp.serializeInteger(w, 1);
+        }
+    }
+
+    /// SETEX key seconds value — set with expiry (Redis compat)
+    fn cmdSetEx(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 4) {
+            try resp.serializeError(w, "wrong number of arguments for 'SETEX'");
+            return;
+        }
+        const ttl = std.fmt.parseInt(i64, args[2], 10) catch {
+            try resp.serializeError(w, "value is not an integer or out of range");
+            return;
+        };
+        if (ttl <= 0) {
+            try resp.serializeError(w, "invalid expire time in 'SETEX'");
+            return;
+        }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch {
+            try resp.serializeError(w, "internal error");
+            return;
+        };
+        defer key_ref.deinit(self.allocator);
+        self.kv.setEx(key_ref.key, args[3], ttl) catch {
+            try resp.serializeError(w, "internal error");
+            return;
+        };
+        self.logToAOF(args);
+        try resp.serializeSimpleString(w, "OK");
+    }
+
+    /// GETSET key value — atomically set and return old value
+    fn cmdGetSet(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 3) {
+            try resp.serializeError(w, "wrong number of arguments for 'GETSET'");
+            return;
+        }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch {
+            try resp.serializeError(w, "internal error");
+            return;
+        };
+        defer key_ref.deinit(self.allocator);
+        const old = self.kv.get(key_ref.key);
+        // Must copy old value before overwriting since KV owns the memory
+        var old_copy: ?[]u8 = null;
+        if (old) |v| {
+            old_copy = self.allocator.dupe(u8, v) catch {
+                try resp.serializeError(w, "internal error");
+                return;
+            };
+        }
+        defer if (old_copy) |oc| self.allocator.free(oc);
+        self.kv.set(key_ref.key, args[2]) catch {
+            try resp.serializeError(w, "internal error");
+            return;
+        };
+        self.logToAOF(args);
+        try resp.serializeBulkString(w, old_copy);
+    }
+
+    /// GETDEL key — get value and delete the key
+    fn cmdGetDel(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 2) {
+            try resp.serializeError(w, "wrong number of arguments for 'GETDEL'");
+            return;
+        }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch {
+            try resp.serializeBulkString(w, null);
+            return;
+        };
+        defer key_ref.deinit(self.allocator);
+        const val = self.kv.get(key_ref.key);
+        if (val) |v| {
+            const copy = self.allocator.dupe(u8, v) catch {
+                try resp.serializeError(w, "internal error");
+                return;
+            };
+            defer self.allocator.free(copy);
+            _ = self.kv.delete(key_ref.key);
+            self.logToAOF(args);
+            try resp.serializeBulkString(w, copy);
+        } else {
+            try resp.serializeBulkString(w, null);
+        }
+    }
+
+    /// GETEX key [EX seconds | PX ms | PERSIST] — get and optionally set/clear expiry
+    fn cmdGetEx(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 2) {
+            try resp.serializeError(w, "wrong number of arguments for 'GETEX'");
+            return;
+        }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch {
+            try resp.serializeBulkString(w, null);
+            return;
+        };
+        defer key_ref.deinit(self.allocator);
+        const val = self.kv.get(key_ref.key);
+        if (val == null) {
+            try resp.serializeBulkString(w, null);
+            return;
+        }
+        // Copy value before potential re-set
+        const copy = self.allocator.dupe(u8, val.?) catch {
+            try resp.serializeError(w, "internal error");
+            return;
+        };
+        defer self.allocator.free(copy);
+
+        if (args.len >= 4) {
+            var flag_buf: [64]u8 = undefined;
+            const flag = toUpper(args[2], &flag_buf);
+            if (std.mem.eql(u8, flag, "EX")) {
+                const ttl = std.fmt.parseInt(i64, args[3], 10) catch {
+                    try resp.serializeError(w, "value is not an integer or out of range");
+                    return;
+                };
+                self.kv.setEx(key_ref.key, copy, ttl) catch {};
+            } else if (std.mem.eql(u8, flag, "PX")) {
+                const ttl = std.fmt.parseInt(i64, args[3], 10) catch {
+                    try resp.serializeError(w, "value is not an integer or out of range");
+                    return;
+                };
+                self.kv.setPx(key_ref.key, copy, ttl) catch {};
+            }
+        } else if (args.len == 3) {
+            var flag_buf: [64]u8 = undefined;
+            const flag = toUpper(args[2], &flag_buf);
+            if (std.mem.eql(u8, flag, "PERSIST")) {
+                self.kv.set(key_ref.key, copy) catch {};
+            }
+        }
+        try resp.serializeBulkString(w, copy);
+    }
+
+    /// PTTL key — remaining TTL in milliseconds
+    fn cmdPttl(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 2) {
+            try resp.serializeError(w, "wrong number of arguments for 'PTTL'");
+            return;
+        }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch {
+            try resp.serializeInteger(w, -2);
+            return;
+        };
+        defer key_ref.deinit(self.allocator);
+        if (!self.kv.exists(key_ref.key)) {
+            try resp.serializeInteger(w, -2);
+            return;
+        }
+        const entry = self.kv.map.getPtr(key_ref.key) orelse {
+            try resp.serializeInteger(w, -2);
+            return;
+        };
+        if (!entry.flags.has_ttl) {
+            try resp.serializeInteger(w, -1);
+            return;
+        }
+        const now = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
+        const remaining = entry.expires_at - now;
+        try resp.serializeInteger(w, if (remaining > 0) remaining else 0);
+    }
+
+    /// PEXPIRE key milliseconds — set TTL in milliseconds
+    fn cmdPExpire(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 3) {
+            try resp.serializeError(w, "wrong number of arguments for 'PEXPIRE'");
+            return;
+        }
+        const ttl_ms = std.fmt.parseInt(i64, args[2], 10) catch {
+            try resp.serializeError(w, "value is not an integer or out of range");
+            return;
+        };
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch {
+            try resp.serializeInteger(w, 0);
+            return;
+        };
+        defer key_ref.deinit(self.allocator);
+        if (self.kv.get(key_ref.key)) |val| {
+            self.kv.setPx(key_ref.key, val, ttl_ms) catch {
+                try resp.serializeInteger(w, 0);
+                return;
+            };
+            self.logToAOF(args);
+            try resp.serializeInteger(w, 1);
+        } else {
+            try resp.serializeInteger(w, 0);
+        }
+    }
+
+    /// RENAME key newkey
+    fn cmdRename(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 3) {
+            try resp.serializeError(w, "wrong number of arguments for 'RENAME'");
+            return;
+        }
+        var src_buf: [512]u8 = undefined;
+        var src_ref = namespacedKeyRef(self, args[1], &src_buf) catch {
+            try resp.serializeError(w, "internal error");
+            return;
+        };
+        defer src_ref.deinit(self.allocator);
+        const val = self.kv.get(src_ref.key);
+        if (val == null) {
+            try resp.serializeError(w, "no such key");
+            return;
+        }
+        const copy = self.allocator.dupe(u8, val.?) catch {
+            try resp.serializeError(w, "internal error");
+            return;
+        };
+        defer self.allocator.free(copy);
+        var dst_buf: [512]u8 = undefined;
+        var dst_ref = namespacedKeyRef(self, args[2], &dst_buf) catch {
+            try resp.serializeError(w, "internal error");
+            return;
+        };
+        defer dst_ref.deinit(self.allocator);
+        self.kv.set(dst_ref.key, copy) catch {
+            try resp.serializeError(w, "internal error");
+            return;
+        };
+        _ = self.kv.delete(src_ref.key);
+        self.logToAOF(args);
+        try resp.serializeSimpleString(w, "OK");
+    }
+
+    /// RENAMENX key newkey — rename only if newkey does not exist
+    fn cmdRenameNx(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 3) {
+            try resp.serializeError(w, "wrong number of arguments for 'RENAMENX'");
+            return;
+        }
+        var src_buf: [512]u8 = undefined;
+        var src_ref = namespacedKeyRef(self, args[1], &src_buf) catch {
+            try resp.serializeError(w, "internal error");
+            return;
+        };
+        defer src_ref.deinit(self.allocator);
+        if (!self.kv.exists(src_ref.key)) {
+            try resp.serializeError(w, "no such key");
+            return;
+        }
+        var dst_buf: [512]u8 = undefined;
+        var dst_ref = namespacedKeyRef(self, args[2], &dst_buf) catch {
+            try resp.serializeError(w, "internal error");
+            return;
+        };
+        defer dst_ref.deinit(self.allocator);
+        if (self.kv.exists(dst_ref.key)) {
+            try resp.serializeInteger(w, 0);
+            return;
+        }
+        const val = self.kv.get(src_ref.key).?;
+        const copy = self.allocator.dupe(u8, val) catch {
+            try resp.serializeError(w, "internal error");
+            return;
+        };
+        defer self.allocator.free(copy);
+        self.kv.set(dst_ref.key, copy) catch {
+            try resp.serializeError(w, "internal error");
+            return;
+        };
+        _ = self.kv.delete(src_ref.key);
+        self.logToAOF(args);
+        try resp.serializeInteger(w, 1);
+    }
+
+    /// RANDOMKEY — return a random key from the current DB
+    fn cmdRandomKey(self: *CommandHandler, w: *std.Io.Writer) !void {
+        var it = self.kv.map.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.flags.deleted) continue;
+            if (stripDbPrefix(self, entry.key_ptr.*)) |user_key| {
+                try resp.serializeBulkString(w, user_key);
+                return;
+            }
+        }
+        try resp.serializeBulkString(w, null);
     }
 
     fn cmdInfo(self: *CommandHandler, out: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -1664,6 +2064,228 @@ test "BGSAVE without persistence returns error" {
     defer allocator.free(r);
     try std.testing.expect(std.mem.indexOf(u8, r, "-ERR") != null);
     try std.testing.expect(std.mem.indexOf(u8, r, "persistence") != null);
+}
+
+test "ECHO and TYPE" {
+    const allocator = std.testing.allocator;
+    var kv = KVStore.init(allocator, std.testing.io);
+    defer kv.deinit();
+    var g = GraphEngine.init(allocator);
+    defer g.deinit();
+    var db = std.atomic.Value(u8).init(0);
+    var handler = CommandHandler.init(allocator, std.testing.io, &kv, &g, null, &db, .strict);
+
+    // ECHO
+    const echo = [_][]const u8{ "ECHO", "hello" };
+    const r1 = try testExec(&handler, allocator, &echo);
+    defer allocator.free(r1);
+    try std.testing.expectEqualStrings("$5\r\nhello\r\n", r1);
+
+    // TYPE on missing key
+    const type_miss = [_][]const u8{ "TYPE", "nokey" };
+    const r2 = try testExec(&handler, allocator, &type_miss);
+    defer allocator.free(r2);
+    try std.testing.expectEqualStrings("+none\r\n", r2);
+
+    // TYPE on existing key
+    const set = [_][]const u8{ "SET", "k1", "v1" };
+    const rs = try testExec(&handler, allocator, &set);
+    defer allocator.free(rs);
+    const type_hit = [_][]const u8{ "TYPE", "k1" };
+    const r3 = try testExec(&handler, allocator, &type_hit);
+    defer allocator.free(r3);
+    try std.testing.expectEqualStrings("+string\r\n", r3);
+}
+
+test "STRLEN" {
+    const allocator = std.testing.allocator;
+    var kv = KVStore.init(allocator, std.testing.io);
+    defer kv.deinit();
+    var g = GraphEngine.init(allocator);
+    defer g.deinit();
+    var db = std.atomic.Value(u8).init(0);
+    var handler = CommandHandler.init(allocator, std.testing.io, &kv, &g, null, &db, .strict);
+
+    // Missing key → 0
+    const r1 = try testExec(&handler, allocator, &[_][]const u8{ "STRLEN", "nokey" });
+    defer allocator.free(r1);
+    try std.testing.expectEqualStrings(":0\r\n", r1);
+
+    // Set and check
+    const rs = try testExec(&handler, allocator, &[_][]const u8{ "SET", "k", "hello" });
+    defer allocator.free(rs);
+    const r2 = try testExec(&handler, allocator, &[_][]const u8{ "STRLEN", "k" });
+    defer allocator.free(r2);
+    try std.testing.expectEqualStrings(":5\r\n", r2);
+}
+
+test "SETNX and SET NX/XX" {
+    const allocator = std.testing.allocator;
+    var kv = KVStore.init(allocator, std.testing.io);
+    defer kv.deinit();
+    var g = GraphEngine.init(allocator);
+    defer g.deinit();
+    var db = std.atomic.Value(u8).init(0);
+    var handler = CommandHandler.init(allocator, std.testing.io, &kv, &g, null, &db, .strict);
+
+    // SETNX on new key → 1
+    const r1 = try testExec(&handler, allocator, &[_][]const u8{ "SETNX", "lock", "holder1" });
+    defer allocator.free(r1);
+    try std.testing.expectEqualStrings(":1\r\n", r1);
+
+    // SETNX on existing key → 0
+    const r2 = try testExec(&handler, allocator, &[_][]const u8{ "SETNX", "lock", "holder2" });
+    defer allocator.free(r2);
+    try std.testing.expectEqualStrings(":0\r\n", r2);
+
+    // SET key value NX — should fail (key exists)
+    const r3 = try testExec(&handler, allocator, &[_][]const u8{ "SET", "lock", "new", "NX" });
+    defer allocator.free(r3);
+    try std.testing.expectEqualStrings("$-1\r\n", r3);
+
+    // SET key value XX — should succeed (key exists)
+    const r4 = try testExec(&handler, allocator, &[_][]const u8{ "SET", "lock", "updated", "XX" });
+    defer allocator.free(r4);
+    try std.testing.expectEqualStrings("+OK\r\n", r4);
+
+    // SET key value XX on missing key — should fail
+    const r5 = try testExec(&handler, allocator, &[_][]const u8{ "SET", "nokey", "val", "XX" });
+    defer allocator.free(r5);
+    try std.testing.expectEqualStrings("$-1\r\n", r5);
+}
+
+test "GETSET and GETDEL" {
+    const allocator = std.testing.allocator;
+    var kv = KVStore.init(allocator, std.testing.io);
+    defer kv.deinit();
+    var g = GraphEngine.init(allocator);
+    defer g.deinit();
+    var db = std.atomic.Value(u8).init(0);
+    var handler = CommandHandler.init(allocator, std.testing.io, &kv, &g, null, &db, .strict);
+
+    // SET initial
+    const rs = try testExec(&handler, allocator, &[_][]const u8{ "SET", "k", "old" });
+    defer allocator.free(rs);
+
+    // GETSET → returns old, sets new
+    const r1 = try testExec(&handler, allocator, &[_][]const u8{ "GETSET", "k", "new" });
+    defer allocator.free(r1);
+    try std.testing.expectEqualStrings("$3\r\nold\r\n", r1);
+
+    // Verify new value
+    const r2 = try testExec(&handler, allocator, &[_][]const u8{ "GET", "k" });
+    defer allocator.free(r2);
+    try std.testing.expectEqualStrings("$3\r\nnew\r\n", r2);
+
+    // GETDEL → returns value and deletes
+    const r3 = try testExec(&handler, allocator, &[_][]const u8{ "GETDEL", "k" });
+    defer allocator.free(r3);
+    try std.testing.expectEqualStrings("$3\r\nnew\r\n", r3);
+
+    // Key should be gone
+    const r4 = try testExec(&handler, allocator, &[_][]const u8{ "GET", "k" });
+    defer allocator.free(r4);
+    try std.testing.expectEqualStrings("$-1\r\n", r4);
+}
+
+test "RENAME and RENAMENX" {
+    const allocator = std.testing.allocator;
+    var kv = KVStore.init(allocator, std.testing.io);
+    defer kv.deinit();
+    var g = GraphEngine.init(allocator);
+    defer g.deinit();
+    var db = std.atomic.Value(u8).init(0);
+    var handler = CommandHandler.init(allocator, std.testing.io, &kv, &g, null, &db, .strict);
+
+    const rs = try testExec(&handler, allocator, &[_][]const u8{ "SET", "src", "val" });
+    defer allocator.free(rs);
+
+    // RENAME
+    const r1 = try testExec(&handler, allocator, &[_][]const u8{ "RENAME", "src", "dst" });
+    defer allocator.free(r1);
+    try std.testing.expectEqualStrings("+OK\r\n", r1);
+
+    // Old key gone
+    const r2 = try testExec(&handler, allocator, &[_][]const u8{ "GET", "src" });
+    defer allocator.free(r2);
+    try std.testing.expectEqualStrings("$-1\r\n", r2);
+
+    // New key exists
+    const r3 = try testExec(&handler, allocator, &[_][]const u8{ "GET", "dst" });
+    defer allocator.free(r3);
+    try std.testing.expectEqualStrings("$3\r\nval\r\n", r3);
+
+    // RENAMENX — dst exists, should fail
+    const rs2 = try testExec(&handler, allocator, &[_][]const u8{ "SET", "other", "x" });
+    defer allocator.free(rs2);
+    const r4 = try testExec(&handler, allocator, &[_][]const u8{ "RENAMENX", "other", "dst" });
+    defer allocator.free(r4);
+    try std.testing.expectEqualStrings(":0\r\n", r4);
+
+    // RENAMENX to new name — should succeed
+    const r5 = try testExec(&handler, allocator, &[_][]const u8{ "RENAMENX", "other", "newname" });
+    defer allocator.free(r5);
+    try std.testing.expectEqualStrings(":1\r\n", r5);
+}
+
+test "PTTL and PEXPIRE" {
+    const allocator = std.testing.allocator;
+    var kv = KVStore.init(allocator, std.testing.io);
+    defer kv.deinit();
+    var g = GraphEngine.init(allocator);
+    defer g.deinit();
+    var db = std.atomic.Value(u8).init(0);
+    var handler = CommandHandler.init(allocator, std.testing.io, &kv, &g, null, &db, .strict);
+
+    const rs = try testExec(&handler, allocator, &[_][]const u8{ "SET", "k", "v" });
+    defer allocator.free(rs);
+
+    // PTTL without expiry → -1
+    const r1 = try testExec(&handler, allocator, &[_][]const u8{ "PTTL", "k" });
+    defer allocator.free(r1);
+    try std.testing.expectEqualStrings(":-1\r\n", r1);
+
+    // PEXPIRE 60000 (60 seconds in ms)
+    const r2 = try testExec(&handler, allocator, &[_][]const u8{ "PEXPIRE", "k", "60000" });
+    defer allocator.free(r2);
+    try std.testing.expectEqualStrings(":1\r\n", r2);
+
+    // PTTL now > 0
+    const r3 = try testExec(&handler, allocator, &[_][]const u8{ "PTTL", "k" });
+    defer allocator.free(r3);
+    try std.testing.expect(r3[0] == ':');
+    try std.testing.expect(r3[1] != '-');
+
+    // PTTL on missing key → -2
+    const r4 = try testExec(&handler, allocator, &[_][]const u8{ "PTTL", "nokey" });
+    defer allocator.free(r4);
+    try std.testing.expectEqualStrings(":-2\r\n", r4);
+}
+
+test "SETEX" {
+    const allocator = std.testing.allocator;
+    var kv = KVStore.init(allocator, std.testing.io);
+    defer kv.deinit();
+    var g = GraphEngine.init(allocator);
+    defer g.deinit();
+    var db = std.atomic.Value(u8).init(0);
+    var handler = CommandHandler.init(allocator, std.testing.io, &kv, &g, null, &db, .strict);
+
+    // SETEX key seconds value
+    const r1 = try testExec(&handler, allocator, &[_][]const u8{ "SETEX", "sess", "3600", "data" });
+    defer allocator.free(r1);
+    try std.testing.expectEqualStrings("+OK\r\n", r1);
+
+    // Key exists with value
+    const r2 = try testExec(&handler, allocator, &[_][]const u8{ "GET", "sess" });
+    defer allocator.free(r2);
+    try std.testing.expectEqualStrings("$4\r\ndata\r\n", r2);
+
+    // Has TTL
+    const r3 = try testExec(&handler, allocator, &[_][]const u8{ "TTL", "sess" });
+    defer allocator.free(r3);
+    try std.testing.expect(r3[0] == ':');
+    try std.testing.expect(r3[1] != '-');
 }
 
 test "bgsave_in_progress flag" {

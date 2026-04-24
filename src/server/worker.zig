@@ -126,6 +126,10 @@ const Connection = struct {
     authenticated: bool,
     ssl: ?*SSL,
     pubsub_mode: bool,
+    /// Connection name set by CLIENT SETNAME
+    client_name: ?[]u8,
+    /// Unique connection ID
+    client_id: u64,
     /// Transaction queue: non-null when MULTI is active
     tx_queue: ?std.array_list.Managed(TxCommand),
 
@@ -137,6 +141,9 @@ const Connection = struct {
             alloc.free(self.args);
         }
     };
+
+    /// Global connection ID counter
+    var next_client_id: std.atomic.Value(u64) = std.atomic.Value(u64).init(1);
 
     fn init(allocator: Allocator, fd: i32, auth_required: bool) !*Connection {
         const conn = try allocator.create(Connection);
@@ -151,6 +158,8 @@ const Connection = struct {
             .authenticated = !auth_required,
             .ssl = null,
             .pubsub_mode = false,
+            .client_name = null,
+            .client_id = next_client_id.fetchAdd(1, .monotonic),
             .tx_queue = null,
         };
         return conn;
@@ -161,6 +170,7 @@ const Connection = struct {
             for (q.items) |*cmd| cmd.deinit(allocator);
             q.deinit();
         }
+        if (self.client_name) |name| allocator.free(name);
         self.accum.deinit();
         self.write_buf.deinit();
         allocator.destroy(self);
@@ -632,6 +642,112 @@ pub const Worker = struct {
             return;
         }
 
+        // ── Connection-level commands (handled in worker, not CommandHandler) ──
+
+        // CLIENT subcommands
+        if (args[0].len == 6 and equalsAsciiUpper(args[0], "CLIENT")) {
+            self.handleClient(conn, args);
+            return;
+        }
+
+        // CONFIG GET/SET — return sensible defaults for client compatibility
+        if (args[0].len == 6 and equalsAsciiUpper(args[0], "CONFIG")) {
+            self.handleConfig(conn, args);
+            return;
+        }
+
+        // UNLINK — non-blocking DEL (we alias to DEL since our DEL is already fast)
+        if (args[0].len == 6 and equalsAsciiUpper(args[0], "UNLINK")) {
+            if (self.ckv) |ckv| {
+                var count: i64 = 0;
+                for (args[1..]) |user_key| {
+                    const ns = nsKey(conn.selected_db, user_key) orelse continue;
+                    const stale = ckv.deleteStale(ns);
+                    if (stale.stale_key) |k| self.allocator.free(k);
+                    if (stale.stale_val) |v| self.allocator.free(v);
+                    if (stale.found) count += 1;
+                }
+                if (count > 0) {
+                    if (self.aof) |a| a.logCommand(args);
+                    self.maybeBroadcast(args);
+                }
+                writeIntTo(&conn.write_buf, count);
+                return;
+            }
+            // Fallthrough to CommandHandler (DEL logic)
+        }
+
+        // TIME — server time as [seconds, microseconds]
+        if (args[0].len == 4 and equalsAsciiUpper(args[0], "TIME")) {
+            var ts: std.c.timespec = undefined;
+            _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+            conn.write_buf.appendSlice("*2\r\n") catch {};
+            var buf: [32]u8 = undefined;
+            const sec_s = std.fmt.bufPrint(&buf, "{d}", .{ts.sec}) catch "0";
+            writeBulkTo(&conn.write_buf, sec_s);
+            const usec: i64 = @divTrunc(@as(i64, @intCast(ts.nsec)), 1000);
+            const usec_s = std.fmt.bufPrint(&buf, "{d}", .{usec}) catch "0";
+            writeBulkTo(&conn.write_buf, usec_s);
+            return;
+        }
+
+        // OBJECT ENCODING/IDLETIME/HELP
+        if (args[0].len == 6 and equalsAsciiUpper(args[0], "OBJECT")) {
+            self.handleObject(conn, args);
+            return;
+        }
+
+        // COPY src dst [REPLACE]
+        if (args[0].len == 4 and equalsAsciiUpper(args[0], "COPY")) {
+            self.handleCopy(conn, args);
+            return;
+        }
+
+        // WAIT numreplicas timeout — wait for replication ack
+        if (args[0].len == 4 and equalsAsciiUpper(args[0], "WAIT")) {
+            // Return current follower count (best-effort — we don't have per-write ack yet)
+            var follower_count: i64 = 0;
+            if (self.repl_leader) |rl| {
+                follower_count = @intCast(rl.follower_count.load(.acquire));
+            } else if (self.repl_follower) |rf| {
+                if (rf.getPromotedLeader()) |pl| {
+                    follower_count = @intCast(pl.follower_count.load(.acquire));
+                }
+            }
+            writeIntTo(&conn.write_buf, follower_count);
+            return;
+        }
+
+        // RESET — reset connection state
+        if (args[0].len == 5 and equalsAsciiUpper(args[0], "RESET")) {
+            conn.selected_db = 0;
+            if (conn.client_name) |name| self.allocator.free(name);
+            conn.client_name = null;
+            if (conn.pubsub_mode) {
+                if (self.pubsub) |ps| ps.unsubscribeAll(conn.fd);
+                conn.pubsub_mode = false;
+            }
+            if (conn.tx_queue) |*q| {
+                for (q.items) |*cmd| cmd.deinit(self.allocator);
+                q.deinit();
+                conn.tx_queue = null;
+            }
+            conn.write_buf.appendSlice("+RESET\r\n") catch {};
+            return;
+        }
+
+        // PSUBSCRIBE — pattern subscribe (basic glob pattern matching)
+        if (self.pubsub) |ps| {
+            if (args[0].len == 10 and equalsAsciiUpper(args[0], "PSUBSCRIBE")) {
+                self.handlePSubscribe(conn, args, ps);
+                return;
+            }
+            if (args[0].len == 12 and equalsAsciiUpper(args[0], "PUNSUBSCRIBE")) {
+                self.handlePUnsubscribe(conn, args, ps);
+                return;
+            }
+        }
+
         // ── Replication replay marker: _REPL prefix means this is a replayed
         // command. Execute locally, skip forwarding AND broadcasting.
         if (args.len >= 2 and std.mem.eql(u8, args[0], "_REPL")) {
@@ -698,6 +814,225 @@ pub const Worker = struct {
         defer self.allocator.free(payload);
         std.debug.print("[repl-broadcast] cmd={s} payload_len={d}\n", .{ if (args.len > 0) args[0] else "?", payload.len });
         leader.broadcastMutation(payload);
+    }
+
+    // ── CLIENT subcommand handler ──────────────────────────────────────
+
+    fn handleClient(self: *Worker, conn: *Connection, args: []const []const u8) void {
+        if (args.len < 2) {
+            conn.write_buf.appendSlice("-ERR wrong number of arguments for 'CLIENT'\r\n") catch {};
+            return;
+        }
+        if (equalsAsciiUpper(args[1], "SETNAME")) {
+            if (args.len < 3) {
+                conn.write_buf.appendSlice("-ERR wrong number of arguments for 'CLIENT SETNAME'\r\n") catch {};
+                return;
+            }
+            if (conn.client_name) |old| self.allocator.free(old);
+            conn.client_name = self.allocator.dupe(u8, args[2]) catch null;
+            conn.write_buf.appendSlice("+OK\r\n") catch {};
+        } else if (equalsAsciiUpper(args[1], "GETNAME")) {
+            if (conn.client_name) |name| {
+                writeBulkTo(&conn.write_buf, name);
+            } else {
+                conn.write_buf.appendSlice("$-1\r\n") catch {};
+            }
+        } else if (equalsAsciiUpper(args[1], "ID")) {
+            writeIntTo(&conn.write_buf, @intCast(conn.client_id));
+        } else if (equalsAsciiUpper(args[1], "LIST")) {
+            // Minimal CLIENT LIST: return info for connections on this worker
+            var buf = std.array_list.Managed(u8).init(self.allocator);
+            defer buf.deinit();
+            var it = self.conns.iterator();
+            while (it.next()) |entry| {
+                const c = entry.value_ptr.*;
+                var line_buf: [256]u8 = undefined;
+                const line = std.fmt.bufPrint(&line_buf, "id={d} fd={d} db={d} name={s}\n", .{
+                    c.client_id, c.fd, c.selected_db, if (c.client_name) |n| n else "",
+                }) catch continue;
+                buf.appendSlice(line) catch {};
+            }
+            writeBulkTo(&conn.write_buf, buf.items);
+        } else if (equalsAsciiUpper(args[1], "INFO")) {
+            var line_buf: [256]u8 = undefined;
+            const line = std.fmt.bufPrint(&line_buf, "id={d} fd={d} db={d} name={s}\n", .{
+                conn.client_id, conn.fd, conn.selected_db, if (conn.client_name) |n| n else "",
+            }) catch "";
+            writeBulkTo(&conn.write_buf, line);
+        } else {
+            conn.write_buf.appendSlice("+OK\r\n") catch {};
+        }
+    }
+
+    // ── CONFIG subcommand handler ────────────────────────────────────
+
+    fn handleConfig(self: *Worker, conn: *Connection, args: []const []const u8) void {
+        _ = self;
+        if (args.len < 2) {
+            conn.write_buf.appendSlice("-ERR wrong number of arguments for 'CONFIG'\r\n") catch {};
+            return;
+        }
+        if (equalsAsciiUpper(args[1], "GET")) {
+            if (args.len < 3) {
+                conn.write_buf.appendSlice("*0\r\n") catch {};
+                return;
+            }
+            // Return known config keys, empty array for unknown
+            const key = args[2];
+            if (equalsAsciiUpper(key, "SAVE") or equalsAsciiUpper(key, "DATABASES") or
+                equalsAsciiUpper(key, "MAXMEMORY") or equalsAsciiUpper(key, "APPENDONLY"))
+            {
+                conn.write_buf.appendSlice("*2\r\n") catch {};
+                writeBulkTo(&conn.write_buf, key);
+                writeBulkTo(&conn.write_buf, "");
+            } else if (key.len == 1 and key[0] == '*') {
+                // CONFIG GET * — return empty (some clients do this on connect)
+                conn.write_buf.appendSlice("*0\r\n") catch {};
+            } else {
+                conn.write_buf.appendSlice("*0\r\n") catch {};
+            }
+        } else if (equalsAsciiUpper(args[1], "SET")) {
+            // Accept but ignore — Vex doesn't support runtime config changes
+            conn.write_buf.appendSlice("+OK\r\n") catch {};
+        } else if (equalsAsciiUpper(args[1], "RESETSTAT")) {
+            conn.write_buf.appendSlice("+OK\r\n") catch {};
+        } else {
+            conn.write_buf.appendSlice("-ERR unknown CONFIG subcommand\r\n") catch {};
+        }
+    }
+
+    // ── OBJECT subcommand handler ────────────────────────────────────
+
+    fn handleObject(self: *Worker, conn: *Connection, args: []const []const u8) void {
+        if (args.len < 2) {
+            conn.write_buf.appendSlice("-ERR wrong number of arguments for 'OBJECT'\r\n") catch {};
+            return;
+        }
+        if (equalsAsciiUpper(args[1], "ENCODING")) {
+            if (args.len < 3) {
+                conn.write_buf.appendSlice("-ERR wrong number of arguments\r\n") catch {};
+                return;
+            }
+            const ns = nsKey(conn.selected_db, args[2]);
+            if (ns != null and self.ckv != null and self.ckv.?.exists(ns.?)) {
+                writeBulkTo(&conn.write_buf, "embstr");
+            } else {
+                conn.write_buf.appendSlice("-ERR no such key\r\n") catch {};
+            }
+        } else if (equalsAsciiUpper(args[1], "IDLETIME")) {
+            if (args.len < 3) {
+                conn.write_buf.appendSlice("-ERR wrong number of arguments\r\n") catch {};
+                return;
+            }
+            // We don't track idle time precisely in ConcurrentKV, return 0
+            const ns = nsKey(conn.selected_db, args[2]);
+            if (ns != null and self.ckv != null and self.ckv.?.exists(ns.?)) {
+                writeIntTo(&conn.write_buf, 0);
+            } else {
+                conn.write_buf.appendSlice("-ERR no such key\r\n") catch {};
+            }
+        } else if (equalsAsciiUpper(args[1], "HELP")) {
+            conn.write_buf.appendSlice("*3\r\n") catch {};
+            writeBulkTo(&conn.write_buf, "OBJECT ENCODING <key> - Return encoding of the value stored at <key>");
+            writeBulkTo(&conn.write_buf, "OBJECT IDLETIME <key> - Return idle time of <key> (seconds since last access)");
+            writeBulkTo(&conn.write_buf, "OBJECT HELP - Return this help message");
+        } else {
+            conn.write_buf.appendSlice("-ERR unknown OBJECT subcommand\r\n") catch {};
+        }
+    }
+
+    // ── COPY handler ────────────────────────────────────────────────
+
+    fn handleCopy(self: *Worker, conn: *Connection, args: []const []const u8) void {
+        if (args.len < 3) {
+            conn.write_buf.appendSlice("-ERR wrong number of arguments for 'COPY'\r\n") catch {};
+            return;
+        }
+        const ckv = self.ckv orelse {
+            conn.write_buf.appendSlice("-ERR not available\r\n") catch {};
+            return;
+        };
+        const src = nsKey(conn.selected_db, args[1]) orelse {
+            writeIntTo(&conn.write_buf, 0);
+            return;
+        };
+        const dst = nsKey(conn.selected_db, args[2]) orelse {
+            writeIntTo(&conn.write_buf, 0);
+            return;
+        };
+
+        // Check REPLACE flag
+        var replace = false;
+        if (args.len >= 4 and equalsAsciiUpper(args[3], "REPLACE")) {
+            replace = true;
+        }
+
+        // Check if src exists — get returns OwnedValue (allocated copy)
+        const owned = ckv.get(src) orelse {
+            writeIntTo(&conn.write_buf, 0);
+            return;
+        };
+        defer owned.deinit();
+
+        // Check if dst exists and REPLACE not set
+        if (!replace and ckv.exists(dst)) {
+            writeIntTo(&conn.write_buf, 0);
+            return;
+        }
+
+        // Copy value to destination
+        const key_copy = self.allocator.dupe(u8, dst) catch {
+            writeIntTo(&conn.write_buf, 0);
+            return;
+        };
+        const val_copy = self.allocator.dupe(u8, owned.data) catch {
+            self.allocator.free(key_copy);
+            writeIntTo(&conn.write_buf, 0);
+            return;
+        };
+        const stale = ckv.setPrealloc(dst, key_copy, val_copy, 0);
+        if (stale.stale_val) |v| self.allocator.free(v);
+        if (stale.stale_key) |k| self.allocator.free(k);
+        writeIntTo(&conn.write_buf, 1);
+    }
+
+    // ── PSUBSCRIBE / PUNSUBSCRIBE handlers ──────────────────────────
+
+    fn handlePSubscribe(self: *Worker, conn: *Connection, args: []const []const u8, ps: *PubSubRegistry) void {
+        _ = self;
+        if (args.len < 2) {
+            conn.write_buf.appendSlice("-ERR wrong number of arguments for 'PSUBSCRIBE'\r\n") catch {};
+            return;
+        }
+        conn.pubsub_mode = true;
+        // Store pattern subscriptions as "pattern:<pat>" channels
+        for (args[1..]) |pattern| {
+            var key_buf: [256]u8 = undefined;
+            const pkey = std.fmt.bufPrint(&key_buf, "pattern:{s}", .{pattern}) catch continue;
+            ps.subscribe(pkey, conn.fd) catch continue;
+            conn.write_buf.appendSlice("*3\r\n$10\r\npsubscribe\r\n") catch {};
+            writeBulkTo(&conn.write_buf, pattern);
+            writeIntTo(&conn.write_buf, 1);
+        }
+    }
+
+    fn handlePUnsubscribe(self: *Worker, conn: *Connection, args: []const []const u8, ps: *PubSubRegistry) void {
+        _ = self;
+        if (args.len < 2) {
+            ps.unsubscribeAll(conn.fd);
+            conn.pubsub_mode = false;
+            conn.write_buf.appendSlice("*3\r\n$12\r\npunsubscribe\r\n$-1\r\n:0\r\n") catch {};
+            return;
+        }
+        for (args[1..]) |pattern| {
+            var key_buf: [256]u8 = undefined;
+            const pkey = std.fmt.bufPrint(&key_buf, "pattern:{s}", .{pattern}) catch continue;
+            ps.unsubscribe(pkey, conn.fd);
+            conn.write_buf.appendSlice("*3\r\n$12\r\npunsubscribe\r\n") catch {};
+            writeBulkTo(&conn.write_buf, pattern);
+            writeIntTo(&conn.write_buf, 0);
+        }
+        conn.pubsub_mode = false;
     }
 
     fn handleAuth(self: *Worker, conn: *Connection, args: []const []const u8) void {

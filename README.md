@@ -217,20 +217,28 @@ Redis-compatible KV + graph DB with multi-reactor architecture.
 
 ## Roadmap
 
-### v0.4 -- Partitioned Graph
+### v0.4 -- Redis Data Types: Lists & Hashes
+- `LPUSH`/`RPUSH`/`LPOP`/`RPOP`/`LLEN`/`LRANGE`/`LINDEX` (Lists)
+- `HSET`/`HGET`/`HDEL`/`HGETALL`/`HLEN`/`HMSET`/`HMGET` (Hashes)
+- `WATCH`/`UNWATCH` for optimistic locking
+
+### v0.5 -- Sets & Sorted Sets
+- `SADD`/`SREM`/`SMEMBERS`/`SISMEMBER`/`SCARD`/`SUNION`/`SINTER` (Sets)
+- `ZADD`/`ZREM`/`ZRANGE`/`ZSCORE`/`ZRANK`/`ZCARD` (Sorted Sets)
+- Streams (`XADD`/`XREAD`)
+
+### v0.6 -- Partitioned Graph
 - Hash-partition graph nodes across machines
 - Ghost nodes for 1-hop boundary cache
 - BSP BFS for cross-partition traversals
 - Distributed Dijkstra
 - Consistent hash ring with vnodes
 
-### Future
+### v0.7 -- Scripting & Advanced
+- Lua scripting (`EVAL`/`EVALSHA`)
 - Graph secondary indexes on properties
 - Cypher query language subset
-- `WATCH` for optimistic locking
 - io_uring batched read/write (Linux)
-- Lua scripting (`EVAL`)
-- Streams (`XADD`/`XREAD`)
 
 ---
 

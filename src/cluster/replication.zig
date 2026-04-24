@@ -690,6 +690,15 @@ pub fn isWriteCommand(args: []const []const u8) bool {
     if (std.mem.eql(u8, upper, "APPEND")) return true;
     if (std.mem.eql(u8, upper, "EXPIRE")) return true;
     if (std.mem.eql(u8, upper, "PERSIST")) return true;
+    if (std.mem.eql(u8, upper, "PEXPIRE")) return true;
+    if (std.mem.eql(u8, upper, "UNLINK")) return true;
+    if (std.mem.eql(u8, upper, "SETNX")) return true;
+    if (std.mem.eql(u8, upper, "SETEX")) return true;
+    if (std.mem.eql(u8, upper, "GETSET")) return true;
+    if (std.mem.eql(u8, upper, "GETDEL")) return true;
+    if (std.mem.eql(u8, upper, "RENAME")) return true;
+    if (std.mem.eql(u8, upper, "RENAMENX")) return true;
+    if (std.mem.eql(u8, upper, "COPY")) return true;
     if (std.mem.eql(u8, upper, "FLUSHDB")) return true;
     if (std.mem.eql(u8, upper, "FLUSHALL")) return true;
     // Graph write commands
