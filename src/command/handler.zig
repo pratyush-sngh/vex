@@ -8,6 +8,8 @@ const query = @import("../engine/query.zig");
 const snapshot = @import("../storage/snapshot.zig");
 const aof_mod = @import("../storage/aof.zig");
 const AOF = aof_mod.AOF;
+const ListStore = @import("../engine/list.zig").ListStore;
+const HashStore = @import("../engine/hash.zig").HashStore;
 const MAX_DATABASES: u8 = 16;
 const KEYS_MAX_REPLY: usize = 1000;
 const SCAN_DEFAULT_COUNT: usize = 10;
@@ -31,6 +33,8 @@ pub const CommandHandler = struct {
     selected_db: *std.atomic.Value(u8),
     keys_mode: KeysMode,
     graph_rwlock: ?*std.c.pthread_rwlock_t,
+    list_store: ?*ListStore,
+    hash_store: ?*HashStore,
 
     pub fn init(
         allocator: Allocator,
@@ -50,6 +54,8 @@ pub const CommandHandler = struct {
             .selected_db = selected_db,
             .keys_mode = keys_mode,
             .graph_rwlock = null,
+            .list_store = null,
+            .hash_store = null,
         };
     }
 
@@ -97,6 +103,19 @@ pub const CommandHandler = struct {
                 'T' => if (std.mem.eql(u8, cmd, "TYPE")) return self.cmdType(args, w),
                 'Q' => if (std.mem.eql(u8, cmd, "QUIT")) return self.cmdQuit(w),
                 'E' => if (std.mem.eql(u8, cmd, "ECHO")) return self.cmdEcho(args, w),
+                'H' => {
+                    if (std.mem.eql(u8, cmd, "HSET")) return self.cmdHset(args, w);
+                    if (std.mem.eql(u8, cmd, "HGET")) return self.cmdHgetFn(args, w);
+                    if (std.mem.eql(u8, cmd, "HDEL")) return self.cmdHdel(args, w);
+                    if (std.mem.eql(u8, cmd, "HLEN")) return self.cmdHlen(args, w);
+                },
+                'L' => {
+                    if (std.mem.eql(u8, cmd, "LLEN")) return self.cmdLlen(args, w);
+                    if (std.mem.eql(u8, cmd, "LSET")) return self.cmdLset(args, w);
+                    if (std.mem.eql(u8, cmd, "LREM")) return self.cmdLrem(args, w);
+                    if (std.mem.eql(u8, cmd, "LPOP")) return self.cmdLpop(args, w);
+                },
+                'R' => if (std.mem.eql(u8, cmd, "RPOP")) return self.cmdRpop(args, w),
                 else => {},
             },
             5 => switch (first) {
@@ -105,6 +124,14 @@ pub const CommandHandler = struct {
                     if (std.mem.eql(u8, cmd, "SETEX")) return self.cmdSetEx(args, w);
                 },
                 'G' => if (std.mem.eql(u8, cmd, "GETEX")) return self.cmdGetEx(args, w),
+                'L' => if (std.mem.eql(u8, cmd, "LPUSH")) return self.cmdLpush(args, w),
+                'R' => if (std.mem.eql(u8, cmd, "RPUSH")) return self.cmdRpush(args, w),
+                'H' => {
+                    if (std.mem.eql(u8, cmd, "HMSET")) return self.cmdHmset(args, w);
+                    if (std.mem.eql(u8, cmd, "HMGET")) return self.cmdHmget(args, w);
+                    if (std.mem.eql(u8, cmd, "HKEYS")) return self.cmdHkeys(args, w);
+                    if (std.mem.eql(u8, cmd, "HVALS")) return self.cmdHvals(args, w);
+                },
                 else => {},
             },
             6 => switch (first) {
@@ -128,6 +155,10 @@ pub const CommandHandler = struct {
                     if (std.mem.eql(u8, cmd, "GETSET")) return self.cmdGetSet(args, w);
                 },
                 'R' => if (std.mem.eql(u8, cmd, "RENAME")) return self.cmdRename(args, w),
+                'L' => {
+                    if (std.mem.eql(u8, cmd, "LRANGE")) return self.cmdLrange(args, w);
+                    if (std.mem.eql(u8, cmd, "LINDEX")) return self.cmdLindex(args, w);
+                },
                 else => {},
             },
             7 => switch (first) {
@@ -136,6 +167,11 @@ pub const CommandHandler = struct {
                 'P' => {
                     if (std.mem.eql(u8, cmd, "PERSIST")) return self.cmdPersist(args, w);
                     if (std.mem.eql(u8, cmd, "PEXPIRE")) return self.cmdPExpire(args, w);
+                },
+                'H' => {
+                    if (std.mem.eql(u8, cmd, "HGETALL")) return self.cmdHgetall(args, w);
+                    if (std.mem.eql(u8, cmd, "HEXISTS")) return self.cmdHexists(args, w);
+                    if (std.mem.eql(u8, cmd, "HINCRBY")) return self.cmdHincrby(args, w);
                 },
                 else => {},
             },
@@ -1133,6 +1169,239 @@ pub const CommandHandler = struct {
         _ = self.kv.delete(src_ref.key);
         self.logToAOF(args);
         try resp.serializeInteger(w, 1);
+    }
+
+    // ── List Commands ──────────────────────────────────────────────────
+
+    fn getListStore(self: *CommandHandler) *ListStore {
+        return self.list_store orelse @panic("list_store not initialized");
+    }
+
+    fn cmdLpush(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 3) { try resp.serializeError(w, "wrong number of arguments for 'LPUSH'"); return; }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeError(w, "internal error"); return; };
+        defer key_ref.deinit(self.allocator);
+        const len = self.getListStore().lpush(key_ref.key, args[2..]) catch { try resp.serializeError(w, "internal error"); return; };
+        self.logToAOF(args);
+        try resp.serializeInteger(w, @intCast(len));
+    }
+
+    fn cmdRpush(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 3) { try resp.serializeError(w, "wrong number of arguments for 'RPUSH'"); return; }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeError(w, "internal error"); return; };
+        defer key_ref.deinit(self.allocator);
+        const len = self.getListStore().rpush(key_ref.key, args[2..]) catch { try resp.serializeError(w, "internal error"); return; };
+        self.logToAOF(args);
+        try resp.serializeInteger(w, @intCast(len));
+    }
+
+    fn cmdLpop(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 2) { try resp.serializeError(w, "wrong number of arguments for 'LPOP'"); return; }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeBulkString(w, null); return; };
+        defer key_ref.deinit(self.allocator);
+        if (self.getListStore().lpop(key_ref.key)) |val| {
+            defer self.allocator.free(val);
+            self.logToAOF(args);
+            try resp.serializeBulkString(w, val);
+        } else {
+            try resp.serializeBulkString(w, null);
+        }
+    }
+
+    fn cmdRpop(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 2) { try resp.serializeError(w, "wrong number of arguments for 'RPOP'"); return; }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeBulkString(w, null); return; };
+        defer key_ref.deinit(self.allocator);
+        if (self.getListStore().rpop(key_ref.key)) |val| {
+            defer self.allocator.free(val);
+            self.logToAOF(args);
+            try resp.serializeBulkString(w, val);
+        } else {
+            try resp.serializeBulkString(w, null);
+        }
+    }
+
+    fn cmdLlen(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 2) { try resp.serializeError(w, "wrong number of arguments for 'LLEN'"); return; }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeInteger(w, 0); return; };
+        defer key_ref.deinit(self.allocator);
+        try resp.serializeInteger(w, @intCast(self.getListStore().llen(key_ref.key)));
+    }
+
+    fn cmdLrange(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 4) { try resp.serializeError(w, "wrong number of arguments for 'LRANGE'"); return; }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeArrayHeader(w, 0); return; };
+        defer key_ref.deinit(self.allocator);
+        const start = std.fmt.parseInt(i64, args[2], 10) catch { try resp.serializeError(w, "value is not an integer"); return; };
+        const stop = std.fmt.parseInt(i64, args[3], 10) catch { try resp.serializeError(w, "value is not an integer"); return; };
+        if (self.getListStore().lrange(key_ref.key, start, stop)) |items| {
+            try resp.serializeArrayHeader(w, items.len);
+            for (items) |item| try resp.serializeBulkString(w, item);
+        } else {
+            try resp.serializeArrayHeader(w, 0);
+        }
+    }
+
+    fn cmdLindex(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 3) { try resp.serializeError(w, "wrong number of arguments for 'LINDEX'"); return; }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeBulkString(w, null); return; };
+        defer key_ref.deinit(self.allocator);
+        const idx = std.fmt.parseInt(i64, args[2], 10) catch { try resp.serializeError(w, "value is not an integer"); return; };
+        try resp.serializeBulkString(w, self.getListStore().lindex(key_ref.key, idx));
+    }
+
+    fn cmdLset(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 4) { try resp.serializeError(w, "wrong number of arguments for 'LSET'"); return; }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeError(w, "no such key"); return; };
+        defer key_ref.deinit(self.allocator);
+        const idx = std.fmt.parseInt(i64, args[2], 10) catch { try resp.serializeError(w, "value is not an integer"); return; };
+        self.getListStore().lset(key_ref.key, idx, args[3]) catch |err| {
+            try resp.serializeError(w, @errorName(err));
+            return;
+        };
+        self.logToAOF(args);
+        try resp.serializeSimpleString(w, "OK");
+    }
+
+    fn cmdLrem(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 4) { try resp.serializeError(w, "wrong number of arguments for 'LREM'"); return; }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeInteger(w, 0); return; };
+        defer key_ref.deinit(self.allocator);
+        const count = std.fmt.parseInt(i64, args[2], 10) catch { try resp.serializeError(w, "value is not an integer"); return; };
+        const removed = self.getListStore().lrem(key_ref.key, count, args[3]);
+        if (removed > 0) self.logToAOF(args);
+        try resp.serializeInteger(w, @intCast(removed));
+    }
+
+    // ── Hash Commands ────────────────────────────────────────────────
+
+    fn getHashStore(self: *CommandHandler) *HashStore {
+        return self.hash_store orelse @panic("hash_store not initialized");
+    }
+
+    fn cmdHset(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 4 or (args.len - 2) % 2 != 0) { try resp.serializeError(w, "wrong number of arguments for 'HSET'"); return; }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeError(w, "internal error"); return; };
+        defer key_ref.deinit(self.allocator);
+        const added = self.getHashStore().hset(key_ref.key, args[2..]) catch { try resp.serializeError(w, "internal error"); return; };
+        self.logToAOF(args);
+        try resp.serializeInteger(w, @intCast(added));
+    }
+
+    fn cmdHgetFn(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 3) { try resp.serializeError(w, "wrong number of arguments for 'HGET'"); return; }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeBulkString(w, null); return; };
+        defer key_ref.deinit(self.allocator);
+        try resp.serializeBulkString(w, self.getHashStore().hget(key_ref.key, args[2]));
+    }
+
+    fn cmdHdel(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 3) { try resp.serializeError(w, "wrong number of arguments for 'HDEL'"); return; }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeInteger(w, 0); return; };
+        defer key_ref.deinit(self.allocator);
+        const removed = self.getHashStore().hdel(key_ref.key, args[2..]);
+        if (removed > 0) self.logToAOF(args);
+        try resp.serializeInteger(w, @intCast(removed));
+    }
+
+    fn cmdHgetall(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 2) { try resp.serializeError(w, "wrong number of arguments for 'HGETALL'"); return; }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeArrayHeader(w, 0); return; };
+        defer key_ref.deinit(self.allocator);
+        const pairs = self.getHashStore().hgetall(key_ref.key, self.allocator) catch { try resp.serializeArrayHeader(w, 0); return; };
+        defer if (pairs.len > 0) self.allocator.free(pairs);
+        try resp.serializeArrayHeader(w, pairs.len);
+        for (pairs) |s| try resp.serializeBulkString(w, s);
+    }
+
+    fn cmdHlen(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 2) { try resp.serializeError(w, "wrong number of arguments for 'HLEN'"); return; }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeInteger(w, 0); return; };
+        defer key_ref.deinit(self.allocator);
+        try resp.serializeInteger(w, @intCast(self.getHashStore().hlen(key_ref.key)));
+    }
+
+    fn cmdHexists(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 3) { try resp.serializeError(w, "wrong number of arguments for 'HEXISTS'"); return; }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeInteger(w, 0); return; };
+        defer key_ref.deinit(self.allocator);
+        try resp.serializeInteger(w, if (self.getHashStore().hexists(key_ref.key, args[2])) @as(i64, 1) else 0);
+    }
+
+    fn cmdHmset(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 4 or (args.len - 2) % 2 != 0) { try resp.serializeError(w, "wrong number of arguments for 'HMSET'"); return; }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeError(w, "internal error"); return; };
+        defer key_ref.deinit(self.allocator);
+        _ = self.getHashStore().hset(key_ref.key, args[2..]) catch { try resp.serializeError(w, "internal error"); return; };
+        self.logToAOF(args);
+        try resp.serializeSimpleString(w, "OK");
+    }
+
+    fn cmdHmget(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 3) { try resp.serializeError(w, "wrong number of arguments for 'HMGET'"); return; }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch {
+            try resp.serializeArrayHeader(w, args.len - 2);
+            for (args[2..]) |_| try resp.serializeBulkString(w, null);
+            return;
+        };
+        defer key_ref.deinit(self.allocator);
+        try resp.serializeArrayHeader(w, args.len - 2);
+        for (args[2..]) |field| {
+            try resp.serializeBulkString(w, self.getHashStore().hget(key_ref.key, field));
+        }
+    }
+
+    fn cmdHkeys(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 2) { try resp.serializeError(w, "wrong number of arguments for 'HKEYS'"); return; }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeArrayHeader(w, 0); return; };
+        defer key_ref.deinit(self.allocator);
+        const keys = self.getHashStore().hkeys(key_ref.key, self.allocator) catch { try resp.serializeArrayHeader(w, 0); return; };
+        defer if (keys.len > 0) self.allocator.free(keys);
+        try resp.serializeArrayHeader(w, keys.len);
+        for (keys) |k| try resp.serializeBulkString(w, k);
+    }
+
+    fn cmdHvals(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 2) { try resp.serializeError(w, "wrong number of arguments for 'HVALS'"); return; }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeArrayHeader(w, 0); return; };
+        defer key_ref.deinit(self.allocator);
+        const vals = self.getHashStore().hvals(key_ref.key, self.allocator) catch { try resp.serializeArrayHeader(w, 0); return; };
+        defer if (vals.len > 0) self.allocator.free(vals);
+        try resp.serializeArrayHeader(w, vals.len);
+        for (vals) |v| try resp.serializeBulkString(w, v);
+    }
+
+    fn cmdHincrby(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 4) { try resp.serializeError(w, "wrong number of arguments for 'HINCRBY'"); return; }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeError(w, "internal error"); return; };
+        defer key_ref.deinit(self.allocator);
+        const delta = std.fmt.parseInt(i64, args[3], 10) catch { try resp.serializeError(w, "value is not an integer"); return; };
+        const result = self.getHashStore().hincrby(key_ref.key, args[2], delta) catch |err| {
+            try resp.serializeError(w, @errorName(err));
+            return;
+        };
+        self.logToAOF(args);
+        try resp.serializeInteger(w, result);
     }
 
     /// RANDOMKEY — return a random key from the current DB
@@ -2286,6 +2555,107 @@ test "SETEX" {
     defer allocator.free(r3);
     try std.testing.expect(r3[0] == ':');
     try std.testing.expect(r3[1] != '-');
+}
+
+test "LPUSH/RPUSH/LRANGE/LPOP/RPOP" {
+    const allocator = std.testing.allocator;
+    var kv = KVStore.init(allocator, std.testing.io);
+    defer kv.deinit();
+    var g = GraphEngine.init(allocator);
+    defer g.deinit();
+    var ls = ListStore.init(allocator);
+    defer ls.deinit();
+    var hs = HashStore.init(allocator);
+    defer hs.deinit();
+    var db = std.atomic.Value(u8).init(0);
+    var handler = CommandHandler.init(allocator, std.testing.io, &kv, &g, null, &db, .strict);
+    handler.list_store = &ls;
+    handler.hash_store = &hs;
+
+    // RPUSH
+    const r1 = try testExec(&handler, allocator, &[_][]const u8{ "RPUSH", "mylist", "a", "b", "c" });
+    defer allocator.free(r1);
+    try std.testing.expectEqualStrings(":3\r\n", r1);
+
+    // LPUSH
+    const r2 = try testExec(&handler, allocator, &[_][]const u8{ "LPUSH", "mylist", "z" });
+    defer allocator.free(r2);
+    try std.testing.expectEqualStrings(":4\r\n", r2);
+
+    // LRANGE 0 -1
+    const r3 = try testExec(&handler, allocator, &[_][]const u8{ "LRANGE", "mylist", "0", "-1" });
+    defer allocator.free(r3);
+    try std.testing.expect(std.mem.indexOf(u8, r3, "*4\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r3, "z") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r3, "a") != null);
+
+    // LPOP
+    const r4 = try testExec(&handler, allocator, &[_][]const u8{ "LPOP", "mylist" });
+    defer allocator.free(r4);
+    try std.testing.expectEqualStrings("$1\r\nz\r\n", r4);
+
+    // RPOP
+    const r5 = try testExec(&handler, allocator, &[_][]const u8{ "RPOP", "mylist" });
+    defer allocator.free(r5);
+    try std.testing.expectEqualStrings("$1\r\nc\r\n", r5);
+
+    // LLEN
+    const r6 = try testExec(&handler, allocator, &[_][]const u8{ "LLEN", "mylist" });
+    defer allocator.free(r6);
+    try std.testing.expectEqualStrings(":2\r\n", r6);
+}
+
+test "HSET/HGET/HGETALL/HDEL/HINCRBY" {
+    const allocator = std.testing.allocator;
+    var kv = KVStore.init(allocator, std.testing.io);
+    defer kv.deinit();
+    var g = GraphEngine.init(allocator);
+    defer g.deinit();
+    var ls = ListStore.init(allocator);
+    defer ls.deinit();
+    var hs = HashStore.init(allocator);
+    defer hs.deinit();
+    var db = std.atomic.Value(u8).init(0);
+    var handler = CommandHandler.init(allocator, std.testing.io, &kv, &g, null, &db, .strict);
+    handler.list_store = &ls;
+    handler.hash_store = &hs;
+
+    // HSET
+    const r1 = try testExec(&handler, allocator, &[_][]const u8{ "HSET", "u", "name", "Bob", "age", "25" });
+    defer allocator.free(r1);
+    try std.testing.expectEqualStrings(":2\r\n", r1);
+
+    // HGET
+    const r2 = try testExec(&handler, allocator, &[_][]const u8{ "HGET", "u", "name" });
+    defer allocator.free(r2);
+    try std.testing.expectEqualStrings("$3\r\nBob\r\n", r2);
+
+    // HGETALL
+    const r3 = try testExec(&handler, allocator, &[_][]const u8{ "HGETALL", "u" });
+    defer allocator.free(r3);
+    try std.testing.expect(std.mem.indexOf(u8, r3, "*4\r\n") != null);
+
+    // HLEN
+    const r4 = try testExec(&handler, allocator, &[_][]const u8{ "HLEN", "u" });
+    defer allocator.free(r4);
+    try std.testing.expectEqualStrings(":2\r\n", r4);
+
+    // HINCRBY
+    const r5 = try testExec(&handler, allocator, &[_][]const u8{ "HINCRBY", "u", "visits", "5" });
+    defer allocator.free(r5);
+    try std.testing.expectEqualStrings(":5\r\n", r5);
+
+    // HDEL
+    const r6 = try testExec(&handler, allocator, &[_][]const u8{ "HDEL", "u", "age" });
+    defer allocator.free(r6);
+    try std.testing.expectEqualStrings(":1\r\n", r6);
+
+    // HMGET
+    const r7 = try testExec(&handler, allocator, &[_][]const u8{ "HMGET", "u", "name", "age", "visits" });
+    defer allocator.free(r7);
+    try std.testing.expect(std.mem.indexOf(u8, r7, "*3\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r7, "Bob") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r7, "$-1\r\n") != null); // age deleted
 }
 
 test "bgsave_in_progress flag" {

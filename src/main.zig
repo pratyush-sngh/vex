@@ -703,4 +703,6 @@ test {
     _ = @import("cluster/config.zig");
     _ = @import("cluster/protocol.zig");
     _ = @import("cluster/replication.zig");
+    _ = @import("engine/list.zig");
+    _ = @import("engine/hash.zig");
 }

@@ -997,6 +997,13 @@ pub const Server = struct {
         var pubsub = PubSubRegistry.init(self.allocator);
         defer pubsub.deinit();
 
+        const LS = @import("../engine/list.zig").ListStore;
+        const HS = @import("../engine/hash.zig").HashStore;
+        var list_store = LS.init(self.allocator);
+        defer list_store.deinit();
+        var hash_store = HS.init(self.allocator);
+        defer hash_store.deinit();
+
         const workers = try self.allocator.alloc(Worker, num_workers);
         defer self.allocator.free(workers);
 
@@ -1021,6 +1028,8 @@ pub const Server = struct {
                 self.repl_follower,
                 self.repl_leader,
                 &pubsub,
+                &list_store,
+                &hash_store,
             );
         }
 

@@ -701,6 +701,18 @@ pub fn isWriteCommand(args: []const []const u8) bool {
     if (std.mem.eql(u8, upper, "COPY")) return true;
     if (std.mem.eql(u8, upper, "FLUSHDB")) return true;
     if (std.mem.eql(u8, upper, "FLUSHALL")) return true;
+    // List write commands
+    if (std.mem.eql(u8, upper, "LPUSH")) return true;
+    if (std.mem.eql(u8, upper, "RPUSH")) return true;
+    if (std.mem.eql(u8, upper, "LPOP")) return true;
+    if (std.mem.eql(u8, upper, "RPOP")) return true;
+    if (std.mem.eql(u8, upper, "LSET")) return true;
+    if (std.mem.eql(u8, upper, "LREM")) return true;
+    // Hash write commands
+    if (std.mem.eql(u8, upper, "HSET")) return true;
+    if (std.mem.eql(u8, upper, "HDEL")) return true;
+    if (std.mem.eql(u8, upper, "HMSET")) return true;
+    if (std.mem.eql(u8, upper, "HINCRBY")) return true;
     // Graph write commands
     if (upper.len >= 12 and std.mem.eql(u8, upper[0..6], "GRAPH.")) {
         if (std.mem.eql(u8, upper[6..], "ADDNODE")) return true;

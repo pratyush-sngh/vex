@@ -14,6 +14,8 @@ const ct = @import("../command/comptime_dispatch.zig");
 const replication = @import("../cluster/replication.zig");
 const TlsContext = @import("tls.zig").TlsContext;
 const SSL = @import("tls.zig").SSL;
+const ListStore = @import("../engine/list.zig").ListStore;
+const HashStore = @import("../engine/hash.zig").HashStore;
 
 const READ_BUF_SIZE = 64 * 1024;
 const MAX_NEW_FDS = 256;
@@ -222,6 +224,8 @@ pub const Worker = struct {
     repl_follower: ?*replication.ReplicationFollower,
     repl_leader: ?*replication.ReplicationLeader,
     pubsub: ?*PubSubRegistry,
+    list_store: ?*ListStore,
+    hash_store: ?*HashStore,
     new_fds: [MAX_NEW_FDS]i32,
     new_fd_head: std.atomic.Value(usize),
     new_fd_tail: std.atomic.Value(usize),
@@ -246,6 +250,8 @@ pub const Worker = struct {
         repl_follower: ?*replication.ReplicationFollower,
         repl_leader: ?*replication.ReplicationLeader,
         pubsub: ?*PubSubRegistry,
+        list_store: ?*ListStore,
+        hash_store: ?*HashStore,
     ) !Worker {
         return .{
             .id = id,
@@ -269,6 +275,8 @@ pub const Worker = struct {
             .repl_follower = repl_follower,
             .repl_leader = repl_leader,
             .pubsub = pubsub,
+            .list_store = list_store,
+            .hash_store = hash_store,
             .new_fds = [_]i32{-1} ** MAX_NEW_FDS,
             .new_fd_head = std.atomic.Value(usize).init(0),
             .new_fd_tail = std.atomic.Value(usize).init(0),
@@ -1312,6 +1320,8 @@ pub const Worker = struct {
             &selected_db,
             self.keys_mode,
         );
+        handler.list_store = self.list_store;
+        handler.hash_store = self.hash_store;
 
         var list: std.ArrayList(u8) = .empty;
         defer list.deinit(self.allocator);
