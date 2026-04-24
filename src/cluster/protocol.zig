@@ -72,6 +72,23 @@ pub fn readFrame(fd: i32, allocator: Allocator) !Frame {
     return .{ .frame_type = frame_type, .payload = payload };
 }
 
+/// Build a heartbeat payload: leader's current mutation_seq + timestamp.
+pub fn encodeHeartbeat(mutation_seq: u64, timestamp_ms: i64) [16]u8 {
+    var buf: [16]u8 = undefined;
+    std.mem.writeInt(u64, buf[0..8], mutation_seq, .little);
+    std.mem.writeInt(i64, buf[8..16], timestamp_ms, .little);
+    return buf;
+}
+
+/// Decode a heartbeat payload.
+pub fn decodeHeartbeat(payload: []const u8) !struct { mutation_seq: u64, timestamp_ms: i64 } {
+    if (payload.len < 16) return error.InvalidPayload;
+    return .{
+        .mutation_seq = std.mem.readInt(u64, payload[0..8], .little),
+        .timestamp_ms = std.mem.readInt(i64, payload[8..16], .little),
+    };
+}
+
 /// Build a repl_request payload: just a u64 sequence number.
 pub fn encodeReplRequest(seq: u64) [8]u8 {
     var buf: [8]u8 = undefined;

@@ -792,6 +792,10 @@ pub const CommandHandler = struct {
             try aw.writer.writeAll("aof_enabled:0\r\n");
         }
 
+        // Cluster section (if available)
+        try aw.writer.writeAll("\r\n# Cluster\r\n");
+        try aw.writer.print("graph_mutation_seq:{d}\r\n", .{self.graph.mutation_seq});
+
         try resp.serializeBulkString(out, aw.written());
     }
 

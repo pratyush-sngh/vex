@@ -10,6 +10,7 @@ const snapshot = @import("storage/snapshot.zig");
 const aof_mod = @import("storage/aof.zig");
 const AOF = aof_mod.AOF;
 const span = @import("perf/span.zig");
+const vex_log = @import("log.zig");
 
 // Global state for replication — leader's local port for self-loopback
 
@@ -86,6 +87,7 @@ pub fn main(init: std.process.Init) !void {
 
     installSignalHandlers();
     const config = parseArgs(init);
+    vex_log.global = vex_log.Logger.init(config.log_level);
     var prof_state: span.Profile = undefined;
     var prof: ?*span.Profile = null;
     if (config.profile) {
@@ -270,6 +272,7 @@ const Config = struct {
     tls_key: ?[]const u8,
     maxmemory: usize,
     maxmemory_policy: @import("engine/kv.zig").EvictionPolicy,
+    log_level: vex_log.Level,
 };
 
 fn parseArgs(init: std.process.Init) Config {
@@ -292,6 +295,7 @@ fn parseArgs(init: std.process.Init) Config {
     var tls_key: ?[]const u8 = null;
     var maxmemory: usize = 0;
     var maxmemory_policy: @import("engine/kv.zig").EvictionPolicy = .noeviction;
+    var log_level: vex_log.Level = .info;
 
     var it = std.process.Args.Iterator.init(init.minimal.args);
     defer it.deinit();
@@ -371,6 +375,10 @@ fn parseArgs(init: std.process.Init) Config {
             if (it.next()) |p| {
                 tls_key = std.mem.sliceTo(p, 0);
             }
+        } else if (std.mem.eql(u8, arg, "--log-level")) {
+            if (it.next()) |l| {
+                log_level = vex_log.Level.parse(std.mem.sliceTo(l, 0));
+            }
         } else if (std.mem.eql(u8, arg, "--maxmemory")) {
             if (it.next()) |n| {
                 maxmemory = std.fmt.parseInt(usize, std.mem.sliceTo(n, 0), 10) catch 0;
@@ -407,6 +415,7 @@ fn parseArgs(init: std.process.Init) Config {
         .tls_key = tls_key,
         .maxmemory = maxmemory,
         .maxmemory_policy = maxmemory_policy,
+        .log_level = log_level,
     };
 }
 
@@ -460,7 +469,7 @@ fn parseMemorySize(s: []const u8) usize {
 }
 
 fn log(comptime fmt: []const u8, args: anytype) void {
-    std.debug.print("[vex] " ++ fmt ++ "\n", args);
+    vex_log.info(fmt, args);
 }
 
 test {

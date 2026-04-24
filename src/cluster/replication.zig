@@ -10,6 +10,8 @@ const ClusterNode = config_mod.ClusterNode;
 /// Returns the RESP response bytes (caller must free).
 pub const ExecuteWriteFn = *const fn (allocator: Allocator, args: []const []const u8) ?[]u8;
 
+pub const HEARTBEAT_INTERVAL_MS: i64 = 5000; // 5 seconds
+
 pub const ReplicationLeader = struct {
     allocator: Allocator,
     config: *const ClusterConfig,
@@ -18,8 +20,12 @@ pub const ReplicationLeader = struct {
     mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
     running: std.atomic.Value(bool),
     listener_thread: ?std.Thread,
-    /// Callback to execute forwarded write commands
+    heartbeat_thread: ?std.Thread,
     execute_fn: ?ExecuteWriteFn,
+    /// Current mutation sequence (set by main, read by heartbeat)
+    mutation_seq: std.atomic.Value(u64),
+    /// Connected follower count (for INFO)
+    follower_count: std.atomic.Value(u32),
 
     pub fn init(allocator: Allocator, conf: *const ClusterConfig, base_port: u16) ReplicationLeader {
         return .{
@@ -29,7 +35,10 @@ pub const ReplicationLeader = struct {
             .follower_fds = std.array_list.Managed(i32).init(allocator),
             .running = std.atomic.Value(bool).init(false),
             .listener_thread = null,
+            .heartbeat_thread = null,
             .execute_fn = null,
+            .mutation_seq = std.atomic.Value(u64).init(0),
+            .follower_count = std.atomic.Value(u32).init(0),
         };
     }
 
@@ -47,6 +56,7 @@ pub const ReplicationLeader = struct {
     pub fn start(self: *ReplicationLeader) !void {
         self.running.store(true, .release);
         self.listener_thread = try std.Thread.spawn(.{}, listenerLoop, .{self});
+        self.heartbeat_thread = try std.Thread.spawn(.{}, heartbeatLoop, .{self});
     }
 
     pub fn stop(self: *ReplicationLeader) void {
@@ -55,11 +65,16 @@ pub const ReplicationLeader = struct {
             t.join();
             self.listener_thread = null;
         }
+        if (self.heartbeat_thread) |t| {
+            t.join();
+            self.heartbeat_thread = null;
+        }
     }
 
     /// Broadcast an AOF record to all connected followers.
     /// Called by the leader after executing a write command.
     pub fn broadcastMutation(self: *ReplicationLeader, aof_record: []const u8) void {
+        _ = self.mutation_seq.fetchAdd(1, .monotonic);
         _ = std.c.pthread_mutex_lock(&self.mutex);
         defer _ = std.c.pthread_mutex_unlock(&self.mutex);
 
@@ -130,6 +145,40 @@ pub const ReplicationLeader = struct {
         }
     }
 
+    fn heartbeatLoop(self: *ReplicationLeader) void {
+        while (self.running.load(.acquire)) {
+            // Sleep ~5 seconds (poll with timeout on a dummy)
+            var i: u32 = 0;
+            while (i < 50 and self.running.load(.acquire)) : (i += 1) {
+                std.Thread.yield() catch {};
+                var dummy_pfd = [1]std.c.pollfd{.{ .fd = -1, .events = 0, .revents = 0 }};
+                _ = std.c.poll(&dummy_pfd, 0, 100); // 100ms sleep
+            }
+            if (!self.running.load(.acquire)) break;
+
+            // Get current timestamp
+            var ts: std.c.timespec = undefined;
+            _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+            const now_ms: i64 = @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
+
+            const hb = protocol.encodeHeartbeat(self.mutation_seq.load(.monotonic), now_ms);
+
+            _ = std.c.pthread_mutex_lock(&self.mutex);
+            var j: usize = 0;
+            while (j < self.follower_fds.items.len) {
+                const fd = self.follower_fds.items[j];
+                protocol.writeFrame(fd, .heartbeat, &hb) catch {
+                    _ = std.c.close(fd);
+                    _ = self.follower_fds.swapRemove(j);
+                    _ = self.follower_count.fetchSub(1, .monotonic);
+                    continue;
+                };
+                j += 1;
+            }
+            _ = std.c.pthread_mutex_unlock(&self.mutex);
+        }
+    }
+
     const FollowerHandlerCtx = struct {
         leader: *ReplicationLeader,
         fd: i32,
@@ -184,6 +233,7 @@ pub const ReplicationLeader = struct {
                     _ = std.c.pthread_mutex_lock(&self.mutex);
                     self.follower_fds.append(fd) catch {};
                     _ = std.c.pthread_mutex_unlock(&self.mutex);
+                    _ = self.follower_count.fetchAdd(1, .monotonic);
                     std.debug.print("[repl-leader] follower fd={d} registered for replication stream\n", .{fd});
                 },
                 .heartbeat => {
@@ -208,6 +258,11 @@ pub const ReplicationFollower = struct {
     receiver_thread: ?std.Thread,
     replay_fn: ?*const fn (data: []const u8) void,
     local_port: u16,
+    /// Replication state — updated by heartbeat
+    leader_seq: std.atomic.Value(u64),
+    local_seq: std.atomic.Value(u64),
+    last_heartbeat_ms: std.atomic.Value(i64),
+    replayed_count: std.atomic.Value(u64),
 
     pub fn init(allocator: Allocator, conf: *const ClusterConfig, local_port: u16) ReplicationFollower {
         return .{
@@ -219,6 +274,10 @@ pub const ReplicationFollower = struct {
             .receiver_thread = null,
             .replay_fn = null,
             .local_port = local_port,
+            .leader_seq = std.atomic.Value(u64).init(0),
+            .local_seq = std.atomic.Value(u64).init(0),
+            .last_heartbeat_ms = std.atomic.Value(i64).init(0),
+            .replayed_count = std.atomic.Value(u64).init(0),
         };
     }
 
@@ -378,19 +437,24 @@ pub const ReplicationFollower = struct {
 
             switch (frame.frame_type) {
                 .repl_data => {
-                    // Decode command args and replay locally via loopback
                     const args = protocol.decodeWriteForward(self.allocator, frame.payload) catch {
                         if (frame.payload.len > 0) self.allocator.free(@constCast(frame.payload));
                         continue;
                     };
                     defer self.allocator.free(args);
-                    // payload freed after args are used
                     defer if (frame.payload.len > 0) self.allocator.free(@constCast(frame.payload));
 
-                    // Replay via loopback to own RESP port
                     self.replayViaLoopback(args);
+                    _ = self.local_seq.fetchAdd(1, .monotonic);
+                    _ = self.replayed_count.fetchAdd(1, .monotonic);
                 },
                 .heartbeat => {
+                    if (frame.payload.len >= 16) {
+                        if (protocol.decodeHeartbeat(frame.payload)) |hb| {
+                            self.leader_seq.store(hb.mutation_seq, .release);
+                            self.last_heartbeat_ms.store(hb.timestamp_ms, .release);
+                        } else |_| {}
+                    }
                     if (frame.payload.len > 0) self.allocator.free(@constCast(frame.payload));
                 },
                 else => {
@@ -436,6 +500,13 @@ pub fn isWriteCommand(args: []const []const u8) bool {
         if (std.mem.eql(u8, upper[6..], "DELEDGE")) return true;
     }
     return false;
+}
+
+/// Get replication lag (leader_seq - local_seq).
+pub fn replLag(follower: *const ReplicationFollower) u64 {
+    const leader = follower.leader_seq.load(.acquire);
+    const local = follower.local_seq.load(.acquire);
+    return if (leader > local) leader - local else 0;
 }
 
 fn resolveHost(allocator: Allocator, host: []const u8) ?u32 {

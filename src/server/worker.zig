@@ -204,6 +204,9 @@ pub const Worker = struct {
                     }
                 }
             }
+
+            // AOF group commit: flush buffered commands to file at end of tick
+            if (self.aof) |a| a.flush();
         }
     }
 
