@@ -59,7 +59,9 @@ pub const Logger = struct {
 };
 
 fn formatTimestamp(buf: *[30]u8) []const u8 {
-    const now_ms = std.time.milliTimestamp();
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+    const now_ms: i64 = @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
     const epoch_secs: u64 = @intCast(@divTrunc(now_ms, 1000));
 
     const SECS_PER_DAY: u64 = 86400;

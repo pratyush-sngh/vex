@@ -12,7 +12,10 @@ const AOF = aof_mod.AOF;
 const span = @import("perf/span.zig");
 const vex_log = @import("log.zig");
 
-// Global state for replication — leader's local port for self-loopback
+// Global state for replication callbacks
+var g_kv: ?*KVStore = null;
+var g_graph: ?*GraphEngine = null;
+var g_io: ?std.Io = null;
 
 /// Execute a forwarded write by sending it to the local RESP port as a client.
 /// This ensures it goes through the worker → ConcurrentKV path (not plain KVStore).
@@ -60,6 +63,57 @@ fn executeForwardedWrite(allocator: std.mem.Allocator, args: []const []const u8)
 }
 
 var g_local_port: u16 = 6380;
+
+/// Get a binary snapshot of KV + Graph for full sync to followers.
+fn getSnapshot(allocator: std.mem.Allocator) ?[]u8 {
+    const kv_ptr = g_kv orelse return null;
+    const graph_ptr = g_graph orelse return null;
+    const io = g_io orelse return null;
+
+    // Build snapshot in memory using snapshot module
+    var buf = std.array_list.Managed(u8).init(allocator);
+    defer buf.deinit();
+
+    // Use snapshot.save to a temp path, then read the file
+    const tmp_path = "/tmp/vex_repl_sync.zdb";
+    snapshot.save(io, allocator, kv_ptr, graph_ptr, tmp_path) catch return null;
+
+    // Read the snapshot file
+    const file = std.Io.Dir.cwd().openFile(io, tmp_path, .{}) catch return null;
+    defer file.close(io);
+    const len = file.length(io) catch return null;
+    const data = allocator.alloc(u8, @intCast(len)) catch return null;
+    const n = file.readPositionalAll(io, data, 0) catch {
+        allocator.free(data);
+        return null;
+    };
+    if (n != @as(usize, @intCast(len))) {
+        allocator.free(data);
+        return null;
+    }
+    return data;
+}
+
+/// Load a binary snapshot on the follower.
+fn loadSnapshot(data: []const u8) bool {
+    const kv_ptr = g_kv orelse return false;
+    const graph_ptr = g_graph orelse return false;
+    const io = g_io orelse return false;
+    const allocator = kv_ptr.allocator;
+
+    // Write snapshot to temp file
+    const tmp_path = "/tmp/vex_repl_load.zdb";
+    const file = std.Io.Dir.cwd().createFile(io, tmp_path, .{}) catch return false;
+    file.writeStreamingAll(io, data) catch {
+        file.close(io);
+        return false;
+    };
+    file.close(io);
+
+    // Load snapshot
+    snapshot.load(io, allocator, kv_ptr, graph_ptr, tmp_path) catch return false;
+    return true;
+}
 
 const DEFAULT_HOST = "0.0.0.0";
 const DEFAULT_PORT: u16 = 6380;
@@ -185,18 +239,25 @@ pub fn main(init: std.process.Init) !void {
         };
 
         if (cluster_conf) |*cc| {
+            // Set globals for replication callbacks
+            g_kv = &kv;
+            g_graph = &graph;
+            g_io = io;
+
             if (cc.isLeader()) {
                 log("cluster mode: LEADER (node {d})", .{cc.self_id});
                 g_local_port = config.port;
 
                 repl_leader = ReplMod.ReplicationLeader.init(allocator, cc, config.port);
                 repl_leader.?.execute_fn = executeForwardedWrite;
+                repl_leader.?.snapshot_fn = getSnapshot;
                 repl_leader.?.start() catch |err| {
                     log("warning: replication listener failed: {s}", .{@errorName(err)});
                 };
             } else {
                 log("cluster mode: FOLLOWER (node {d})", .{cc.self_id});
                 repl_follower = ReplMod.ReplicationFollower.init(allocator, cc, config.port);
+                repl_follower.?.load_snapshot_fn = loadSnapshot;
                 repl_follower.?.connectToLeader() catch |err| {
                     log("warning: cannot connect to leader: {s}", .{@errorName(err)});
                 };
@@ -489,6 +550,7 @@ test {
     _ = @import("engine/property_store.zig");
     _ = @import("command/comptime_dispatch.zig");
     _ = @import("server/tls.zig");
+    _ = @import("log.zig");
     _ = @import("cluster/config.zig");
     _ = @import("cluster/protocol.zig");
     _ = @import("cluster/replication.zig");

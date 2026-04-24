@@ -9,6 +9,8 @@ const ClusterNode = config_mod.ClusterNode;
 /// Callback type for executing a forwarded write command on the leader.
 /// Returns the RESP response bytes (caller must free).
 pub const ExecuteWriteFn = *const fn (allocator: Allocator, args: []const []const u8) ?[]u8;
+/// Callback to get a snapshot of the current state (returns snapshot bytes).
+pub const GetSnapshotFn = *const fn (allocator: Allocator) ?[]u8;
 
 pub const HEARTBEAT_INTERVAL_MS: i64 = 5000; // 5 seconds
 
@@ -22,6 +24,7 @@ pub const ReplicationLeader = struct {
     listener_thread: ?std.Thread,
     heartbeat_thread: ?std.Thread,
     execute_fn: ?ExecuteWriteFn,
+    snapshot_fn: ?GetSnapshotFn,
     /// Current mutation sequence (set by main, read by heartbeat)
     mutation_seq: std.atomic.Value(u64),
     /// Connected follower count (for INFO)
@@ -37,6 +40,7 @@ pub const ReplicationLeader = struct {
             .listener_thread = null,
             .heartbeat_thread = null,
             .execute_fn = null,
+            .snapshot_fn = null,
             .mutation_seq = std.atomic.Value(u64).init(0),
             .follower_count = std.atomic.Value(u32).init(0),
         };
@@ -228,13 +232,33 @@ pub const ReplicationLeader = struct {
                     }
                 },
                 .repl_request => {
+                    // Decode requested seq
+                    const req_seq = if (frame.payload.len >= 8)
+                        protocol.decodeReplRequest(frame.payload) catch 0
+                    else
+                        0;
                     if (frame.payload.len > 0) self.allocator.free(@constCast(frame.payload));
-                    // This connection is a repl_stream — add to broadcast list
+
+                    // If seq=0, send full sync (snapshot transfer)
+                    if (req_seq == 0) {
+                        if (self.snapshot_fn) |snap_fn| {
+                            std.debug.print("[repl-leader] follower fd={d} requesting full sync\n", .{fd});
+                            if (snap_fn(self.allocator)) |snap_data| {
+                                defer self.allocator.free(snap_data);
+                                protocol.writeFrame(fd, .full_sync_data, snap_data) catch {
+                                    std.debug.print("[repl-leader] full sync write failed for fd={d}\n", .{fd});
+                                };
+                                std.debug.print("[repl-leader] full sync sent to fd={d} ({d} bytes)\n", .{ fd, snap_data.len });
+                            }
+                        }
+                    }
+
+                    // Register for broadcast list
                     _ = std.c.pthread_mutex_lock(&self.mutex);
                     self.follower_fds.append(fd) catch {};
                     _ = std.c.pthread_mutex_unlock(&self.mutex);
                     _ = self.follower_count.fetchAdd(1, .monotonic);
-                    std.debug.print("[repl-leader] follower fd={d} registered for replication stream\n", .{fd});
+                    std.debug.print("[repl-leader] follower fd={d} registered for replication stream (from seq={d})\n", .{ fd, req_seq });
                 },
                 .heartbeat => {
                     if (frame.payload.len > 0) self.allocator.free(@constCast(frame.payload));
@@ -257,6 +281,8 @@ pub const ReplicationFollower = struct {
     running: std.atomic.Value(bool),
     receiver_thread: ?std.Thread,
     replay_fn: ?*const fn (data: []const u8) void,
+    /// Callback to load a snapshot (full sync)
+    load_snapshot_fn: ?*const fn (data: []const u8) bool,
     local_port: u16,
     /// Replication state — updated by heartbeat
     leader_seq: std.atomic.Value(u64),
@@ -273,6 +299,7 @@ pub const ReplicationFollower = struct {
             .running = std.atomic.Value(bool).init(false),
             .receiver_thread = null,
             .replay_fn = null,
+            .load_snapshot_fn = null,
             .local_port = local_port,
             .leader_seq = std.atomic.Value(u64).init(0),
             .local_seq = std.atomic.Value(u64).init(0),
@@ -447,6 +474,17 @@ pub const ReplicationFollower = struct {
                     self.replayViaLoopback(args);
                     _ = self.local_seq.fetchAdd(1, .monotonic);
                     _ = self.replayed_count.fetchAdd(1, .monotonic);
+                },
+                .full_sync_data => {
+                    std.debug.print("[repl-follower] received full sync ({d} bytes)\n", .{frame.payload.len});
+                    if (self.load_snapshot_fn) |load_fn| {
+                        if (load_fn(frame.payload)) {
+                            std.debug.print("[repl-follower] full sync loaded successfully\n", .{});
+                        } else {
+                            std.debug.print("[repl-follower] full sync load failed\n", .{});
+                        }
+                    }
+                    if (frame.payload.len > 0) self.allocator.free(@constCast(frame.payload));
                 },
                 .heartbeat => {
                     if (frame.payload.len >= 16) {
