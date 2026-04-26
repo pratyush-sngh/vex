@@ -141,14 +141,19 @@ QUEUED
 
 | Feature | Details |
 |---------|---------|
-| **KV Commands** | SET/GET/DEL/MGET/MSET/INCR/DECR/APPEND/EXPIRE/PERSIST + 15 more |
-| **Graph Commands** | ADDNODE/ADDEDGE/TRAVERSE/PATH/WPATH/NEIGHBORS + 6 more |
-| **Transactions** | MULTI/EXEC/DISCARD -- atomic batch execution under engine lock |
-| **Pub/Sub** | SUBSCRIBE/PUBLISH/UNSUBSCRIBE -- cross-worker shared registry |
+| **Strings** | SET/GET/DEL/MGET/MSET/INCR/DECR/APPEND/EXPIRE/SETNX/GETSET + 20 more |
+| **Lists** | LPUSH/RPUSH/LPOP/RPOP/LLEN/LRANGE/LINDEX/LSET/LREM |
+| **Hashes** | HSET/HGET/HDEL/HGETALL/HLEN/HEXISTS/HMSET/HMGET/HKEYS/HVALS/HINCRBY |
+| **Sets** | SADD/SREM/SMEMBERS/SISMEMBER/SCARD/SUNION/SINTER/SDIFF |
+| **Sorted Sets** | ZADD/ZREM/ZRANGE/ZSCORE/ZRANK/ZCARD/ZINCRBY/ZCOUNT |
+| **Graph** | ADDNODE/ADDEDGE/TRAVERSE/PATH/WPATH/NEIGHBORS + 6 more |
+| **Transactions** | MULTI/EXEC/DISCARD + WATCH/UNWATCH optimistic locking |
+| **Pub/Sub** | SUBSCRIBE/PUBLISH/UNSUBSCRIBE/PSUBSCRIBE/PUNSUBSCRIBE |
 | **Persistence** | Snapshot (CRC-32) + AOF with group commit + BGSAVE |
 | **TLS** | OpenSSL via dlopen -- no build dependency |
 | **Memory Limits** | --maxmemory with noeviction or allkeys-lru |
 | **Auth** | --requirepass with constant-time comparison |
+| **Client Compat** | CONFIG GET/SET, CLIENT ID/LIST/SETNAME, OBJECT, TIME, RESET |
 | **Config File** | Auto-load `vex.conf` + `VEX_CONFIG` env + `--config` flag |
 | **Logging** | Structured ISO 8601 timestamps, 4 levels |
 | **Clustering** | Leader/follower replication + automatic failover |
@@ -192,6 +197,10 @@ src/
 ├── engine/
 │   ├── kv.zig            # KV store + LRU eviction
 │   ├── concurrent_kv.zig # 256-stripe rwlock KV
+│   ├── list.zig          # List data type (deque)
+│   ├── hash.zig          # Hash data type (field maps)
+│   ├── set.zig           # Set data type (unique members)
+│   ├── sorted_set.zig    # Sorted set (score-ordered)
 │   ├── graph.zig         # CSR graph engine
 │   └── query.zig         # BFS, Dijkstra, traversal
 ├── command/
@@ -207,11 +216,17 @@ src/
 
 ## Changelog
 
+### v0.5.0 -- Sets & Sorted Sets
+Sets (SADD/SREM/SMEMBERS/SISMEMBER/SCARD/SUNION/SINTER/SDIFF), Sorted Sets (ZADD/ZREM/ZRANGE/ZSCORE/ZRANK/ZCARD/ZINCRBY/ZCOUNT). All 5 Redis data types now supported.
+
+### v0.4.0 -- Lists, Hashes & WATCH
+Lists (LPUSH/RPUSH/LPOP/RPOP/LLEN/LRANGE/LINDEX/LSET/LREM), Hashes (HSET/HGET/HDEL/HGETALL/HLEN/HEXISTS/HMSET/HMGET/HKEYS/HVALS/HINCRBY), WATCH/UNWATCH optimistic locking. 30 Redis compatibility commands (CONFIG, CLIENT, COPY, UNLINK, PSUBSCRIBE, TIME, OBJECT, RESET, etc.).
+
 ### v0.3.0 -- Production Hardening
-TLS, MULTI/EXEC, pub/sub, LRU eviction, BGSAVE, AOF group commit, config files, structured logging, automatic failover. [Full details](docs/commands.md)
+TLS, MULTI/EXEC, pub/sub, LRU eviction, BGSAVE, AOF group commit, config files, structured logging, automatic failover.
 
 ### v0.2.0 -- Distributed KV + Graph Read Replicas
-Leader/follower replication, full sync, heartbeat lag tracking, write forwarding. [Clustering docs](docs/clustering.md)
+Leader/follower replication, full sync, heartbeat lag tracking, write forwarding.
 
 ### v0.1.0 -- Initial Release
 Redis-compatible KV + graph DB with multi-reactor architecture.
@@ -219,16 +234,6 @@ Redis-compatible KV + graph DB with multi-reactor architecture.
 ---
 
 ## Roadmap
-
-### v0.4 -- Redis Data Types: Lists & Hashes
-- `LPUSH`/`RPUSH`/`LPOP`/`RPOP`/`LLEN`/`LRANGE`/`LINDEX` (Lists)
-- `HSET`/`HGET`/`HDEL`/`HGETALL`/`HLEN`/`HMSET`/`HMGET` (Hashes)
-- `WATCH`/`UNWATCH` for optimistic locking
-
-### v0.5 -- Sets & Sorted Sets
-- `SADD`/`SREM`/`SMEMBERS`/`SISMEMBER`/`SCARD`/`SUNION`/`SINTER` (Sets)
-- `ZADD`/`ZREM`/`ZRANGE`/`ZSCORE`/`ZRANK`/`ZCARD` (Sorted Sets)
-- Streams (`XADD`/`XREAD`)
 
 ### v0.6 -- Partitioned Graph
 - Hash-partition graph nodes across machines
