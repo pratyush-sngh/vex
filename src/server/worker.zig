@@ -1625,7 +1625,35 @@ pub const Worker = struct {
                     return true;
                 },
                 'I' => if (args.len >= 2 and equalsAsciiUpper(cmd, "INCR")) {
-                    const ns_key = nsKey(conn.selected_db, args[1]) orelse return false;
+                    // Ultra-fast INCR: inline nsKey + batch reservation
+                    const user_key = args[1];
+                    const db = conn.selected_db;
+                    if (db >= 16) return false;
+                    const prefix = DB_PREFIXES[db];
+                    const IK = struct { threadlocal var buf: [512]u8 = undefined; };
+                    const total_len = prefix.len + user_key.len;
+                    if (total_len > IK.buf.len) return false;
+                    @memcpy(IK.buf[0..prefix.len], prefix);
+                    @memcpy(IK.buf[prefix.len..total_len], user_key);
+                    const ns_key = IK.buf[0..total_len];
+
+                    // Lock-free fast path: atomic INCR on existing integer key
+                    const stripe = ckv.getStripePublic(ns_key);
+                    const entry_opt = stripe.map.getPtr(ns_key);
+                    if (entry_opt) |entry| {
+                        if (entry.flags.is_integer and !entry.flags.deleted) {
+                            // Single atomic instruction — minimum possible synchronization
+                            const int_ptr: *i64 = &entry.int_value;
+                            const new_val = @atomicRmw(i64, int_ptr, .Add, 1, .monotonic) + 1;
+                            if (self.aof) |a| a.logCommand(args);
+                            var incr_resp: [32]u8 = undefined;
+                            const ir = std.fmt.bufPrint(&incr_resp, ":{d}\r\n", .{new_val}) catch return false;
+                            conn.write_buf.appendSlice(ir) catch {};
+                            return true;
+                        }
+                    }
+
+                    // Fallback: new key or non-integer — use write lock
                     const new_val = ckv.incrBy(ns_key, 1) catch |err| {
                         if (err == error.NotAnInteger) {
                             conn.write_buf.appendSlice("-ERR value is not an integer or out of range\r\n") catch {};
