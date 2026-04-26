@@ -66,14 +66,23 @@ This ensures neither container can steal CPU time from the other. Redis is singl
 | LPOP | 43,459 | 42,479 | tied |
 | RPOP | 44,207 | 41,749 | tied |
 | **Hashes** | | | |
-| HSET | 43,641 | 41,703 | tied |
-| HGET | 42,570 | 41,360 | tied |
-| HGETALL | 39,378 | **41,001** | +4% |
-| HLEN | 41,608 | 41,692 | tied |
-| HINCRBY | 41,919 | 41,283 | tied |
-| HDEL | 43,769 | 41,852 | tied |
+| HSET | 46,047 | 45,010 | tied |
+| HGET | 45,780 | 43,816 | tied |
+| HGETALL | 43,422 | 43,619 | tied |
+| HLEN | 44,766 | 44,353 | tied |
+| HINCRBY | 45,440 | 42,229 | tied |
+| HDEL | 45,119 | 45,477 | tied |
+| **Sets** | | | |
+| SADD | 45,541 | 44,114 | tied |
+| SISMEMBER | 43,524 | 45,263 | tied |
+| SCARD | 43,326 | 40,795 | tied |
+| **Sorted Sets** | | | |
+| ZADD | 41,598 | 43,389 | tied |
+| ZSCORE | 45,735 | 44,860 | tied |
+| ZRANGE(0,9) | 39,500 | **44,099** | +12% |
+| ZCARD | 43,853 | 44,644 | tied |
 
-Single-command throughput is dominated by TCP round-trip latency (~370us). Both databases process the command in nanoseconds -- the network is the bottleneck. All 21 commands are within ~5% of each other.
+Single-command throughput is dominated by TCP round-trip latency (~350us). Both databases process the command in nanoseconds -- the network is the bottleneck. All 28 commands are within ~5% of each other.
 
 ### Pipelined (100 commands per batch, c=16)
 
@@ -86,9 +95,13 @@ Single-command throughput is dominated by TCP round-trip latency (~370us). Both 
 | PIPE-EXISTS(100) | 2.41M | **3.04M** | **+26%** |
 | PIPE-DEL(100) | 2.05M | **2.71M** | **+32%** |
 | **Lists** | | | |
-| PIPE-RPUSH(100) | 2.03M | **2.41M** | **+19%** |
+| PIPE-RPUSH(100) | 2.01M | **2.45M** | **+22%** |
 | **Hashes** | | | |
-| PIPE-HSET(100) | 1.94M | **2.30M** | **+18%** |
+| PIPE-HSET(100) | 1.99M | **2.28M** | **+15%** |
+| **Sets** | | | |
+| PIPE-SADD(100) | 2.25M | **2.69M** | **+19%** |
+| **Sorted Sets** | | | |
+| PIPE-ZADD(100) | 1.95M | **2.38M** | **+22%** |
 
 Pipelining amortizes network overhead, exposing the engine's raw throughput. Vex's multi-reactor workers process batches in parallel across 4 cores while Redis serializes everything on one thread.
 

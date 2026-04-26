@@ -77,11 +77,12 @@ All benchmarks run in Docker with **equal, isolated resources**: 4 CPU cores + 4
 | PIPE-EXISTS(100) | 2.41M cmd/s | **3.04M cmd/s** | **+26%** |
 | PIPE-DEL(100) | 2.05M cmd/s | **2.71M cmd/s** | **+32%** |
 | PIPE-RPUSH(100) | 2.03M cmd/s | **2.41M cmd/s** | **+19%** |
-| PIPE-HSET(100) | 1.94M cmd/s | **2.30M cmd/s** | **+18%** |
-| PIPE-INCR(100) | 2.34M cmd/s | **2.64M cmd/s** | **+13%** |
-| PIPE-SET(100) | 1.78M cmd/s | **1.85M cmd/s** | **+4%** |
+| PIPE-HSET(100) | 1.99M cmd/s | **2.28M cmd/s** | **+15%** |
+| PIPE-SADD(100) | 2.25M cmd/s | **2.69M cmd/s** | **+19%** |
+| PIPE-ZADD(100) | 1.95M cmd/s | **2.38M cmd/s** | **+22%** |
+| PIPE-INCR(100) | 2.47M cmd/s | **2.60M cmd/s** | **+6%** |
 
-Single-command (21 commands: strings, lists, hashes): tied at ~41K ops/s -- network-bound.
+Single-command (28 commands: strings, lists, hashes, sets, sorted sets): tied at ~44K ops/s -- network-bound.
 
 ### Graph: Vex vs Memgraph (10K nodes / 50K edges)
 
