@@ -1,15 +1,28 @@
 # Vex
 
-A high-performance KV + Graph database written in Zig 0.16. Speaks the Redis protocol (RESP), so you can connect with `redis-cli` or any Redis client library.
+A high-performance KV + Graph database written in Zig. Drop-in Redis replacement that's 20-40% faster per instance on the same hardware. Same ops, same clients, same horizontal scaling model -- fewer instances for the same throughput.
 
 ## Why Vex?
 
-- **Up to 79% faster than Redis** on same-machine workloads (median of 15 runs, `redis-benchmark` UDS: 6.17M LPOP vs 3.45M)
+**Same scaling model as Redis, better per-instance performance.**
+
+Redis is single-threaded. To scale, you add more instances. Vex does the same -- but each instance uses 4-8 cores efficiently via multi-reactor architecture with lock-free reads. You need 20-40% fewer instances for the same throughput.
+
+| | Redis | Vex | Dragonfly |
+|---|---|---|---|
+| Sweet spot | 1 core | 4-8 cores | 32-64 cores |
+| Scale model | Add instances | Add instances | Bigger machine |
+| K8s / Docker | Small pods | Small pods | Huge pod |
+| Failure blast radius | 1 instance | 1 instance | Everything |
+| Protocol | RESP | RESP (compatible) | RESP (compatible) |
+
+- **20-40% faster than Redis** on pipelined workloads with equal resources (4 cores, `redis-benchmark`, median of 30 runs)
+- **Beats Dragonfly** at 4 cores (+16% to +201%) -- shared-nothing routing overhead loses to striped locks at moderate core counts
 - **22x faster shortest path than Memgraph** via bidirectional BFS + CSR adjacency
-- **Wins all 5 graph operations** vs Memgraph (add, traverse, path, neighbors)
-- **Redis-compatible** -- works with every Redis client library
+- **Redis-compatible** -- works with `redis-cli`, redis-py, Jedis, go-redis, ioredis, any Redis client
+- **Built-in graph engine** -- TRAVERSE, PATH, NEIGHBORS on the same data store
 - **Zero dependencies** -- pure Zig standard library, single binary
-- **Production features** -- TLS, transactions, pub/sub, LRU eviction, background saves, config files, structured logging, clustering with automatic failover
+- **Production features** -- TLS, MULTI/EXEC, pub/sub, WATCH, LRU eviction, BGSAVE, clustering with automatic failover
 
 ## Documentation
 
