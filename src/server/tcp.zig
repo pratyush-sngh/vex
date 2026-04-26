@@ -993,6 +993,7 @@ pub const Server = struct {
         // Create ConcurrentKV and import existing data from the plain KVStore.
         const ConcurrentKV = @import("../engine/concurrent_kv.zig").ConcurrentKV;
         var ckv = ConcurrentKV.init(self.allocator, self.io);
+        ckv.initStripes(); // Must init AFTER ckv is at its final stack address (pthread_rwlock can't be moved)
         defer ckv.deinit();
         try ckv.importFrom(self.kv);
 

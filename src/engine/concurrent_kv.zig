@@ -43,11 +43,20 @@ pub const ConcurrentKV = struct {
             .io = io,
         };
         for (&self.stripes) |*s| {
-            s.* = .{
-                .map = std.StringHashMap(Entry).init(allocator),
-            };
+            s.map = std.StringHashMap(Entry).init(allocator);
+            // Zero-init rwlock — works on Linux. macOS needs initStripes() after placement.
         }
         return self;
+    }
+
+    /// Initialize rwlocks using pthread_rwlock_init(). Must be called AFTER the
+    /// ConcurrentKV is at its final memory address for macOS compatibility.
+    /// On Linux, zeroed rwlocks are valid so this is optional but harmless.
+    pub fn initStripes(self: *ConcurrentKV) void {
+        const init_fn = @extern(*const fn (*std.c.pthread_rwlock_t, ?*const anyopaque) callconv(.c) c_int, .{ .name = "pthread_rwlock_init" });
+        for (&self.stripes) |*s| {
+            _ = init_fn(&s.rwlock, null);
+        }
     }
 
     pub fn deinit(self: *ConcurrentKV) void {
@@ -398,6 +407,7 @@ fn globMatch(pattern: []const u8, string: []const u8) bool {
 
 test "concurrent_kv basic set/get" {
     var store = ConcurrentKV.init(std.testing.allocator, std.testing.io);
+    store.initStripes();
     defer store.deinit();
 
     try store.set("name", "vex");
@@ -408,6 +418,7 @@ test "concurrent_kv basic set/get" {
 
 test "concurrent_kv delete" {
     var store = ConcurrentKV.init(std.testing.allocator, std.testing.io);
+    store.initStripes();
     defer store.deinit();
 
     try store.set("key1", "val1");
@@ -418,6 +429,7 @@ test "concurrent_kv delete" {
 
 test "concurrent_kv overwrite" {
     var store = ConcurrentKV.init(std.testing.allocator, std.testing.io);
+    store.initStripes();
     defer store.deinit();
 
     try store.set("k", "v1");
@@ -429,6 +441,7 @@ test "concurrent_kv overwrite" {
 
 test "concurrent_kv exists" {
     var store = ConcurrentKV.init(std.testing.allocator, std.testing.io);
+    store.initStripes();
     defer store.deinit();
 
     try store.set("present", "yes");
@@ -438,6 +451,7 @@ test "concurrent_kv exists" {
 
 test "concurrent_kv flushdb and dbsize" {
     var store = ConcurrentKV.init(std.testing.allocator, std.testing.io);
+    store.initStripes();
     defer store.deinit();
 
     try store.set("a", "1");
@@ -453,6 +467,7 @@ test "concurrent_kv multi-thread stress" {
     // external rwlock synchronization. Passes in ReleaseFast.
     if (@import("builtin").mode == .Debug) return error.SkipZigTest;
     var store = ConcurrentKV.init(std.testing.allocator, std.testing.io);
+    store.initStripes();
     defer store.deinit();
 
     const num_threads = 8;
