@@ -235,6 +235,46 @@ func main() {
 			return clients[worker%len(clients)].cmd("HDEL", fmt.Sprintf("h:%d", i%100), fmt.Sprintf("f:%d", i))
 		})
 
+		// ── Set benchmarks ──
+		if err := clients[0].cmd("FLUSHDB"); err != nil {
+			fmt.Printf("flushdb failed: %v\n\n", err)
+			continue
+		}
+
+		printBench("SADD", cfg, func(i int, worker int) error {
+			return clients[worker%len(clients)].cmd("SADD", fmt.Sprintf("set:%d", i%100), fmt.Sprintf("m:%d", i))
+		})
+
+		printBench("SISMEMBER", cfg, func(i int, worker int) error {
+			return clients[worker%len(clients)].cmd("SISMEMBER", fmt.Sprintf("set:%d", i%100), fmt.Sprintf("m:%d", i%cfg.n))
+		})
+
+		printBench("SCARD", cfg, func(i int, worker int) error {
+			return clients[worker%len(clients)].cmd("SCARD", fmt.Sprintf("set:%d", i%100))
+		})
+
+		// ── Sorted Set benchmarks ──
+		if err := clients[0].cmd("FLUSHDB"); err != nil {
+			fmt.Printf("flushdb failed: %v\n\n", err)
+			continue
+		}
+
+		printBench("ZADD", cfg, func(i int, worker int) error {
+			return clients[worker%len(clients)].cmd("ZADD", fmt.Sprintf("zs:%d", i%100), fmt.Sprintf("%d", i), fmt.Sprintf("m:%d", i))
+		})
+
+		printBench("ZSCORE", cfg, func(i int, worker int) error {
+			return clients[worker%len(clients)].cmd("ZSCORE", fmt.Sprintf("zs:%d", i%100), fmt.Sprintf("m:%d", i%cfg.n))
+		})
+
+		printBench("ZRANGE(0,9)", cfg, func(i int, worker int) error {
+			return clients[worker%len(clients)].cmd("ZRANGE", fmt.Sprintf("zs:%d", i%100), "0", "9")
+		})
+
+		printBench("ZCARD", cfg, func(i int, worker int) error {
+			return clients[worker%len(clients)].cmd("ZCARD", fmt.Sprintf("zs:%d", i%100))
+		})
+
 		// Pipeline benchmarks (if -pipeline > 0)
 		if *pipeline > 0 {
 			pipeSize := *pipeline
@@ -303,6 +343,22 @@ func main() {
 				batch := make([][]string, 0, pipeSize)
 				for j := 0; j < pipeSize; j++ {
 					batch = append(batch, []string{"HSET", fmt.Sprintf("ph:%d", (i*pipeSize+j)%1000), fmt.Sprintf("f:%d", j), fmt.Sprintf("v:%d", j)})
+				}
+				return clients[worker%len(clients)].cmdPipeline(batch)
+			})
+
+			printBench(fmt.Sprintf("PIPE-SADD(%d)", pipeSize), cfg, func(i int, worker int) error {
+				batch := make([][]string, 0, pipeSize)
+				for j := 0; j < pipeSize; j++ {
+					batch = append(batch, []string{"SADD", fmt.Sprintf("ps:%d", (i*pipeSize+j)%1000), fmt.Sprintf("m:%d", j)})
+				}
+				return clients[worker%len(clients)].cmdPipeline(batch)
+			})
+
+			printBench(fmt.Sprintf("PIPE-ZADD(%d)", pipeSize), cfg, func(i int, worker int) error {
+				batch := make([][]string, 0, pipeSize)
+				for j := 0; j < pipeSize; j++ {
+					batch = append(batch, []string{"ZADD", fmt.Sprintf("pz:%d", (i*pipeSize+j)%1000), fmt.Sprintf("%d", j), fmt.Sprintf("m:%d", j)})
 				}
 				return clients[worker%len(clients)].cmdPipeline(batch)
 			})

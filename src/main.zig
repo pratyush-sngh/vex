@@ -705,4 +705,6 @@ test {
     _ = @import("cluster/replication.zig");
     _ = @import("engine/list.zig");
     _ = @import("engine/hash.zig");
+    _ = @import("engine/set.zig");
+    _ = @import("engine/sorted_set.zig");
 }

@@ -1004,6 +1004,12 @@ pub const Server = struct {
         defer list_store.deinit();
         var hash_store = HS.init(self.allocator);
         defer hash_store.deinit();
+        const SS = @import("../engine/set.zig").SetStore;
+        const ZS = @import("../engine/sorted_set.zig").SortedSetStore;
+        var set_store = SS.init(self.allocator);
+        defer set_store.deinit();
+        var sorted_set_store = ZS.init(self.allocator);
+        defer sorted_set_store.deinit();
         var watch_map = WM.init(self.allocator);
         defer watch_map.deinit();
 
@@ -1033,6 +1039,8 @@ pub const Server = struct {
                 &pubsub,
                 &list_store,
                 &hash_store,
+                &set_store,
+                &sorted_set_store,
                 &watch_map,
             );
         }

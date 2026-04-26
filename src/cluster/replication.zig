@@ -713,6 +713,13 @@ pub fn isWriteCommand(args: []const []const u8) bool {
     if (std.mem.eql(u8, upper, "HDEL")) return true;
     if (std.mem.eql(u8, upper, "HMSET")) return true;
     if (std.mem.eql(u8, upper, "HINCRBY")) return true;
+    // Set write commands
+    if (std.mem.eql(u8, upper, "SADD")) return true;
+    if (std.mem.eql(u8, upper, "SREM")) return true;
+    // Sorted set write commands
+    if (std.mem.eql(u8, upper, "ZADD")) return true;
+    if (std.mem.eql(u8, upper, "ZREM")) return true;
+    if (std.mem.eql(u8, upper, "ZINCRBY")) return true;
     // Graph write commands
     if (upper.len >= 12 and std.mem.eql(u8, upper[0..6], "GRAPH.")) {
         if (std.mem.eql(u8, upper[6..], "ADDNODE")) return true;

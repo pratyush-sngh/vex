@@ -16,6 +16,8 @@ const TlsContext = @import("tls.zig").TlsContext;
 const SSL = @import("tls.zig").SSL;
 const ListStore = @import("../engine/list.zig").ListStore;
 const HashStore = @import("../engine/hash.zig").HashStore;
+const SetStore = @import("../engine/set.zig").SetStore;
+const SortedSetStore = @import("../engine/sorted_set.zig").SortedSetStore;
 
 const READ_BUF_SIZE = 64 * 1024;
 const MAX_NEW_FDS = 256;
@@ -282,6 +284,8 @@ pub const Worker = struct {
     pubsub: ?*PubSubRegistry,
     list_store: ?*ListStore,
     hash_store: ?*HashStore,
+    set_store: ?*SetStore,
+    sorted_set_store: ?*SortedSetStore,
     watch_map: ?*WatchMap,
     new_fds: [MAX_NEW_FDS]i32,
     new_fd_head: std.atomic.Value(usize),
@@ -309,6 +313,8 @@ pub const Worker = struct {
         pubsub: ?*PubSubRegistry,
         list_store: ?*ListStore,
         hash_store: ?*HashStore,
+        set_store: ?*SetStore,
+        sorted_set_store: ?*SortedSetStore,
         watch_map: ?*WatchMap,
     ) !Worker {
         return .{
@@ -335,6 +341,8 @@ pub const Worker = struct {
             .pubsub = pubsub,
             .list_store = list_store,
             .hash_store = hash_store,
+            .set_store = set_store,
+            .sorted_set_store = sorted_set_store,
             .watch_map = watch_map,
             .new_fds = [_]i32{-1} ** MAX_NEW_FDS,
             .new_fd_head = std.atomic.Value(usize).init(0),
@@ -1464,6 +1472,8 @@ pub const Worker = struct {
         );
         handler.list_store = self.list_store;
         handler.hash_store = self.hash_store;
+        handler.set_store = self.set_store;
+        handler.sorted_set_store = self.sorted_set_store;
 
         var list: std.ArrayList(u8) = .empty;
         defer list.deinit(self.allocator);

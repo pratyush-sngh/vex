@@ -10,6 +10,8 @@ const aof_mod = @import("../storage/aof.zig");
 const AOF = aof_mod.AOF;
 const ListStore = @import("../engine/list.zig").ListStore;
 const HashStore = @import("../engine/hash.zig").HashStore;
+const SetStore = @import("../engine/set.zig").SetStore;
+const SortedSetStore = @import("../engine/sorted_set.zig").SortedSetStore;
 const MAX_DATABASES: u8 = 16;
 const KEYS_MAX_REPLY: usize = 1000;
 const SCAN_DEFAULT_COUNT: usize = 10;
@@ -35,6 +37,8 @@ pub const CommandHandler = struct {
     graph_rwlock: ?*std.c.pthread_rwlock_t,
     list_store: ?*ListStore,
     hash_store: ?*HashStore,
+    set_store: ?*SetStore,
+    sorted_set_store: ?*SortedSetStore,
 
     pub fn init(
         allocator: Allocator,
@@ -56,6 +60,8 @@ pub const CommandHandler = struct {
             .graph_rwlock = null,
             .list_store = null,
             .hash_store = null,
+            .set_store = null,
+            .sorted_set_store = null,
         };
     }
 
@@ -94,6 +100,8 @@ pub const CommandHandler = struct {
                 'S' => {
                     if (std.mem.eql(u8, cmd, "SCAN")) return self.cmdScan(args, w);
                     if (std.mem.eql(u8, cmd, "SAVE")) return self.cmdSave(w);
+                    if (std.mem.eql(u8, cmd, "SADD")) return self.cmdSadd(args, w);
+                    if (std.mem.eql(u8, cmd, "SREM")) return self.cmdSrem(args, w);
                 },
                 'I' => {
                     if (std.mem.eql(u8, cmd, "INFO")) return self.cmdInfo(w);
@@ -116,12 +124,18 @@ pub const CommandHandler = struct {
                     if (std.mem.eql(u8, cmd, "LPOP")) return self.cmdLpop(args, w);
                 },
                 'R' => if (std.mem.eql(u8, cmd, "RPOP")) return self.cmdRpop(args, w),
+                'Z' => {
+                    if (std.mem.eql(u8, cmd, "ZADD")) return self.cmdZadd(args, w);
+                    if (std.mem.eql(u8, cmd, "ZREM")) return self.cmdZrem(args, w);
+                },
                 else => {},
             },
             5 => switch (first) {
                 'S' => {
                     if (std.mem.eql(u8, cmd, "SETNX")) return self.cmdSetNx(args, w);
                     if (std.mem.eql(u8, cmd, "SETEX")) return self.cmdSetEx(args, w);
+                    if (std.mem.eql(u8, cmd, "SCARD")) return self.cmdScard(args, w);
+                    if (std.mem.eql(u8, cmd, "SDIFF")) return self.cmdSdiff(args, w);
                 },
                 'G' => if (std.mem.eql(u8, cmd, "GETEX")) return self.cmdGetEx(args, w),
                 'L' => if (std.mem.eql(u8, cmd, "LPUSH")) return self.cmdLpush(args, w),
@@ -131,6 +145,10 @@ pub const CommandHandler = struct {
                     if (std.mem.eql(u8, cmd, "HMGET")) return self.cmdHmget(args, w);
                     if (std.mem.eql(u8, cmd, "HKEYS")) return self.cmdHkeys(args, w);
                     if (std.mem.eql(u8, cmd, "HVALS")) return self.cmdHvals(args, w);
+                },
+                'Z' => {
+                    if (std.mem.eql(u8, cmd, "ZCARD")) return self.cmdZcard(args, w);
+                    if (std.mem.eql(u8, cmd, "ZRANK")) return self.cmdZrank(args, w);
                 },
                 else => {},
             },
@@ -146,6 +164,8 @@ pub const CommandHandler = struct {
                 'S' => {
                     if (std.mem.eql(u8, cmd, "SELECT")) return self.cmdSelect(args, w);
                     if (std.mem.eql(u8, cmd, "STRLEN")) return self.cmdStrlen(args, w);
+                    if (std.mem.eql(u8, cmd, "SINTER")) return self.cmdSinter(args, w);
+                    if (std.mem.eql(u8, cmd, "SUNION")) return self.cmdSunion(args, w);
                 },
                 'I' => if (std.mem.eql(u8, cmd, "INCRBY")) return self.cmdIncrBy(args, w),
                 'A' => if (std.mem.eql(u8, cmd, "APPEND")) return self.cmdAppend(args, w),
@@ -158,6 +178,11 @@ pub const CommandHandler = struct {
                 'L' => {
                     if (std.mem.eql(u8, cmd, "LRANGE")) return self.cmdLrange(args, w);
                     if (std.mem.eql(u8, cmd, "LINDEX")) return self.cmdLindex(args, w);
+                },
+                'Z' => {
+                    if (std.mem.eql(u8, cmd, "ZSCORE")) return self.cmdZscore(args, w);
+                    if (std.mem.eql(u8, cmd, "ZRANGE")) return self.cmdZrange(args, w);
+                    if (std.mem.eql(u8, cmd, "ZCOUNT")) return self.cmdZcount(args, w);
                 },
                 else => {},
             },
@@ -173,15 +198,21 @@ pub const CommandHandler = struct {
                     if (std.mem.eql(u8, cmd, "HEXISTS")) return self.cmdHexists(args, w);
                     if (std.mem.eql(u8, cmd, "HINCRBY")) return self.cmdHincrby(args, w);
                 },
+                'Z' => if (std.mem.eql(u8, cmd, "ZINCRBY")) return self.cmdZincrby(args, w),
                 else => {},
             },
             8 => switch (first) {
+                'S' => if (std.mem.eql(u8, cmd, "SMEMBERS")) return self.cmdSmembers(args, w),
                 'F' => if (std.mem.eql(u8, cmd, "FLUSHALL")) return self.cmdFlushall(args, w),
                 'L' => if (std.mem.eql(u8, cmd, "LASTSAVE")) return self.cmdLastSave(w),
                 'R' => if (std.mem.eql(u8, cmd, "RENAMENX")) return self.cmdRenameNx(args, w),
                 else => {},
             },
-            9 => if (first == 'R' and std.mem.eql(u8, cmd, "RANDOMKEY")) return self.cmdRandomKey(w),
+            9 => switch (first) {
+                'R' => if (std.mem.eql(u8, cmd, "RANDOMKEY")) return self.cmdRandomKey(w),
+                'S' => if (std.mem.eql(u8, cmd, "SISMEMBER")) return self.cmdSismember(args, w),
+                else => {},
+            },
             12 => if (first == 'B' and std.mem.eql(u8, cmd, "BGREWRITEAOF")) return self.cmdBgRewriteAof(w),
             else => {},
         }
@@ -1402,6 +1433,225 @@ pub const CommandHandler = struct {
         };
         self.logToAOF(args);
         try resp.serializeInteger(w, result);
+    }
+
+    // ── Set Commands ───────────────────────────────────────────────────
+
+    fn getSetStore(self: *CommandHandler) *SetStore {
+        return self.set_store orelse @panic("set_store not initialized");
+    }
+
+    fn cmdSadd(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 3) { try resp.serializeError(w, "wrong number of arguments for 'SADD'"); return; }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeError(w, "internal error"); return; };
+        defer key_ref.deinit(self.allocator);
+        const added = self.getSetStore().sadd(key_ref.key, args[2..]) catch { try resp.serializeError(w, "internal error"); return; };
+        self.logToAOF(args);
+        try resp.serializeInteger(w, @intCast(added));
+    }
+
+    fn cmdSrem(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 3) { try resp.serializeError(w, "wrong number of arguments for 'SREM'"); return; }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeInteger(w, 0); return; };
+        defer key_ref.deinit(self.allocator);
+        const removed = self.getSetStore().srem(key_ref.key, args[2..]);
+        if (removed > 0) self.logToAOF(args);
+        try resp.serializeInteger(w, @intCast(removed));
+    }
+
+    fn cmdSismember(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 3) { try resp.serializeError(w, "wrong number of arguments for 'SISMEMBER'"); return; }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeInteger(w, 0); return; };
+        defer key_ref.deinit(self.allocator);
+        try resp.serializeInteger(w, if (self.getSetStore().sismember(key_ref.key, args[2])) @as(i64, 1) else 0);
+    }
+
+    fn cmdScard(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 2) { try resp.serializeError(w, "wrong number of arguments for 'SCARD'"); return; }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeInteger(w, 0); return; };
+        defer key_ref.deinit(self.allocator);
+        try resp.serializeInteger(w, @intCast(self.getSetStore().scard(key_ref.key)));
+    }
+
+    fn cmdSmembers(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 2) { try resp.serializeError(w, "wrong number of arguments for 'SMEMBERS'"); return; }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeArrayHeader(w, 0); return; };
+        defer key_ref.deinit(self.allocator);
+        const members = self.getSetStore().smembers(key_ref.key, self.allocator) catch { try resp.serializeArrayHeader(w, 0); return; };
+        defer if (members.len > 0) self.allocator.free(members);
+        try resp.serializeArrayHeader(w, members.len);
+        for (members) |m| try resp.serializeBulkString(w, m);
+    }
+
+    fn cmdSunion(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 2) { try resp.serializeError(w, "wrong number of arguments for 'SUNION'"); return; }
+        // Namespace all keys
+        var ns_keys = std.array_list.Managed([]const u8).init(self.allocator);
+        defer {
+            for (ns_keys.items) |k| self.allocator.free(@constCast(k));
+            ns_keys.deinit();
+        }
+        for (args[1..]) |user_key| {
+            const nk = namespacedKey(self, user_key) catch continue;
+            ns_keys.append(nk) catch { self.allocator.free(nk); };
+        }
+        const result = self.getSetStore().sunion(ns_keys.items, self.allocator) catch { try resp.serializeArrayHeader(w, 0); return; };
+        defer if (result.len > 0) self.allocator.free(result);
+        try resp.serializeArrayHeader(w, result.len);
+        for (result) |m| try resp.serializeBulkString(w, m);
+    }
+
+    fn cmdSinter(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 2) { try resp.serializeError(w, "wrong number of arguments for 'SINTER'"); return; }
+        var ns_keys = std.array_list.Managed([]const u8).init(self.allocator);
+        defer {
+            for (ns_keys.items) |k| self.allocator.free(@constCast(k));
+            ns_keys.deinit();
+        }
+        for (args[1..]) |user_key| {
+            const nk = namespacedKey(self, user_key) catch continue;
+            ns_keys.append(nk) catch { self.allocator.free(nk); };
+        }
+        const result = self.getSetStore().sinter(ns_keys.items, self.allocator) catch { try resp.serializeArrayHeader(w, 0); return; };
+        defer if (result.len > 0) self.allocator.free(result);
+        try resp.serializeArrayHeader(w, result.len);
+        for (result) |m| try resp.serializeBulkString(w, m);
+    }
+
+    fn cmdSdiff(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 2) { try resp.serializeError(w, "wrong number of arguments for 'SDIFF'"); return; }
+        var ns_keys = std.array_list.Managed([]const u8).init(self.allocator);
+        defer {
+            for (ns_keys.items) |k| self.allocator.free(@constCast(k));
+            ns_keys.deinit();
+        }
+        for (args[1..]) |user_key| {
+            const nk = namespacedKey(self, user_key) catch continue;
+            ns_keys.append(nk) catch { self.allocator.free(nk); };
+        }
+        const result = self.getSetStore().sdiff(ns_keys.items, self.allocator) catch { try resp.serializeArrayHeader(w, 0); return; };
+        defer if (result.len > 0) self.allocator.free(result);
+        try resp.serializeArrayHeader(w, result.len);
+        for (result) |m| try resp.serializeBulkString(w, m);
+    }
+
+    // ── Sorted Set Commands ──────────────────────────────────────────
+
+    fn getSortedSetStore(self: *CommandHandler) *SortedSetStore {
+        return self.sorted_set_store orelse @panic("sorted_set_store not initialized");
+    }
+
+    fn cmdZadd(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 4 or (args.len - 2) % 2 != 0) { try resp.serializeError(w, "wrong number of arguments for 'ZADD'"); return; }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeError(w, "internal error"); return; };
+        defer key_ref.deinit(self.allocator);
+        const added = self.getSortedSetStore().zadd(key_ref.key, args[2..]) catch { try resp.serializeError(w, "internal error"); return; };
+        self.logToAOF(args);
+        try resp.serializeInteger(w, @intCast(added));
+    }
+
+    fn cmdZrem(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 3) { try resp.serializeError(w, "wrong number of arguments for 'ZREM'"); return; }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeInteger(w, 0); return; };
+        defer key_ref.deinit(self.allocator);
+        const removed = self.getSortedSetStore().zrem(key_ref.key, args[2..]);
+        if (removed > 0) self.logToAOF(args);
+        try resp.serializeInteger(w, @intCast(removed));
+    }
+
+    fn cmdZscore(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 3) { try resp.serializeError(w, "wrong number of arguments for 'ZSCORE'"); return; }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeBulkString(w, null); return; };
+        defer key_ref.deinit(self.allocator);
+        if (self.getSortedSetStore().zscore(key_ref.key, args[2])) |score| {
+            var buf: [32]u8 = undefined;
+            const s = std.fmt.bufPrint(&buf, "{d:.6}", .{score}) catch { try resp.serializeBulkString(w, null); return; };
+            try resp.serializeBulkString(w, s);
+        } else {
+            try resp.serializeBulkString(w, null);
+        }
+    }
+
+    fn cmdZcard(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 2) { try resp.serializeError(w, "wrong number of arguments for 'ZCARD'"); return; }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeInteger(w, 0); return; };
+        defer key_ref.deinit(self.allocator);
+        try resp.serializeInteger(w, @intCast(self.getSortedSetStore().zcard(key_ref.key)));
+    }
+
+    fn cmdZrank(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 3) { try resp.serializeError(w, "wrong number of arguments for 'ZRANK'"); return; }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeBulkString(w, null); return; };
+        defer key_ref.deinit(self.allocator);
+        const rank = self.getSortedSetStore().zrank(key_ref.key, args[2], self.allocator) catch { try resp.serializeBulkString(w, null); return; };
+        if (rank) |r| {
+            try resp.serializeInteger(w, @intCast(r));
+        } else {
+            try resp.serializeBulkString(w, null);
+        }
+    }
+
+    fn cmdZrange(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 4) { try resp.serializeError(w, "wrong number of arguments for 'ZRANGE'"); return; }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeArrayHeader(w, 0); return; };
+        defer key_ref.deinit(self.allocator);
+        const start = std.fmt.parseInt(i64, args[2], 10) catch { try resp.serializeError(w, "value is not an integer"); return; };
+        const stop = std.fmt.parseInt(i64, args[3], 10) catch { try resp.serializeError(w, "value is not an integer"); return; };
+        // Check for WITHSCORES flag
+        var with_scores = false;
+        if (args.len >= 5) {
+            var flag_buf: [64]u8 = undefined;
+            const flag = toUpper(args[4], &flag_buf);
+            if (std.mem.eql(u8, flag, "WITHSCORES")) with_scores = true;
+        }
+        const entries = self.getSortedSetStore().zrange(key_ref.key, start, stop, self.allocator) catch { try resp.serializeArrayHeader(w, 0); return; };
+        defer if (entries.len > 0) self.allocator.free(entries);
+        if (with_scores) {
+            try resp.serializeArrayHeader(w, entries.len * 2);
+            for (entries) |e| {
+                try resp.serializeBulkString(w, e.member);
+                var buf: [32]u8 = undefined;
+                const s = std.fmt.bufPrint(&buf, "{d:.6}", .{e.score}) catch "0";
+                try resp.serializeBulkString(w, s);
+            }
+        } else {
+            try resp.serializeArrayHeader(w, entries.len);
+            for (entries) |e| try resp.serializeBulkString(w, e.member);
+        }
+    }
+
+    fn cmdZincrby(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 4) { try resp.serializeError(w, "wrong number of arguments for 'ZINCRBY'"); return; }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeError(w, "internal error"); return; };
+        defer key_ref.deinit(self.allocator);
+        const delta = std.fmt.parseFloat(f64, args[2]) catch { try resp.serializeError(w, "value is not a valid float"); return; };
+        const new_score = self.getSortedSetStore().zincrby(key_ref.key, delta, args[3]) catch { try resp.serializeError(w, "internal error"); return; };
+        self.logToAOF(args);
+        var buf: [32]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, "{d:.6}", .{new_score}) catch "0";
+        try resp.serializeBulkString(w, s);
+    }
+
+    fn cmdZcount(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 4) { try resp.serializeError(w, "wrong number of arguments for 'ZCOUNT'"); return; }
+        var key_buf: [512]u8 = undefined;
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeInteger(w, 0); return; };
+        defer key_ref.deinit(self.allocator);
+        const min = std.fmt.parseFloat(f64, args[2]) catch { try resp.serializeError(w, "min is not a float"); return; };
+        const max = std.fmt.parseFloat(f64, args[3]) catch { try resp.serializeError(w, "max is not a float"); return; };
+        try resp.serializeInteger(w, @intCast(self.getSortedSetStore().zcount(key_ref.key, min, max)));
     }
 
     /// RANDOMKEY — return a random key from the current DB
