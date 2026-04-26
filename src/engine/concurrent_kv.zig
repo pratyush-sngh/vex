@@ -282,6 +282,63 @@ pub const ConcurrentKV = struct {
         return result.toOwnedSlice();
     }
 
+    /// Atomic INCR/DECR: parse, add, format under ONE write lock.
+    /// Returns the new value, or error if not an integer.
+    pub fn incrBy(self: *ConcurrentKV, key: []const u8, delta: i64) error{ NotAnInteger, OutOfMemory }!i64 {
+        const s = self.getStripe(key);
+        writeLockStripe(s);
+
+        const result = s.map.getPtr(key);
+        var current: i64 = 0;
+        if (result) |existing| {
+            if (self.isExpired(existing)) {
+                // Treat expired as 0
+                current = 0;
+            } else {
+                current = std.fmt.parseInt(i64, existing.value, 10) catch {
+                    writeUnlockStripe(s);
+                    return error.NotAnInteger;
+                };
+            }
+        }
+
+        const new_val = current + delta;
+        var val_buf: [32]u8 = undefined;
+        const val_str = std.fmt.bufPrint(&val_buf, "{d}", .{new_val}) catch {
+            writeUnlockStripe(s);
+            return error.OutOfMemory;
+        };
+        const owned_value = self.allocator.dupe(u8, val_str) catch {
+            writeUnlockStripe(s);
+            return error.OutOfMemory;
+        };
+
+        if (result) |existing| {
+            self.allocator.free(existing.value);
+            existing.value = owned_value;
+            existing.last_access = self.cached_now_ms;
+            existing.flags = .{};
+        } else {
+            const owned_key = self.allocator.dupe(u8, key) catch {
+                self.allocator.free(owned_value);
+                writeUnlockStripe(s);
+                return error.OutOfMemory;
+            };
+            s.map.put(owned_key, .{
+                .value = owned_value,
+                .last_access = self.cached_now_ms,
+            }) catch {
+                self.allocator.free(owned_key);
+                self.allocator.free(owned_value);
+                writeUnlockStripe(s);
+                return error.OutOfMemory;
+            };
+        }
+
+        writeUnlockStripe(s);
+        return new_val;
+    }
+
     // ── Internal helpers ──
 
     fn setInternal(self: *ConcurrentKV, key: []const u8, value: []const u8, expires_at: i64) !void {

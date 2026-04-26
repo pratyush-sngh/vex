@@ -1440,6 +1440,21 @@ pub const Worker = struct {
                     if (args.len > 1) writeBulkTo(&conn.write_buf, args[1]) else conn.write_buf.appendSlice(ct.resp_pong) catch {};
                     return true;
                 },
+                'I' => if (args.len >= 2 and equalsAsciiUpper(cmd, "INCR")) {
+                    const ns_key = nsKey(conn.selected_db, args[1]) orelse return false;
+                    const new_val = ckv.incrBy(ns_key, 1) catch |err| {
+                        if (err == error.NotAnInteger) {
+                            conn.write_buf.appendSlice("-ERR value is not an integer or out of range\r\n") catch {};
+                        } else {
+                            conn.write_buf.appendSlice("-ERR internal error\r\n") catch {};
+                        }
+                        return true;
+                    };
+                    if (self.aof) |a| a.logCommand(args);
+                    self.bumpWatchVersion(conn.selected_db, args[1]);
+                    writeIntTo(&conn.write_buf, new_val);
+                    return true;
+                },
                 'H' => {
                     if (args.len >= 4 and equalsAsciiUpper(cmd, "HSET")) {
                         if (self.hash_store) |hs| {
