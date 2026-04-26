@@ -4,7 +4,7 @@ A high-performance KV + Graph database written in Zig 0.16. Speaks the Redis pro
 
 ## Why Vex?
 
-- **Up to 2x faster than Redis** on pipelined KV workloads with equal resources (3.08M EXISTS cmd/s)
+- **Up to 66% faster than Redis** on pipelined workloads with equal resources (`redis-benchmark`: 1.75M GET rps vs 1.05M)
 - **22x faster shortest path than Memgraph** via bidirectional BFS + CSR adjacency
 - **Wins all 5 graph operations** vs Memgraph (add, traverse, path, neighbors)
 - **Redis-compatible** -- works with every Redis client library
@@ -67,22 +67,20 @@ Workers auto-detect from CPU core count (capped at 8). See [Configuration](docs/
 
 ## Benchmarks
 
-All benchmarks run in Docker with **equal, isolated resources**: 4 CPU cores + 4GB RAM per container, CPU-pinned (`cpuset`) to prevent cross-container interference. Vex capped at 4 reactor workers. Median of 5 runs, 1000 warmup ops discarded. See [Benchmarks](docs/benchmarks.md) for full methodology.
+Benchmarked with **`redis-benchmark`** (industry standard). Docker containers with **equal, isolated resources**: 4 CPU cores + 4GB RAM each, CPU-pinned (`cpuset`). See [Benchmarks](docs/benchmarks.md) for full methodology and internal engine numbers.
 
-### KV: Vex vs Redis 8.0 (pipelined, c=16)
+### KV: Vex vs Redis 8.0 (`redis-benchmark`, pipelined P=50, c=16)
 
 | Command | Redis | Vex | Speedup |
 |---|---|---|---|
-| PIPE-GET(100) | 2.34M cmd/s | **3.00M cmd/s** | **+28%** |
-| PIPE-EXISTS(100) | 2.41M cmd/s | **3.04M cmd/s** | **+26%** |
-| PIPE-DEL(100) | 2.05M cmd/s | **2.71M cmd/s** | **+32%** |
-| PIPE-RPUSH(100) | 2.03M cmd/s | **2.41M cmd/s** | **+19%** |
-| PIPE-HSET(100) | 1.99M cmd/s | **2.28M cmd/s** | **+15%** |
-| PIPE-SADD(100) | 2.25M cmd/s | **2.69M cmd/s** | **+19%** |
-| PIPE-ZADD(100) | 1.95M cmd/s | **2.38M cmd/s** | **+22%** |
-| PIPE-INCR(100) | 2.47M cmd/s | **2.60M cmd/s** | **+6%** |
+| GET | 1.05M rps | **1.75M rps** | **+66%** |
+| SET | 1.14M rps | **1.66M rps** | **+45%** |
+| INCR | 1.19M rps | **1.69M rps** | **+42%** |
+| LPOP | 1.80M rps | **2.01M rps** | **+12%** |
+| RPOP | 1.87M rps | **2.08M rps** | **+12%** |
+| HSET | 1.42M rps | **1.54M rps** | **+8%** |
 
-Single-command (28 commands: strings, lists, hashes, sets, sorted sets): tied at ~44K ops/s -- network-bound.
+Single-command (9 commands, no pipeline): tied at ~46K rps -- network-bound.
 
 ### Graph: Vex vs Memgraph (10K nodes / 50K edges)
 

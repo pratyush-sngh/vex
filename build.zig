@@ -73,6 +73,21 @@ pub fn build(b: *std.Build) void {
     const bench_kv_step = b.step("bench-kv", "Benchmark KV engine (SET/GET/DEL)");
     bench_kv_step.dependOn(&run_kv_bench.step);
 
+    // Data structure benchmark (lists, hashes, sets, sorted sets)
+    const ds_bench = b.addExecutable(.{
+        .name = "ds_bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/engine/ds_bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    const run_ds_bench = b.addRunArtifact(ds_bench);
+    if (b.args) |args| run_ds_bench.addArgs(args);
+    const bench_ds_step = b.step("bench-ds", "Benchmark data structures (list/hash/set/zset)");
+    bench_ds_step.dependOn(&run_ds_bench.step);
+
     const persistence_bench = b.addExecutable(.{
         .name = "persistence_bench",
         .root_module = b.createModule(.{
