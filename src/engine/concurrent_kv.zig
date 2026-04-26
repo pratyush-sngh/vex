@@ -49,13 +49,17 @@ pub const ConcurrentKV = struct {
         return self;
     }
 
-    /// Initialize rwlocks using pthread_rwlock_init(). Must be called AFTER the
+    /// Initialize rwlocks and pre-allocate stripe capacity. Must be called AFTER the
     /// ConcurrentKV is at its final memory address for macOS compatibility.
-    /// On Linux, zeroed rwlocks are valid so this is optional but harmless.
+    /// Pre-allocation avoids HashMap resize under concurrent writes (which causes crashes
+    /// due to Zig HashMap's non-thread-safe grow path).
     pub fn initStripes(self: *ConcurrentKV) void {
         const init_fn = @extern(*const fn (*std.c.pthread_rwlock_t, ?*const anyopaque) callconv(.c) c_int, .{ .name = "pthread_rwlock_init" });
         for (&self.stripes) |*s| {
             _ = init_fn(&s.rwlock, null);
+            // Pre-allocate 4096 slots per stripe (256 stripes × 4096 = 1M keys before resize).
+            // This prevents HashMap grow during concurrent writes.
+            s.map.ensureTotalCapacity(4096) catch {};
         }
     }
 

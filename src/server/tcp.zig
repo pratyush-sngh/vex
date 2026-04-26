@@ -987,7 +987,11 @@ pub const Server = struct {
         });
         defer net_server.deinit(self.io);
 
-        var graph_rwlock = std.mem.zeroes(std.c.pthread_rwlock_t);
+        var graph_rwlock: std.c.pthread_rwlock_t = undefined;
+        {
+            const init_fn = @extern(*const fn (*std.c.pthread_rwlock_t, ?*const anyopaque) callconv(.c) c_int, .{ .name = "pthread_rwlock_init" });
+            _ = init_fn(&graph_rwlock, null);
+        }
         var kv_mutex = std.atomic.Mutex.unlocked;
 
         // Create ConcurrentKV and import existing data from the plain KVStore.
@@ -1014,7 +1018,11 @@ pub const Server = struct {
         defer set_store.deinit();
         var sorted_set_store = ZS.init(self.allocator);
         defer sorted_set_store.deinit();
-        var ds_rwlock = std.mem.zeroes(std.c.pthread_rwlock_t);
+        var ds_rwlock: std.c.pthread_rwlock_t = undefined;
+        {
+            const init_fn = @extern(*const fn (*std.c.pthread_rwlock_t, ?*const anyopaque) callconv(.c) c_int, .{ .name = "pthread_rwlock_init" });
+            _ = init_fn(&ds_rwlock, null);
+        }
         var watch_map = WM.init(self.allocator);
         defer watch_map.deinit();
 
