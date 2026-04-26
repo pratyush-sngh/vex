@@ -38,7 +38,9 @@ pub const KVStore = struct {
 
     /// Inline buffer size for small values. Values ≤ this are stored in-place
     /// (no heap allocation, enables lock-free GET via SeqLock).
-    pub const INLINE_BUF_SIZE = 128;
+    /// 32 bytes covers redis-benchmark default (3 bytes) + most real-world keys.
+    /// Kept small to minimize Entry size for cache efficiency.
+    pub const INLINE_BUF_SIZE = 32;
 
     pub const Entry = struct {
         value: []const u8, // heap-allocated for large values, points into inline_buf for small
