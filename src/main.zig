@@ -339,6 +339,7 @@ pub fn main(init: std.process.Init) !void {
         if (tls_ctx) |*t| t else null,
         if (repl_follower) |*rf| rf else null,
         if (repl_leader) |*rl| rl else null,
+        config.unixsocket,
     );
     if (config.reactor) {
         server.runReactor(config.workers, &shutdown_requested) catch |err| {
@@ -373,6 +374,7 @@ const Config = struct {
     scale_mode: ScaleMode,
     engine_threads: usize,
     cluster_config: ?[]const u8,
+    unixsocket: ?[]const u8,
     no_persistence: bool,
     reactor: bool,
     workers: usize,
@@ -396,6 +398,7 @@ fn parseArgs(init: std.process.Init) Config {
     var scale_mode: ScaleMode = .scaled;
     var engine_threads: usize = 1;
     var cluster_config: ?[]const u8 = null;
+    var unixsocket: ?[]const u8 = null;
     var no_persistence = false;
     var reactor = false;
     var workers: usize = @min(std.Thread.getCpuCount() catch 4, 8);
@@ -496,6 +499,10 @@ fn parseArgs(init: std.process.Init) Config {
             if (it.next()) |p| {
                 cluster_config = std.mem.sliceTo(p, 0);
             }
+        } else if (std.mem.eql(u8, arg, "--unixsocket")) {
+            if (it.next()) |p| {
+                unixsocket = std.mem.sliceTo(p, 0);
+            }
         } else if (std.mem.eql(u8, arg, "--no-persistence")) {
             no_persistence = true;
         } else if (std.mem.eql(u8, arg, "--reactor")) {
@@ -557,6 +564,7 @@ fn parseArgs(init: std.process.Init) Config {
         .scale_mode = scale_mode,
         .engine_threads = engine_threads,
         .cluster_config = cluster_config,
+        .unixsocket = unixsocket,
         .no_persistence = no_persistence,
         .reactor = reactor,
         .workers = workers,

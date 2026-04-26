@@ -784,6 +784,7 @@ pub const Server = struct {
     tls_ctx: ?*TlsContext,
     repl_follower: ?*@import("../cluster/replication.zig").ReplicationFollower,
     repl_leader: ?*@import("../cluster/replication.zig").ReplicationLeader,
+    unixsocket: ?[]const u8,
     active_connections: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     pub fn init(
@@ -805,6 +806,7 @@ pub const Server = struct {
         tls_ctx: ?*TlsContext,
         repl_follower: ?*@import("../cluster/replication.zig").ReplicationFollower,
         repl_leader: ?*@import("../cluster/replication.zig").ReplicationLeader,
+        unixsocket: ?[]const u8,
     ) !Server {
         const resolved = try std.Io.net.IpAddress.resolve(io, host, port);
         const bind_address: std.Io.net.IpAddress = switch (resolved) {
@@ -833,6 +835,7 @@ pub const Server = struct {
             .tls_ctx = tls_ctx,
             .repl_follower = repl_follower,
             .repl_leader = repl_leader,
+            .unixsocket = unixsocket,
         };
     }
 
@@ -1055,6 +1058,42 @@ pub const Server = struct {
 
         log("listening on :{d} (reactor, workers={d})", .{ self.listen_port, num_workers });
 
+        // Start Unix Domain Socket listener thread (if configured)
+        var uds_thread: ?std.Thread = null;
+        var uds_ctx: ?*UdsAcceptCtx = null;
+        if (self.unixsocket) |sock_path| {
+            const ctx = self.allocator.create(UdsAcceptCtx) catch null;
+            if (ctx) |c| {
+                c.* = .{
+                    .path = sock_path,
+                    .workers = workers,
+                    .num_workers = num_workers,
+                    .shutdown = shutdown,
+                    .next_worker = 0,
+                };
+                uds_ctx = ctx;
+                uds_thread = std.Thread.spawn(.{}, udsAcceptLoop, .{c}) catch null;
+                if (uds_thread != null) {
+                    log("unix socket listening on {s}", .{sock_path});
+                }
+            }
+        }
+        defer {
+            if (uds_thread) |t| {
+                shutdown.store(true, .release);
+                t.join();
+            }
+            if (uds_ctx) |c| self.allocator.destroy(c);
+            // Clean up socket file
+            if (self.unixsocket) |sock_path| {
+                const path_z = self.allocator.dupeZ(u8, sock_path) catch null;
+                if (path_z) |p| {
+                    _ = std.c.unlink(p);
+                    self.allocator.free(p);
+                }
+            }
+        }
+
         var next_worker: usize = 0;
         while (!shutdown.load(.acquire)) {
             const stream = net_server.accept(self.io) catch |err| {
@@ -1077,6 +1116,59 @@ pub const Server = struct {
         }
     }
 };
+
+// ─── Unix Domain Socket accept loop ────────────────────────────────
+
+const UdsAcceptCtx = struct {
+    path: []const u8,
+    workers: []@import("worker.zig").Worker,
+    num_workers: usize,
+    shutdown: *std.atomic.Value(bool),
+    next_worker: usize,
+};
+
+fn udsAcceptLoop(ctx: *UdsAcceptCtx) void {
+    const sock = std.c.socket(std.c.AF.UNIX, std.c.SOCK.STREAM, 0);
+    if (sock < 0) return;
+    defer _ = std.c.close(sock);
+
+    // Build sockaddr_un
+    var addr: std.c.sockaddr.un = std.mem.zeroes(std.c.sockaddr.un);
+    addr.family = std.c.AF.UNIX;
+    const path_len = @min(ctx.path.len, addr.path.len - 1);
+    for (0..path_len) |i| addr.path[i] = @intCast(ctx.path[i]);
+
+    // Remove stale socket file
+    const path_z: [*:0]const u8 = @ptrCast(&addr.path);
+    _ = std.c.unlink(path_z);
+
+    // Bind
+    if (std.c.bind(sock, @ptrCast(&addr), @sizeOf(std.c.sockaddr.un)) < 0) return;
+
+    // chmod 777 so any user can connect
+    const path_z_buf = @as([*:0]const u8, @ptrCast(&addr.path));
+    _ = std.c.chmod(path_z_buf, 0o777);
+
+    if (std.c.listen(sock, 128) < 0) return;
+
+    while (!ctx.shutdown.load(.acquire)) {
+        var pfd = [1]std.c.pollfd{.{ .fd = sock, .events = std.c.POLL.IN, .revents = 0 }};
+        const poll_rc = std.c.poll(&pfd, 1, 500);
+        if (poll_rc <= 0) continue;
+
+        var client_addr: std.c.sockaddr.un = undefined;
+        var addr_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.un);
+        const client_fd = std.c.accept(sock, @ptrCast(&client_addr), &addr_len);
+        if (client_fd < 0) continue;
+
+        // Set non-blocking
+        _ = std.c.fcntl(client_fd, std.c.F.SETFL, @as(c_int, @bitCast(std.c.O{ .NONBLOCK = true })));
+
+        // Round-robin to workers
+        ctx.workers[ctx.next_worker].pushNewFd(client_fd);
+        ctx.next_worker = (ctx.next_worker + 1) % ctx.num_workers;
+    }
+}
 
 const ClientCtx = struct {
     stream: std.Io.net.Stream,
