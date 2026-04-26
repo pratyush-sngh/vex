@@ -4,7 +4,7 @@ A high-performance KV + Graph database written in Zig 0.16. Speaks the Redis pro
 
 ## Why Vex?
 
-- **Up to 66% faster than Redis** on pipelined workloads with equal resources (`redis-benchmark`: 1.75M GET rps vs 1.05M)
+- **Up to 2x faster than Redis** on same-machine workloads (`redis-benchmark` UDS: 6.02M LPOP rps vs 3.07M)
 - **22x faster shortest path than Memgraph** via bidirectional BFS + CSR adjacency
 - **Wins all 5 graph operations** vs Memgraph (add, traverse, path, neighbors)
 - **Redis-compatible** -- works with every Redis client library
@@ -67,20 +67,19 @@ Workers auto-detect from CPU core count (capped at 8). See [Configuration](docs/
 
 ## Benchmarks
 
-Benchmarked with **`redis-benchmark`** (industry standard). Docker containers with **equal, isolated resources**: 4 CPU cores + 4GB RAM each, CPU-pinned (`cpuset`). See [Benchmarks](docs/benchmarks.md) for full methodology and internal engine numbers.
+Benchmarked with **`redis-benchmark`** (industry standard). Docker containers with **equal, isolated resources**: 4 CPU cores + 4GB RAM each, CPU-pinned (`cpuset`). See [Benchmarks](docs/benchmarks.md) for full methodology, UDS results, and internal engine numbers.
 
-### KV: Vex vs Redis 8.0 (`redis-benchmark`, pipelined P=50, c=16)
+### KV: Vex vs Redis 8.0 (`redis-benchmark`, P=50, c=16)
 
-| Command | Redis | Vex | Speedup |
-|---|---|---|---|
-| GET | 1.05M rps | **1.75M rps** | **+66%** |
-| SET | 1.14M rps | **1.66M rps** | **+45%** |
-| INCR | 1.19M rps | **1.69M rps** | **+42%** |
-| LPOP | 1.80M rps | **2.01M rps** | **+12%** |
-| RPOP | 1.87M rps | **2.08M rps** | **+12%** |
-| HSET | 1.42M rps | **1.54M rps** | **+8%** |
+| Command | Redis TCP | Vex TCP | TCP Δ | Redis UDS | Vex UDS | UDS Δ |
+|---|---|---|---|---|---|---|
+| GET | 1.05M | **1.75M** | **+66%** | 4.76M | **5.32M** | **+12%** |
+| SET | 1.14M | **1.66M** | **+45%** | 3.79M | **5.15M** | **+36%** |
+| LPOP | 1.80M | **2.01M** | **+12%** | 3.07M | **6.02M** | **+96%** |
+| HSET | 1.42M | **1.54M** | **+8%** | 3.62M | **5.15M** | **+42%** |
+| SADD | 1.61M | 1.57M | tied | 5.38M | **6.02M** | **+12%** |
 
-Single-command (9 commands, no pipeline): tied at ~46K rps -- network-bound.
+Single-command (no pipeline): tied at ~46K rps -- network-bound. UDS is 3-4x faster than TCP for both.
 
 ### Graph: Vex vs Memgraph (10K nodes / 50K edges)
 
