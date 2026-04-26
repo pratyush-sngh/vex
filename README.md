@@ -239,7 +239,11 @@ Redis-compatible KV + graph DB with multi-reactor architecture.
 - Distributed Dijkstra
 - Consistent hash ring with vnodes
 
-### v0.7 -- Scripting & Advanced
+### v0.7 -- Performance, Scripting & Advanced
+- Custom concurrent hashmap (replace Zig std HashMap for thread-safe resize under concurrent writes)
+- Sorted set skip list (O(log n) ZRANGE/ZRANK instead of O(n log n) sort-per-query)
+- Streams (`XADD`/`XREAD`/`XRANGE`/`XLEN`)
+- Persistence for lists, hashes, sets, sorted sets (snapshot + AOF)
 - Lua scripting (`EVAL`/`EVALSHA`)
 - Graph secondary indexes on properties
 - Cypher query language subset
