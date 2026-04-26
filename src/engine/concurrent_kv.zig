@@ -111,33 +111,50 @@ pub const ConcurrentKV = struct {
 
     /// Zero-allocation GET: holds READ lock, writes RESP bulk string directly to output.
     /// Multiple GETs on the same stripe run in PARALLEL (no blocking).
+    /// Pre-sizes buffer OUTSIDE the lock so most GETs never allocate under lock.
     pub fn getAndWriteBulk(self: *ConcurrentKV, key: []const u8, out: *std.array_list.Managed(u8)) bool {
+        // Optimistic pre-size: ensure room for a typical response before taking the lock.
+        // "$" + up to 6 digits + "\r\n" + up to 256 bytes value + "\r\n" = ~270 bytes.
+        // If the value is larger, ensureTotalCapacity will be called under lock (rare path).
+        out.ensureTotalCapacity(out.items.len + 270) catch {};
+
         const s = self.getStripe(key);
         readLockStripe(s);
-        defer readUnlockStripe(s);
 
         const entry = s.map.getPtr(key) orelse {
+            readUnlockStripe(s);
             out.appendSlice("$-1\r\n") catch {};
             return false;
         };
         if (entry.flags.deleted) {
+            readUnlockStripe(s);
             out.appendSlice("$-1\r\n") catch {};
             return false;
         }
         if (entry.flags.has_ttl and self.cached_now_ms > entry.expires_at) {
-            // Don't evict under read lock — return miss, let next write clean up
+            readUnlockStripe(s);
             out.appendSlice("$-1\r\n") catch {};
             return false;
         }
         // Write RESP bulk string: "$len\r\nvalue\r\n"
-        // Pre-allocate total needed to avoid multiple capacity checks
         const vlen = entry.value.len;
         var hdr: [32]u8 = undefined;
-        const h = std.fmt.bufPrint(&hdr, "${d}\r\n", .{vlen}) catch return false;
-        out.ensureTotalCapacity(out.items.len + h.len + vlen + 2) catch {};
+        const h = std.fmt.bufPrint(&hdr, "${d}\r\n", .{vlen}) catch {
+            readUnlockStripe(s);
+            return false;
+        };
+        const total_needed = out.items.len + h.len + vlen + 2;
+        if (total_needed > out.capacity) {
+            // Large value — rare path, must realloc under lock
+            out.ensureTotalCapacity(total_needed) catch {
+                readUnlockStripe(s);
+                return false;
+            };
+        }
         out.appendSliceAssumeCapacity(h);
         out.appendSliceAssumeCapacity(entry.value);
         out.appendSliceAssumeCapacity("\r\n");
+        readUnlockStripe(s);
         return true;
     }
 
