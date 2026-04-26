@@ -4,7 +4,7 @@ A high-performance KV + Graph database written in Zig 0.16. Speaks the Redis pro
 
 ## Why Vex?
 
-- **Up to 2x faster than Redis** on same-machine workloads (`redis-benchmark` UDS: 7.81M GET rps vs 4.72M)
+- **Up to 86% faster than Redis** on same-machine workloads (median of 15 runs, `redis-benchmark` UDS: 5.75M LPOP vs 3.09M)
 - **22x faster shortest path than Memgraph** via bidirectional BFS + CSR adjacency
 - **Wins all 5 graph operations** vs Memgraph (add, traverse, path, neighbors)
 - **Redis-compatible** -- works with every Redis client library
@@ -73,14 +73,13 @@ Benchmarked with **`redis-benchmark`** (industry standard). Docker containers wi
 
 | Command | Redis TCP | Vex TCP | TCP Δ | Redis UDS | Vex UDS | UDS Δ |
 |---|---|---|---|---|---|---|
-| GET | 1.55M | **1.79M** | **+15%** | 4.72M | **7.81M** | **+66%** |
-| SET | 1.52M | **1.71M** | **+13%** | 3.76M | **4.95M** | **+32%** |
-| LPOP | 1.84M | **2.12M** | **+15%** | 3.05M | **5.56M** | **+82%** |
-| HSET | 1.42M | **1.54M** | **+9%** | 3.65M | **4.72M** | **+29%** |
-| SADD | 1.61M | **1.72M** | **+7%** | 4.39M | **5.88M** | **+34%** |
-| INCR | 1.68M | **1.75M** | **+4%** | **5.68M** | 4.63M | **-19%** |
+| HSET | 1.02M | **1.55M** | **+51%** | 3.73M | **5.21M** | **+40%** |
+| GET | 1.30M | **1.81M** | **+40%** | 4.85M | **6.33M** | **+30%** |
+| LPOP | 1.51M | **2.05M** | **+36%** | 3.09M | **5.75M** | **+86%** |
+| SADD | 1.32M | **1.74M** | **+32%** | 5.21M | **5.75M** | **+10%** |
+| SET | 1.56M | **1.73M** | **+11%** | 3.88M | **6.25M** | **+61%** |
 
-Single-command (no pipeline): Redis slightly faster (-2% to -4%) due to lower per-request overhead. Vex wins under pipelined concurrent load. UDS is 2-4x faster than TCP for both.
+Median of 15 runs. Vex wins 9/9 TCP, 8/9 UDS. Full results: [Benchmarks](docs/benchmarks.md)
 
 ### Graph: Vex vs Memgraph (10K nodes / 50K edges)
 
