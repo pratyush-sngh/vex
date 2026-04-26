@@ -2,21 +2,72 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 /// List storage: maps key -> doubly-ended list of string values.
-/// Backed by ArrayList per key (O(1) RPUSH/RPOP, O(n) LPUSH/LPOP).
+/// Uses two-stack deque: head (reversed) + tail. O(1) amortized LPUSH/LPOP/RPUSH/RPOP.
 pub const ListStore = struct {
     lists: std.StringHashMap(List),
     allocator: Allocator,
 
     const List = struct {
-        items: std.array_list.Managed([]u8),
+        head: std.array_list.Managed([]u8), // reversed: head.pop() gives first element
+        tail: std.array_list.Managed([]u8), // tail.pop() gives last element
 
         fn init(allocator: Allocator) List {
-            return .{ .items = std.array_list.Managed([]u8).init(allocator) };
+            return .{
+                .head = std.array_list.Managed([]u8).init(allocator),
+                .tail = std.array_list.Managed([]u8).init(allocator),
+            };
         }
 
         fn deinit(self: *List, allocator: Allocator) void {
-            for (self.items.items) |v| allocator.free(v);
-            self.items.deinit();
+            for (self.head.items) |v| allocator.free(v);
+            self.head.deinit();
+            for (self.tail.items) |v| allocator.free(v);
+            self.tail.deinit();
+        }
+
+        fn len(self: *const List) usize {
+            return self.head.items.len + self.tail.items.len;
+        }
+
+        /// Get element at logical index (0 = first).
+        fn get(self: *const List, index: usize) ?[]const u8 {
+            const hlen = self.head.items.len;
+            if (index < hlen) {
+                return self.head.items[hlen - 1 - index];
+            }
+            const ti = index - hlen;
+            if (ti < self.tail.items.len) {
+                return self.tail.items[ti];
+            }
+            return null;
+        }
+
+        /// Rebalance: move half of tail to head (when head is empty and we need lpop).
+        fn rebalanceToHead(self: *List) void {
+            // Reverse tail into head
+            const tlen = self.tail.items.len;
+            if (tlen == 0) return;
+            const half = tlen; // move all to head
+            var i: usize = 0;
+            while (i < half) : (i += 1) {
+                const idx = tlen - 1 - i;
+                self.head.append(self.tail.items[idx]) catch return;
+            }
+            // Remove moved items from tail
+            self.tail.shrinkRetainingCapacity(tlen - half);
+        }
+
+        /// Rebalance: move half of head to tail (when tail is empty and we need rpop).
+        fn rebalanceToTail(self: *List) void {
+            const hlen = self.head.items.len;
+            if (hlen == 0) return;
+            const half = hlen;
+            var i: usize = 0;
+            while (i < half) : (i += 1) {
+                const idx = hlen - 1 - i;
+                self.tail.append(self.head.items[idx]) catch return;
+            }
+            self.head.shrinkRetainingCapacity(hlen - half);
         }
     };
 
@@ -37,127 +88,163 @@ pub const ListStore = struct {
         self.lists.deinit();
     }
 
-    /// LPUSH key value [value ...] — prepend values, returns new length.
+    /// LPUSH key value [value ...] — prepend values (O(1) each), returns new length.
     pub fn lpush(self: *ListStore, key: []const u8, values: []const []const u8) !usize {
         const list = try self.getOrCreate(key);
-        // Insert values at front (in order, so last arg ends up at head — Redis behavior)
         for (values) |val| {
             const copy = try self.allocator.dupe(u8, val);
             errdefer self.allocator.free(copy);
-            try list.items.insert(0, copy);
+            try list.head.append(copy); // head is reversed, so append = prepend
         }
-        return list.items.items.len;
+        return list.len();
     }
 
-    /// RPUSH key value [value ...] — append values, returns new length.
+    /// RPUSH key value [value ...] — append values (O(1) each), returns new length.
     pub fn rpush(self: *ListStore, key: []const u8, values: []const []const u8) !usize {
         const list = try self.getOrCreate(key);
         for (values) |val| {
             const copy = try self.allocator.dupe(u8, val);
             errdefer self.allocator.free(copy);
-            try list.items.append(copy);
+            try list.tail.append(copy);
         }
-        return list.items.items.len;
+        return list.len();
     }
 
-    /// LPOP key — remove and return the first element.
+    /// LPOP key — remove and return the first element (O(1) amortized).
     pub fn lpop(self: *ListStore, key: []const u8) ?[]u8 {
         const list = self.lists.getPtr(key) orelse return null;
-        if (list.items.items.len == 0) return null;
-        const val = list.items.orderedRemove(0);
-        if (list.items.items.len == 0) self.removeKey(key);
+        if (list.len() == 0) return null;
+        if (list.head.items.len == 0) list.rebalanceToHead();
+        if (list.head.items.len == 0) return null;
+        const val = list.head.pop();
+        if (list.len() == 0) self.removeKey(key);
         return val;
     }
 
-    /// RPOP key — remove and return the last element.
+    /// RPOP key — remove and return the last element (O(1) amortized).
     pub fn rpop(self: *ListStore, key: []const u8) ?[]u8 {
         const list = self.lists.getPtr(key) orelse return null;
-        if (list.items.items.len == 0) return null;
-        const val = list.items.pop();
-        if (list.items.items.len == 0) self.removeKey(key);
+        if (list.len() == 0) return null;
+        if (list.tail.items.len == 0) list.rebalanceToTail();
+        if (list.tail.items.len == 0) return null;
+        const val = list.tail.pop();
+        if (list.len() == 0) self.removeKey(key);
         return val;
     }
 
     /// LLEN key — return list length.
     pub fn llen(self: *ListStore, key: []const u8) usize {
         const list = self.lists.getPtr(key) orelse return 0;
-        return list.items.items.len;
+        return list.len();
     }
 
     /// LINDEX key index — return element at index (negative indexes from tail).
     pub fn lindex(self: *ListStore, key: []const u8, index: i64) ?[]const u8 {
         const list = self.lists.getPtr(key) orelse return null;
-        const len: i64 = @intCast(list.items.items.len);
+        const total: i64 = @intCast(list.len());
         var idx = index;
-        if (idx < 0) idx += len;
-        if (idx < 0 or idx >= len) return null;
-        return list.items.items[@intCast(idx)];
+        if (idx < 0) idx += total;
+        if (idx < 0 or idx >= total) return null;
+        return list.get(@intCast(idx));
     }
 
     /// LRANGE key start stop — return elements in range (inclusive, negative indexes supported).
     pub fn lrange(self: *ListStore, key: []const u8, start_in: i64, stop_in: i64) ?[]const []const u8 {
         const list = self.lists.getPtr(key) orelse return null;
-        const len: i64 = @intCast(list.items.items.len);
-        if (len == 0) return &[_][]const u8{};
+        const total: i64 = @intCast(list.len());
+        if (total == 0) return &[_][]const u8{};
 
         var start = start_in;
         var stop = stop_in;
-        if (start < 0) start += len;
-        if (stop < 0) stop += len;
+        if (start < 0) start += total;
+        if (stop < 0) stop += total;
         if (start < 0) start = 0;
-        if (stop >= len) stop = len - 1;
+        if (stop >= total) stop = total - 1;
         if (start > stop) return &[_][]const u8{};
 
-        const s: usize = @intCast(start);
-        const e: usize = @intCast(stop + 1);
-        // Return a slice of the underlying items — caller must not modify
-        const items: []const []u8 = list.items.items[s..e];
-        return @ptrCast(items);
+        // Build result by indexing through the deque
+        const count: usize = @intCast(stop - start + 1);
+        const result = self.allocator.alloc([]const u8, count) catch return null;
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            result[i] = list.get(@as(usize, @intCast(start)) + i) orelse "";
+        }
+        return result;
     }
 
     /// LSET key index value — set element at index.
     pub fn lset(self: *ListStore, key: []const u8, index: i64, value: []const u8) !void {
         const list = self.lists.getPtr(key) orelse return error.NoSuchKey;
-        const len: i64 = @intCast(list.items.items.len);
+        const total: i64 = @intCast(list.len());
         var idx = index;
-        if (idx < 0) idx += len;
-        if (idx < 0 or idx >= len) return error.IndexOutOfRange;
-        const i: usize = @intCast(idx);
+        if (idx < 0) idx += total;
+        if (idx < 0 or idx >= total) return error.IndexOutOfRange;
+        const ui: usize = @intCast(idx);
+        const hlen = list.head.items.len;
         const copy = try self.allocator.dupe(u8, value);
-        self.allocator.free(list.items.items[i]);
-        list.items.items[i] = copy;
+        if (ui < hlen) {
+            self.allocator.free(list.head.items[hlen - 1 - ui]);
+            list.head.items[hlen - 1 - ui] = copy;
+        } else {
+            const ti = ui - hlen;
+            self.allocator.free(list.tail.items[ti]);
+            list.tail.items[ti] = copy;
+        }
     }
 
     /// LREM key count value — remove count occurrences of value.
-    /// count > 0: remove from head, count < 0: remove from tail, count == 0: remove all.
+    /// For the deque, we linearize, remove, then rebuild. O(n) but correct.
     pub fn lrem(self: *ListStore, key: []const u8, count_in: i64, value: []const u8) usize {
         const list = self.lists.getPtr(key) orelse return 0;
+        const total = list.len();
+        if (total == 0) return 0;
+
+        // Linearize into a temporary buffer
+        var linear = std.array_list.Managed([]u8).init(self.allocator);
+        defer linear.deinit();
+        // Head is reversed
+        var hi: usize = list.head.items.len;
+        while (hi > 0) : (hi -= 1) {
+            linear.append(list.head.items[hi - 1]) catch return 0;
+        }
+        for (list.tail.items) |item| {
+            linear.append(item) catch return 0;
+        }
+
         var removed: usize = 0;
-        const max_remove: usize = if (count_in == 0) list.items.items.len else @intCast(if (count_in < 0) -count_in else count_in);
+        const max_remove: usize = if (count_in == 0) total else @intCast(if (count_in < 0) -count_in else count_in);
 
         if (count_in >= 0) {
-            // Remove from head
             var i: usize = 0;
-            while (i < list.items.items.len and removed < max_remove) {
-                if (std.mem.eql(u8, list.items.items[i], value)) {
-                    self.allocator.free(list.items.orderedRemove(i));
+            while (i < linear.items.len and removed < max_remove) {
+                if (std.mem.eql(u8, linear.items[i], value)) {
+                    self.allocator.free(linear.orderedRemove(i));
                     removed += 1;
                 } else {
                     i += 1;
                 }
             }
         } else {
-            // Remove from tail
-            var i: usize = list.items.items.len;
+            var i: usize = linear.items.len;
             while (i > 0 and removed < max_remove) {
                 i -= 1;
-                if (std.mem.eql(u8, list.items.items[i], value)) {
-                    self.allocator.free(list.items.orderedRemove(i));
+                if (std.mem.eql(u8, linear.items[i], value)) {
+                    self.allocator.free(linear.orderedRemove(i));
                     removed += 1;
                 }
             }
         }
-        if (list.items.items.len == 0) self.removeKey(key);
+
+        // Rebuild deque from linear
+        list.head.clearRetainingCapacity();
+        list.tail.clearRetainingCapacity();
+        for (linear.items) |item| {
+            list.tail.append(item) catch {};
+        }
+        // Clear linear without freeing items (they're now in tail)
+        linear.clearRetainingCapacity();
+
+        if (list.len() == 0) self.removeKey(key);
         return removed;
     }
 
@@ -229,12 +316,14 @@ test "LRANGE" {
     _ = try store.rpush("r", &[_][]const u8{ "a", "b", "c", "d", "e" });
 
     const range = store.lrange("r", 1, 3).?;
+    defer std.testing.allocator.free(range);
     try std.testing.expectEqual(@as(usize, 3), range.len);
     try std.testing.expectEqualStrings("b", range[0]);
     try std.testing.expectEqualStrings("d", range[2]);
 
     // Negative indexes
     const tail = store.lrange("r", -2, -1).?;
+    defer std.testing.allocator.free(tail);
     try std.testing.expectEqual(@as(usize, 2), tail.len);
     try std.testing.expectEqualStrings("d", tail[0]);
     try std.testing.expectEqualStrings("e", tail[1]);

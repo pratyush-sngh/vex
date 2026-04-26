@@ -1010,6 +1010,7 @@ pub const Server = struct {
         defer set_store.deinit();
         var sorted_set_store = ZS.init(self.allocator);
         defer sorted_set_store.deinit();
+        var ds_rwlock = std.mem.zeroes(std.c.pthread_rwlock_t);
         var watch_map = WM.init(self.allocator);
         defer watch_map.deinit();
 
@@ -1041,6 +1042,7 @@ pub const Server = struct {
                 &hash_store,
                 &set_store,
                 &sorted_set_store,
+                &ds_rwlock,
                 &watch_map,
             );
         }

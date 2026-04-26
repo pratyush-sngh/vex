@@ -286,6 +286,7 @@ pub const Worker = struct {
     hash_store: ?*HashStore,
     set_store: ?*SetStore,
     sorted_set_store: ?*SortedSetStore,
+    ds_rwlock: ?*std.c.pthread_rwlock_t, // shared rwlock for list/hash/set/zset stores
     watch_map: ?*WatchMap,
     new_fds: [MAX_NEW_FDS]i32,
     new_fd_head: std.atomic.Value(usize),
@@ -315,6 +316,7 @@ pub const Worker = struct {
         hash_store: ?*HashStore,
         set_store: ?*SetStore,
         sorted_set_store: ?*SortedSetStore,
+        ds_rwlock: ?*std.c.pthread_rwlock_t,
         watch_map: ?*WatchMap,
     ) !Worker {
         return .{
@@ -343,6 +345,7 @@ pub const Worker = struct {
             .hash_store = hash_store,
             .set_store = set_store,
             .sorted_set_store = sorted_set_store,
+            .ds_rwlock = ds_rwlock,
             .watch_map = watch_map,
             .new_fds = [_]i32{-1} ** MAX_NEW_FDS,
             .new_fd_head = std.atomic.Value(usize).init(0),
@@ -1401,13 +1404,172 @@ pub const Worker = struct {
                 },
                 else => {},
             },
-            4 => if (first == 'P' and equalsAsciiUpper(cmd, "PING")) {
-                if (args.len > 1) {
-                    writeBulkTo(&conn.write_buf, args[1]);
-                } else {
-                    conn.write_buf.appendSlice(ct.resp_pong) catch {};
-                }
-                return true;
+            4 => switch (first) {
+                'P' => if (equalsAsciiUpper(cmd, "PING")) {
+                    if (args.len > 1) writeBulkTo(&conn.write_buf, args[1]) else conn.write_buf.appendSlice(ct.resp_pong) catch {};
+                    return true;
+                },
+                'H' => {
+                    if (args.len >= 4 and equalsAsciiUpper(cmd, "HSET")) {
+                        if (self.hash_store) |hs| {
+                            const ns = nsKey(conn.selected_db, args[1]) orelse return false;
+                            const rwl = self.ds_rwlock orelse return false;
+                            _ = std.c.pthread_rwlock_wrlock(rwl);
+                            defer _ = std.c.pthread_rwlock_unlock(rwl);
+                            const added = hs.hset(ns, args[2..]) catch return false;
+                            if (self.aof) |a| a.logCommand(args);
+                            self.bumpWatchVersion(conn.selected_db, args[1]);
+                            writeIntTo(&conn.write_buf, @intCast(added));
+                            return true;
+                        }
+                    }
+                    if (args.len >= 3 and equalsAsciiUpper(cmd, "HGET")) {
+                        if (self.hash_store) |hs| {
+                            const ns = nsKey(conn.selected_db, args[1]) orelse return false;
+                            const rwl = self.ds_rwlock orelse return false;
+                            _ = std.c.pthread_rwlock_rdlock(rwl);
+                            defer _ = std.c.pthread_rwlock_unlock(rwl);
+                            if (hs.hget(ns, args[2])) |val| {
+                                writeBulkTo(&conn.write_buf, val);
+                            } else {
+                                conn.write_buf.appendSlice("$-1\r\n") catch {};
+                            }
+                            return true;
+                        }
+                    }
+                    if (args.len >= 2 and equalsAsciiUpper(cmd, "HLEN")) {
+                        if (self.hash_store) |hs| {
+                            const ns = nsKey(conn.selected_db, args[1]) orelse return false;
+                            const rwl = self.ds_rwlock orelse return false;
+                            _ = std.c.pthread_rwlock_rdlock(rwl);
+                            defer _ = std.c.pthread_rwlock_unlock(rwl);
+                            writeIntTo(&conn.write_buf, @intCast(hs.hlen(ns)));
+                            return true;
+                        }
+                    }
+                },
+                'L' => {
+                    if (args.len >= 2 and equalsAsciiUpper(cmd, "LLEN")) {
+                        if (self.list_store) |ls| {
+                            const ns = nsKey(conn.selected_db, args[1]) orelse return false;
+                            const rwl = self.ds_rwlock orelse return false;
+                            _ = std.c.pthread_rwlock_rdlock(rwl);
+                            defer _ = std.c.pthread_rwlock_unlock(rwl);
+                            writeIntTo(&conn.write_buf, @intCast(ls.llen(ns)));
+                            return true;
+                        }
+                    }
+                    if (args.len >= 2 and equalsAsciiUpper(cmd, "LPOP")) {
+                        if (self.list_store) |ls| {
+                            const ns = nsKey(conn.selected_db, args[1]) orelse return false;
+                            const rwl = self.ds_rwlock orelse return false;
+                            _ = std.c.pthread_rwlock_wrlock(rwl);
+                            defer _ = std.c.pthread_rwlock_unlock(rwl);
+                            if (ls.lpop(ns)) |val| {
+                                defer self.allocator.free(val);
+                                if (self.aof) |a| a.logCommand(args);
+                                writeBulkTo(&conn.write_buf, val);
+                            } else {
+                                conn.write_buf.appendSlice("$-1\r\n") catch {};
+                            }
+                            return true;
+                        }
+                    }
+                },
+                'R' => if (args.len >= 2 and equalsAsciiUpper(cmd, "RPOP")) {
+                    if (self.list_store) |ls| {
+                        const ns = nsKey(conn.selected_db, args[1]) orelse return false;
+                        const rwl = self.ds_rwlock orelse return false;
+                        _ = std.c.pthread_rwlock_wrlock(rwl);
+                        defer _ = std.c.pthread_rwlock_unlock(rwl);
+                        if (ls.rpop(ns)) |val| {
+                            defer self.allocator.free(val);
+                            if (self.aof) |a| a.logCommand(args);
+                            writeBulkTo(&conn.write_buf, val);
+                        } else {
+                            conn.write_buf.appendSlice("$-1\r\n") catch {};
+                        }
+                        return true;
+                    }
+                },
+                'S' => if (args.len >= 3 and equalsAsciiUpper(cmd, "SADD")) {
+                    if (self.set_store) |ss| {
+                        const ns = nsKey(conn.selected_db, args[1]) orelse return false;
+                        const rwl = self.ds_rwlock orelse return false;
+                        _ = std.c.pthread_rwlock_wrlock(rwl);
+                        defer _ = std.c.pthread_rwlock_unlock(rwl);
+                        const added = ss.sadd(ns, args[2..]) catch return false;
+                        if (self.aof) |a| a.logCommand(args);
+                        self.bumpWatchVersion(conn.selected_db, args[1]);
+                        writeIntTo(&conn.write_buf, @intCast(added));
+                        return true;
+                    }
+                },
+                'Z' => {
+                    if (args.len >= 4 and equalsAsciiUpper(cmd, "ZADD")) {
+                        if (self.sorted_set_store) |zs| {
+                            const ns = nsKey(conn.selected_db, args[1]) orelse return false;
+                            const rwl = self.ds_rwlock orelse return false;
+                            _ = std.c.pthread_rwlock_wrlock(rwl);
+                            defer _ = std.c.pthread_rwlock_unlock(rwl);
+                            const added = zs.zadd(ns, args[2..]) catch return false;
+                            if (self.aof) |a| a.logCommand(args);
+                            self.bumpWatchVersion(conn.selected_db, args[1]);
+                            writeIntTo(&conn.write_buf, @intCast(added));
+                            return true;
+                        }
+                    }
+                },
+                else => {},
+            },
+            5 => switch (first) {
+                'L' => if (args.len >= 3 and equalsAsciiUpper(cmd, "LPUSH")) {
+                    if (self.list_store) |ls| {
+                        const ns = nsKey(conn.selected_db, args[1]) orelse return false;
+                        const rwl = self.ds_rwlock orelse return false;
+                        _ = std.c.pthread_rwlock_wrlock(rwl);
+                        defer _ = std.c.pthread_rwlock_unlock(rwl);
+                        const len = ls.lpush(ns, args[2..]) catch return false;
+                        if (self.aof) |a| a.logCommand(args);
+                        self.bumpWatchVersion(conn.selected_db, args[1]);
+                        writeIntTo(&conn.write_buf, @intCast(len));
+                        return true;
+                    }
+                },
+                'R' => if (args.len >= 3 and equalsAsciiUpper(cmd, "RPUSH")) {
+                    if (self.list_store) |ls| {
+                        const ns = nsKey(conn.selected_db, args[1]) orelse return false;
+                        const rwl = self.ds_rwlock orelse return false;
+                        _ = std.c.pthread_rwlock_wrlock(rwl);
+                        defer _ = std.c.pthread_rwlock_unlock(rwl);
+                        const len = ls.rpush(ns, args[2..]) catch return false;
+                        if (self.aof) |a| a.logCommand(args);
+                        self.bumpWatchVersion(conn.selected_db, args[1]);
+                        writeIntTo(&conn.write_buf, @intCast(len));
+                        return true;
+                    }
+                },
+                'S' => if (args.len >= 2 and equalsAsciiUpper(cmd, "SCARD")) {
+                    if (self.set_store) |ss| {
+                        const ns = nsKey(conn.selected_db, args[1]) orelse return false;
+                        const rwl = self.ds_rwlock orelse return false;
+                        _ = std.c.pthread_rwlock_rdlock(rwl);
+                        defer _ = std.c.pthread_rwlock_unlock(rwl);
+                        writeIntTo(&conn.write_buf, @intCast(ss.scard(ns)));
+                        return true;
+                    }
+                },
+                'Z' => if (args.len >= 2 and equalsAsciiUpper(cmd, "ZCARD")) {
+                    if (self.sorted_set_store) |zs| {
+                        const ns = nsKey(conn.selected_db, args[1]) orelse return false;
+                        const rwl = self.ds_rwlock orelse return false;
+                        _ = std.c.pthread_rwlock_rdlock(rwl);
+                        defer _ = std.c.pthread_rwlock_unlock(rwl);
+                        writeIntTo(&conn.write_buf, @intCast(zs.zcard(ns)));
+                        return true;
+                    }
+                },
+                else => {},
             },
             6 => switch (first) {
                 'E' => if (args.len >= 2 and equalsAsciiUpper(cmd, "EXISTS")) {

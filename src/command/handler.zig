@@ -1272,6 +1272,7 @@ pub const CommandHandler = struct {
         const start = std.fmt.parseInt(i64, args[2], 10) catch { try resp.serializeError(w, "value is not an integer"); return; };
         const stop = std.fmt.parseInt(i64, args[3], 10) catch { try resp.serializeError(w, "value is not an integer"); return; };
         if (self.getListStore().lrange(key_ref.key, start, stop)) |items| {
+            defer if (items.len > 0) self.allocator.free(items);
             try resp.serializeArrayHeader(w, items.len);
             for (items) |item| try resp.serializeBulkString(w, item);
         } else {
