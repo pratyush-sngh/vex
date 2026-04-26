@@ -48,6 +48,23 @@ pub const SetStore = struct {
         return added;
     }
 
+    /// SADD with pre-allocated owned members. Caller allocated, set takes ownership.
+    /// Frees members that already exist (duplicates).
+    pub fn saddOwned(self: *SetStore, key: []const u8, owned: []const []u8) !usize {
+        const s = try self.getOrCreate(key);
+        var added: usize = 0;
+        for (owned) |member| {
+            const gop = try s.members.getOrPut(member);
+            if (!gop.found_existing) {
+                gop.key_ptr.* = member; // take ownership
+                added += 1;
+            } else {
+                self.allocator.free(member); // duplicate, free the pre-alloc
+            }
+        }
+        return added;
+    }
+
     /// SREM key member [member ...] — remove members, returns count removed.
     pub fn srem(self: *SetStore, key: []const u8, members: []const []const u8) usize {
         const s = self.sets.getPtr(key) orelse return 0;

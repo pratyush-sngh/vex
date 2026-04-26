@@ -94,8 +94,16 @@ pub const ListStore = struct {
         for (values) |val| {
             const copy = try self.allocator.dupe(u8, val);
             errdefer self.allocator.free(copy);
-            try list.head.append(copy); // head is reversed, so append = prepend
+            try list.head.append(copy);
         }
+        return list.len();
+    }
+
+    /// LPUSH with pre-allocated owned values. Caller allocated, list takes ownership.
+    /// No allocation under lock — only the ArrayList append (~20ns).
+    pub fn lpushOwned(self: *ListStore, key: []const u8, owned: []const []u8) !usize {
+        const list = try self.getOrCreate(key);
+        for (owned) |val| try list.head.append(val);
         return list.len();
     }
 
@@ -107,6 +115,13 @@ pub const ListStore = struct {
             errdefer self.allocator.free(copy);
             try list.tail.append(copy);
         }
+        return list.len();
+    }
+
+    /// RPUSH with pre-allocated owned values. No allocation under lock.
+    pub fn rpushOwned(self: *ListStore, key: []const u8, owned: []const []u8) !usize {
+        const list = try self.getOrCreate(key);
+        for (owned) |val| try list.tail.append(val);
         return list.len();
     }
 

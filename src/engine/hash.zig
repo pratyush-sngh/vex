@@ -68,6 +68,29 @@ pub const HashStore = struct {
         return new_count;
     }
 
+    /// HSET with pre-allocated owned field+value pairs. No allocation under lock.
+    /// owned_fv is [field0, value0, field1, value1, ...] — all owned by caller.
+    pub fn hsetOwned(self: *HashStore, key: []const u8, owned_fv: []const []u8) !usize {
+        const fm = try self.getOrCreate(key);
+        var new_count: usize = 0;
+        var i: usize = 0;
+        while (i + 1 < owned_fv.len) : (i += 2) {
+            const field = owned_fv[i];
+            const value = owned_fv[i + 1];
+            const gop = try fm.fields.getOrPut(field);
+            if (gop.found_existing) {
+                self.allocator.free(gop.value_ptr.*);
+                self.allocator.free(field); // unused pre-alloc
+                gop.value_ptr.* = value;
+            } else {
+                gop.key_ptr.* = field; // take ownership
+                gop.value_ptr.* = value; // take ownership
+                new_count += 1;
+            }
+        }
+        return new_count;
+    }
+
     /// HGET key field — get a single field value.
     pub fn hget(self: *HashStore, key: []const u8, field: []const u8) ?[]const u8 {
         const fm = self.hashes.getPtr(key) orelse return null;

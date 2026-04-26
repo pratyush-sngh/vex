@@ -1445,9 +1445,20 @@ pub const Worker = struct {
                         if (self.hash_store) |hs| {
                             const ns = nsKey(conn.selected_db, args[1]) orelse return false;
                             const dsl = self.ds_locks orelse return false;
+                            const fv = args[2..];
+                            var owned_buf: [32][]u8 = undefined;
+                            if (fv.len > owned_buf.len) return false;
+                            for (fv, 0..) |v, i| {
+                                owned_buf[i] = self.allocator.dupe(u8, v) catch return false;
+                            }
+                            const owned = owned_buf[0..fv.len];
                             dsl.wrlock(ns);
-                            defer dsl.unlock(ns);
-                            const added = hs.hset(ns, args[2..]) catch return false;
+                            const added = hs.hsetOwned(ns, owned) catch {
+                                dsl.unlock(ns);
+                                for (owned) |o| self.allocator.free(o);
+                                return false;
+                            };
+                            dsl.unlock(ns);
                             if (self.aof) |a| a.logCommand(args);
                             self.bumpWatchVersion(conn.selected_db, args[1]);
                             writeIntTo(&conn.write_buf, @intCast(added));
@@ -1495,11 +1506,12 @@ pub const Worker = struct {
                             const ns = nsKey(conn.selected_db, args[1]) orelse return false;
                             const dsl = self.ds_locks orelse return false;
                             dsl.wrlock(ns);
-                            defer dsl.unlock(ns);
-                            if (ls.lpop(ns)) |val| {
-                                defer self.allocator.free(val);
+                            const val = ls.lpop(ns);
+                            dsl.unlock(ns);
+                            if (val) |v| {
+                                defer self.allocator.free(v);
                                 if (self.aof) |a| a.logCommand(args);
-                                writeBulkTo(&conn.write_buf, val);
+                                writeBulkTo(&conn.write_buf, v);
                             } else {
                                 conn.write_buf.appendSlice("$-1\r\n") catch {};
                             }
@@ -1512,11 +1524,12 @@ pub const Worker = struct {
                         const ns = nsKey(conn.selected_db, args[1]) orelse return false;
                         const dsl = self.ds_locks orelse return false;
                         dsl.wrlock(ns);
-                        defer dsl.unlock(ns);
-                        if (ls.rpop(ns)) |val| {
-                            defer self.allocator.free(val);
+                        const val = ls.rpop(ns);
+                        dsl.unlock(ns);
+                        if (val) |v| {
+                            defer self.allocator.free(v);
                             if (self.aof) |a| a.logCommand(args);
-                            writeBulkTo(&conn.write_buf, val);
+                            writeBulkTo(&conn.write_buf, v);
                         } else {
                             conn.write_buf.appendSlice("$-1\r\n") catch {};
                         }
@@ -1527,9 +1540,20 @@ pub const Worker = struct {
                     if (self.set_store) |ss| {
                         const ns = nsKey(conn.selected_db, args[1]) orelse return false;
                         const dsl = self.ds_locks orelse return false;
+                        const members = args[2..];
+                        var owned_buf: [16][]u8 = undefined;
+                        if (members.len > owned_buf.len) return false;
+                        for (members, 0..) |m, i| {
+                            owned_buf[i] = self.allocator.dupe(u8, m) catch return false;
+                        }
+                        const owned = owned_buf[0..members.len];
                         dsl.wrlock(ns);
-                        defer dsl.unlock(ns);
-                        const added = ss.sadd(ns, args[2..]) catch return false;
+                        const added = ss.saddOwned(ns, owned) catch {
+                            dsl.unlock(ns);
+                            for (owned) |o| self.allocator.free(o);
+                            return false;
+                        };
+                        dsl.unlock(ns);
                         if (self.aof) |a| a.logCommand(args);
                         self.bumpWatchVersion(conn.selected_db, args[1]);
                         writeIntTo(&conn.write_buf, @intCast(added));
@@ -1558,9 +1582,20 @@ pub const Worker = struct {
                     if (self.list_store) |ls| {
                         const ns = nsKey(conn.selected_db, args[1]) orelse return false;
                         const dsl = self.ds_locks orelse return false;
+                        const vals = args[2..];
+                        var owned_buf: [16][]u8 = undefined;
+                        if (vals.len > owned_buf.len) return false;
+                        for (vals, 0..) |v, i| {
+                            owned_buf[i] = self.allocator.dupe(u8, v) catch return false;
+                        }
+                        const owned = owned_buf[0..vals.len];
                         dsl.wrlock(ns);
-                        defer dsl.unlock(ns);
-                        const len = ls.lpush(ns, args[2..]) catch return false;
+                        const len = ls.lpushOwned(ns, owned) catch {
+                            dsl.unlock(ns);
+                            for (owned) |o| self.allocator.free(o);
+                            return false;
+                        };
+                        dsl.unlock(ns);
                         if (self.aof) |a| a.logCommand(args);
                         self.bumpWatchVersion(conn.selected_db, args[1]);
                         writeIntTo(&conn.write_buf, @intCast(len));
@@ -1571,9 +1606,21 @@ pub const Worker = struct {
                     if (self.list_store) |ls| {
                         const ns = nsKey(conn.selected_db, args[1]) orelse return false;
                         const dsl = self.ds_locks orelse return false;
+                        // Pre-alloc values OUTSIDE lock
+                        const vals = args[2..];
+                        var owned_buf: [16][]u8 = undefined;
+                        if (vals.len > owned_buf.len) return false;
+                        for (vals, 0..) |v, i| {
+                            owned_buf[i] = self.allocator.dupe(u8, v) catch return false;
+                        }
+                        const owned = owned_buf[0..vals.len];
                         dsl.wrlock(ns);
-                        defer dsl.unlock(ns);
-                        const len = ls.rpush(ns, args[2..]) catch return false;
+                        const len = ls.rpushOwned(ns, owned) catch {
+                            dsl.unlock(ns);
+                            for (owned) |o| self.allocator.free(o);
+                            return false;
+                        };
+                        dsl.unlock(ns);
                         if (self.aof) |a| a.logCommand(args);
                         self.bumpWatchVersion(conn.selected_db, args[1]);
                         writeIntTo(&conn.write_buf, @intCast(len));
