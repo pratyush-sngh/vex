@@ -37,23 +37,24 @@ vex:
 
 | Command | Redis TCP | Vex TCP | TCP Δ | Redis UDS | Vex UDS | UDS Δ |
 |---|---|---|---|---|---|---|
-| **GET** | 1.05M | **1.75M** | **+66%** | 4.76M | **5.32M** | **+12%** |
-| **SET** | 1.14M | **1.66M** | **+45%** | 3.79M | **5.15M** | **+36%** |
-| **INCR** | 1.19M | **1.69M** | **+42%** | 4.50M | **4.46M** | tied |
-| **LPOP** | 1.80M | **2.01M** | **+12%** | 3.07M | **6.02M** | **+96%** |
-| **RPOP** | 1.87M | **2.08M** | **+12%** | 3.82M | **5.88M** | **+54%** |
-| **SADD** | 1.61M | 1.57M | tied | 5.38M | **6.02M** | **+12%** |
-| **HSET** | 1.42M | **1.54M** | **+8%** | 3.62M | **5.15M** | **+42%** |
-| **LPUSH** | 1.55M | **1.60M** | +3% | 3.23M | **4.03M** | **+25%** |
-| **RPUSH** | 1.53M | **1.59M** | +4% | 4.13M | **4.07M** | tied |
+| **GET** | 1.55M | **1.79M** | **+15%** | 4.72M | **7.81M** | **+66%** |
+| **SET** | 1.52M | **1.71M** | **+13%** | 3.76M | **4.95M** | **+32%** |
+| **INCR** | 1.68M | **1.75M** | +4% | 5.68M | 4.63M | -19% |
+| **LPOP** | 1.84M | **2.12M** | **+15%** | 3.05M | **5.56M** | **+82%** |
+| **RPOP** | 1.86M | **2.07M** | **+11%** | 3.82M | **4.72M** | **+24%** |
+| **SADD** | 1.61M | **1.72M** | **+7%** | 4.39M | **5.88M** | **+34%** |
+| **HSET** | 1.42M | **1.54M** | **+9%** | 3.65M | **4.72M** | **+29%** |
+| **LPUSH** | 1.58M | **1.66M** | **+5%** | 3.16M | **4.72M** | **+49%** |
+| **RPUSH** | 1.65M | **1.68M** | +2% | 4.13M | **4.55M** | **+10%** |
 
 All values in requests per second. TCP benchmarks run from host via Docker port mapping. UDS benchmarks run inside Docker via `docker exec`.
 
 **Key takeaways:**
-- **TCP**: Vex wins 7/9 commands (+8% to +66%). TCP overhead masks engine speed.
-- **UDS**: Vex wins 7/9 commands (+12% to +96%). Without TCP stack, the multi-reactor advantage is fully exposed.
-- **LPOP +96% over UDS**: Vex's O(1) deque vs Redis's quicklist shows the biggest gain when network overhead is removed.
-- **UDS is 3-4x faster than TCP** for both Redis and Vex — use `--unixsocket` for same-machine deployments.
+- **TCP**: Vex wins 9/9 commands (+2% to +15%). TCP overhead compresses the gap.
+- **UDS**: Vex wins 8/9 commands (+10% to +82%). Without TCP stack, the multi-reactor advantage is fully exposed.
+- **GET 7.81M rps over UDS** — 66% faster than Redis. Vex's parallel read locks shine when network isn't the bottleneck.
+- **LPOP +82% over UDS**: Vex's O(1) deque vs Redis's quicklist.
+- **UDS is 2-4x faster than TCP** for both Redis and Vex — use `--unixsocket` for same-machine deployments.
 
 ### Single-command, no pipeline (TCP, c=16, 100K ops)
 
