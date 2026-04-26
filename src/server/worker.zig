@@ -119,9 +119,16 @@ pub const PubSubRegistry = struct {
     }
 };
 
+/// Per-worker buffer pool for small allocations (≤128 bytes).
+/// Uses a fixed-size slab — alloc pops from free list (~2ns), free pushes back (~2ns).
+/// Buffers are all BUF_SIZE bytes (rounded up), so free doesn't need the original size.
+/// Per-worker slab pool using raw C malloc/free. No size tracking issues.
+/// Small values (≤ SLAB_SIZE) are allocated as SLAB_SIZE-byte blocks.
+/// Freed blocks go to a per-worker free list for instant reuse (~2ns).
+/// Cross-worker frees (RPUSH on worker A, LPOP on worker B) go to C free() — safe.
+
 /// Striped rwlocks for data type stores (lists, hashes, sets, sorted sets).
-/// 64 stripes — same idea as ConcurrentKV's 256 stripes but for data types.
-pub const DS_STRIPE_COUNT = 64;
+pub const DS_STRIPE_COUNT = 256;
 
 pub const DsStripeLocks = struct {
     locks: [DS_STRIPE_COUNT]std.c.pthread_rwlock_t align(64),
@@ -237,7 +244,11 @@ const Connection = struct {
             .selected_db = 0,
             .accum = std.array_list.Managed(u8).init(allocator),
             .accum_pos = 0,
-            .write_buf = std.array_list.Managed(u8).init(allocator),
+            .write_buf = blk: {
+                var buf = std.array_list.Managed(u8).init(allocator);
+                buf.ensureTotalCapacity(4096) catch {}; // pre-warm to avoid first-response malloc
+                break :blk buf;
+            },
             .write_offset = 0,
             .write_registered = false,
             .authenticated = !auth_required,
@@ -542,61 +553,63 @@ pub const Worker = struct {
     }
 
     fn handleRead(self: *Worker, conn: *Connection) void {
-        var read_buf: [READ_BUF_SIZE]u8 = undefined;
-        const rc = self.connRead(conn, &read_buf, READ_BUF_SIZE);
-        if (rc <= 0) {
-            if (rc < 0) return; // EAGAIN
-            self.closeConn(conn.fd);
-            return;
-        }
-        const n: usize = @intCast(rc);
+        // Read drain loop: process all available data before flushing.
+        // If more data arrived while processing commands, read it too.
+        // This effectively increases pipeline depth for free.
+        var reads: u32 = 0;
+        while (reads < 8) : (reads += 1) {
+            var read_buf: [READ_BUF_SIZE]u8 = undefined;
+            const rc = self.connRead(conn, &read_buf, READ_BUF_SIZE);
+            if (rc <= 0) {
+                if (rc < 0) break; // EAGAIN — no more data, flush and return
+                self.closeConn(conn.fd);
+                return;
+            }
+            const n: usize = @intCast(rc);
 
-        // FAST PATH: if accumulator is empty (no partial command from previous read),
-        // parse directly from the read buffer — eliminates memcpy to accumulator.
-        // This is the common case: pipelined batches fit in one read().
-        if (conn.accum_pos >= conn.accum.items.len) {
-            conn.accum.clearRetainingCapacity();
-            conn.accum_pos = 0;
+            // FAST PATH: if accumulator is empty (no partial command from previous read),
+            // parse directly from the read buffer — eliminates memcpy to accumulator.
+            if (conn.accum_pos >= conn.accum.items.len) {
+                conn.accum.clearRetainingCapacity();
+                conn.accum_pos = 0;
 
-            var pos: usize = 0;
-            while (pos < n) {
-                const data = read_buf[pos..n];
-                if (data.len >= 4 and data[0] == '*') {
-                    if (parseFastResp(data)) |result| {
-                        self.dispatchCommand(conn, result.args[0..result.argc]);
-                        pos += result.consumed;
-                        continue;
+                var pos: usize = 0;
+                while (pos < n) {
+                    const data = read_buf[pos..n];
+                    if (data.len >= 4 and data[0] == '*') {
+                        if (parseFastResp(data)) |result| {
+                            self.dispatchCommand(conn, result.args[0..result.argc]);
+                            pos += result.consumed;
+                            continue;
+                        }
+                    }
+                    break;
+                }
+
+                if (pos < n) {
+                    conn.accum.appendSlice(read_buf[pos..n]) catch {
+                        self.closeConn(conn.fd);
+                        return;
+                    };
+                    while (conn.accumData().len > 0) {
+                        if (!self.processOneCommand(conn)) break;
                     }
                 }
-                break; // incomplete or non-fast-path — move to accumulator
-            }
-
-            // Only copy leftover (partial command) to accumulator
-            if (pos < n) {
-                conn.accum.appendSlice(read_buf[pos..n]) catch {
+            } else {
+                conn.accum.appendSlice(read_buf[0..n]) catch {
                     self.closeConn(conn.fd);
                     return;
                 };
-                // Try parsing the accumulator for inline/full RESP commands
+
+                if (conn.accum.items.len > self.max_client_buffer) {
+                    _ = std.c.write(conn.fd, "-ERR max client buffer exceeded\r\n", 33);
+                    self.closeConn(conn.fd);
+                    return;
+                }
+
                 while (conn.accumData().len > 0) {
                     if (!self.processOneCommand(conn)) break;
                 }
-            }
-        } else {
-            // SLOW PATH: accumulator has leftover from previous read
-            conn.accum.appendSlice(read_buf[0..n]) catch {
-                self.closeConn(conn.fd);
-                return;
-            };
-
-            if (conn.accum.items.len > self.max_client_buffer) {
-                _ = std.c.write(conn.fd, "-ERR max client buffer exceeded\r\n", 33);
-                self.closeConn(conn.fd);
-                return;
-            }
-
-            while (conn.accumData().len > 0) {
-                if (!self.processOneCommand(conn)) break;
             }
         }
 
@@ -657,6 +670,54 @@ pub const Worker = struct {
 
     fn dispatchCommand(self: *Worker, conn: *Connection, args: []const []const u8) void {
         if (args.len == 0) return;
+
+        // ── Fast path: common case (authenticated, no pubsub, no transaction) ──
+        // Skips ~15 branch comparisons for the hot path.
+        if (conn.authenticated and !conn.pubsub_mode and conn.tx_queue == null) {
+            // Check for _REPL marker
+            if (args.len >= 2 and std.mem.eql(u8, args[0], "_REPL")) {
+                const real_args = args[1..];
+                if (self.ckv) |ckv| {
+                    if (self.executeHotFast(conn, real_args, ckv)) return;
+                }
+                self.executeCommand(conn, real_args);
+                return;
+            }
+
+            // Follower write forwarding
+            if (self.repl_follower) |rf| {
+                if (!rf.promoted.load(.acquire) and replication.isWriteCommand(args)) {
+                    const resp_bytes = rf.forwardWrite(args) catch {
+                        conn.write_buf.appendSlice("-ERR leader unavailable\r\n") catch {};
+                        return;
+                    };
+                    defer self.allocator.free(resp_bytes);
+                    conn.write_buf.appendSlice(resp_bytes) catch {};
+                    return;
+                }
+            }
+
+            // Hot path engine dispatch
+            if (self.ckv) |ckv| {
+                if (self.executeHotFast(conn, args, ckv)) {
+                    self.maybeBroadcast(args);
+                    return;
+                }
+            }
+
+            // SELECT (connection-level, not in CommandHandler)
+            if (isSelect(args)) {
+                self.handleSelect(conn, args);
+                return;
+            }
+
+            // Fall through to CommandHandler for non-hot-path commands
+            self.executeCommand(conn, args);
+            self.maybeBroadcast(args);
+            return;
+        }
+
+        // ── Slow path: handles auth, pubsub, transactions, etc. ──
 
         // AUTH gate: reject unauthenticated commands (except AUTH and PING)
         if (!conn.authenticated) {
@@ -936,6 +997,9 @@ pub const Worker = struct {
         std.debug.print("[repl-broadcast] cmd={s} payload_len={d}\n", .{ if (args.len > 0) args[0] else "?", payload.len });
         leader.broadcastMutation(payload);
     }
+
+    // ── Pool helpers ──────────────────────────────────────────────────
+
 
     // ── WATCH/UNWATCH ─────────────────────────────────────────────────
 
@@ -1377,18 +1441,110 @@ pub const Worker = struct {
         switch (cmd.len) {
             3 => switch (first) {
                 'G' => if (args.len >= 2 and equalsAsciiUpper(cmd, "GET")) {
-                    const ns_key = nsKey(conn.selected_db, args[1]) orelse return false;
-                    _ = ckv.getAndWriteBulk(ns_key, &conn.write_buf);
+                    // Ultra-fast GET with SeqLock — lock-free for inline values.
+                    const user_key = args[1];
+                    const db = conn.selected_db;
+                    if (db >= 16) return false;
+                    const prefix = DB_PREFIXES[db];
+                    const KVS = @import("../engine/kv.zig").KVStore;
+                    const S = struct { threadlocal var buf: [512]u8 = undefined; };
+                    const total = prefix.len + user_key.len;
+                    if (total > S.buf.len) return false;
+                    @memcpy(S.buf[0..prefix.len], prefix);
+                    @memcpy(S.buf[prefix.len..total], user_key);
+                    const ns_key = S.buf[0..total];
+
+                    const stripe = ckv.getStripePublic(ns_key);
+                    const entry_opt = stripe.map.getPtr(ns_key);
+                    if (entry_opt == null) {
+                        conn.write_buf.appendSlice("$-1\r\n") catch {};
+                        return true;
+                    }
+                    const entry = entry_opt.?;
+
+                    // Check deleted/expired (these flags are set under write lock, safe to read)
+                    if (entry.flags.deleted or
+                        (entry.flags.has_ttl and ckv.cached_now_ms > entry.expires_at))
+                    {
+                        conn.write_buf.appendSlice("$-1\r\n") catch {};
+                        return true;
+                    }
+
+                    // Integer path: read int_value atomically (8-byte aligned, atomic on 64-bit)
+                    if (entry.flags.is_integer) {
+                        const int_val = entry.int_value;
+                        var int_buf: [24]u8 = undefined;
+                        const int_str = std.fmt.bufPrint(&int_buf, "{d}", .{int_val}) catch return false;
+                        var hdr_buf: [32]u8 = undefined;
+                        const hdr = std.fmt.bufPrint(&hdr_buf, "${d}\r\n", .{int_str.len}) catch return false;
+                        conn.write_buf.ensureTotalCapacity(conn.write_buf.items.len + hdr.len + int_str.len + 2) catch {};
+                        conn.write_buf.appendSliceAssumeCapacity(hdr);
+                        conn.write_buf.appendSliceAssumeCapacity(int_str);
+                        conn.write_buf.appendSliceAssumeCapacity("\r\n");
+                        return true;
+                    }
+
+                    // Inline value path: SeqLock — NO pthread_rwlock needed
+                    if (entry.flags.is_inline) {
+                        var val_copy: [KVS.INLINE_BUF_SIZE]u8 = undefined;
+                        var vlen: u8 = undefined;
+
+                        // SeqLock read: retry if writer was active
+                        var attempts: u32 = 0;
+                        while (attempts < 64) : (attempts += 1) {
+                            const s1 = entry.seq.load(.acquire);
+                            if (s1 & 1 != 0) { // odd = write in progress
+                                std.atomic.spinLoopHint();
+                                continue;
+                            }
+                            vlen = entry.inline_len;
+                            @memcpy(val_copy[0..vlen], entry.inline_buf[0..vlen]);
+                            const s2 = entry.seq.load(.acquire);
+                            if (s1 == s2) break; // consistent read
+                            std.atomic.spinLoopHint();
+                        }
+
+                        var hdr_buf: [32]u8 = undefined;
+                        const hdr = std.fmt.bufPrint(&hdr_buf, "${d}\r\n", .{vlen}) catch return false;
+                        conn.write_buf.ensureTotalCapacity(conn.write_buf.items.len + hdr.len + vlen + 2) catch {};
+                        conn.write_buf.appendSliceAssumeCapacity(hdr);
+                        conn.write_buf.appendSliceAssumeCapacity(val_copy[0..vlen]);
+                        conn.write_buf.appendSliceAssumeCapacity("\r\n");
+                        return true;
+                    }
+
+                    // Large value fallback: read lock (rare — values > 128 bytes)
+                    ckv.readLockStripePublic(stripe);
+                    const vlen = entry.value.len;
+                    var val_stack: [4096]u8 = undefined;
+                    if (vlen <= val_stack.len) {
+                        @memcpy(val_stack[0..vlen], entry.value);
+                        ckv.readUnlockStripePublic(stripe);
+                        var hdr_buf: [32]u8 = undefined;
+                        const hdr = std.fmt.bufPrint(&hdr_buf, "${d}\r\n", .{vlen}) catch return false;
+                        conn.write_buf.ensureTotalCapacity(conn.write_buf.items.len + hdr.len + vlen + 2) catch {};
+                        conn.write_buf.appendSliceAssumeCapacity(hdr);
+                        conn.write_buf.appendSliceAssumeCapacity(val_stack[0..vlen]);
+                        conn.write_buf.appendSliceAssumeCapacity("\r\n");
+                    } else {
+                        conn.write_buf.ensureTotalCapacity(conn.write_buf.items.len + vlen + 40) catch {};
+                        var hdr_buf: [32]u8 = undefined;
+                        const hdr = std.fmt.bufPrint(&hdr_buf, "${d}\r\n", .{vlen}) catch {
+                            ckv.readUnlockStripePublic(stripe);
+                            return false;
+                        };
+                        conn.write_buf.appendSliceAssumeCapacity(hdr);
+                        conn.write_buf.appendSliceAssumeCapacity(entry.value);
+                        conn.write_buf.appendSliceAssumeCapacity("\r\n");
+                        ckv.readUnlockStripePublic(stripe);
+                    }
                     return true;
                 },
                 'S' => if (args.len >= 3 and equalsAsciiUpper(cmd, "SET")) {
+                    const KVS = @import("../engine/kv.zig").KVStore;
                     const ns_key = nsKey(conn.selected_db, args[1]) orelse return false;
-                    // Pre-allocate key+value OUTSIDE the stripe lock
-                    const key_copy = self.allocator.dupe(u8, ns_key) catch return false;
-                    const val_copy = self.allocator.dupe(u8, args[2]) catch {
-                        self.allocator.free(key_copy);
-                        return false;
-                    };
+                    const value = args[2];
+
                     var expires: i64 = 0;
                     if (args.len >= 5 and equalsAsciiUpper(args[3], "EX")) {
                         const t = std.fmt.parseInt(i64, args[4], 10) catch return false;
@@ -1397,9 +1553,37 @@ pub const Worker = struct {
                         const t = std.fmt.parseInt(i64, args[4], 10) catch return false;
                         expires = ckv.nowMillis() + t;
                     }
-                    // Lock held only for HashMap update (~20ns), not malloc (~60ns)
+
+                    // Lock-free fast path: update existing inline entry via SeqLock
+                    if (value.len <= KVS.INLINE_BUF_SIZE and expires == 0) {
+                        const stripe = ckv.getStripePublic(ns_key);
+                        const entry_opt = stripe.map.getPtr(ns_key);
+                        if (entry_opt) |entry| {
+                            if (!entry.flags.deleted) {
+                                // SeqLock write: bump to odd, memcpy, bump to even
+                                _ = entry.seq.fetchAdd(1, .release);
+                                @memcpy(entry.inline_buf[0..value.len], value);
+                                entry.inline_len = @intCast(value.len);
+                                entry.value = entry.inline_buf[0..value.len];
+                                entry.flags = .{ .is_inline = true };
+                                entry.expires_at = 0;
+                                _ = entry.seq.fetchAdd(1, .release);
+
+                                if (self.aof) |a| a.logCommand(args);
+                                self.bumpWatchVersion(conn.selected_db, args[1]);
+                                conn.write_buf.appendSlice(ct.resp_ok) catch {};
+                                return true;
+                            }
+                        }
+                    }
+
+                    // Fallback: new key or large value — use write lock
+                    const key_copy = self.allocator.dupe(u8, ns_key) catch return false;
+                    const val_copy = self.allocator.dupe(u8, value) catch {
+                        self.allocator.free(key_copy);
+                        return false;
+                    };
                     const stale = ckv.setPrealloc(ns_key, key_copy, val_copy, expires);
-                    // Free stale data OUTSIDE the lock
                     if (stale.stale_val) |v| self.allocator.free(v);
                     if (stale.stale_key) |k| self.allocator.free(k);
                     if (self.aof) |a| a.logCommand(args);
@@ -1555,6 +1739,20 @@ pub const Worker = struct {
                     if (self.set_store) |ss| {
                         const ns = nsKey(conn.selected_db, args[1]) orelse return false;
                         const dsl = self.ds_locks orelse return false;
+
+                        // Fast path: single member, check if already exists under READ lock
+                        if (args.len == 3) {
+                            dsl.rdlock(ns);
+                            const already = ss.sismember(ns, args[2]);
+                            dsl.unlock(ns);
+                            if (already) {
+                                // Member already in set — no mutation needed
+                                writeIntTo(&conn.write_buf, 0);
+                                return true;
+                            }
+                        }
+
+                        // Need write: pre-alloc + write lock
                         const members = args[2..];
                         var owned_buf: [16][]u8 = undefined;
                         if (members.len > owned_buf.len) return false;
@@ -1621,7 +1819,7 @@ pub const Worker = struct {
                     if (self.list_store) |ls| {
                         const ns = nsKey(conn.selected_db, args[1]) orelse return false;
                         const dsl = self.ds_locks orelse return false;
-                        // Pre-alloc values OUTSIDE lock
+                        // Pre-alloc values from per-worker pool (OUTSIDE lock, ~2ns vs ~30ns)
                         const vals = args[2..];
                         var owned_buf: [16][]u8 = undefined;
                         if (vals.len > owned_buf.len) return false;
@@ -1763,11 +1961,23 @@ pub const Worker = struct {
     /// Most responses fit in the TCP send buffer, so write() succeeds immediately.
     /// Only registers for writable events if EAGAIN (partial write).
     fn directFlush(self: *Worker, conn: *Connection) void {
+        // Cork the socket: buffer writes into one TCP segment (uncork sends).
+        // macOS: TCP_NOPUSH (4), Linux: TCP_CORK (3). IPPROTO_TCP = 6.
+        const cork_opt: c_int = if (comptime @import("builtin").os.tag == .linux) 3 else 4;
+        const cork_on: c_int = 1;
+        const cork_off: c_int = 0;
+        if (conn.ssl == null) {
+            _ = std.c.setsockopt(conn.fd, 6, cork_opt, @ptrCast(&cork_on), @sizeOf(c_int));
+        }
+
         while (conn.write_offset < conn.write_buf.items.len) {
             const remaining = conn.write_buf.items[conn.write_offset..];
             const rc = self.connWrite(conn, remaining.ptr, remaining.len);
             if (rc < 0) {
-                // Send buffer full — register for writable event
+                // Send buffer full — uncork and register for writable event
+                if (conn.ssl == null) {
+                    _ = std.c.setsockopt(conn.fd, 6, cork_opt, @ptrCast(&cork_off), @sizeOf(c_int));
+                }
                 if (!conn.write_registered) {
                     self.loop.enableWrite(conn.fd, @intCast(conn.fd)) catch {};
                     conn.write_registered = true;
@@ -1781,10 +1991,12 @@ pub const Worker = struct {
             conn.write_offset += @intCast(rc);
         }
 
-        // All data flushed
+        // All data flushed — uncork to send the batched segment
+        if (conn.ssl == null) {
+            _ = std.c.setsockopt(conn.fd, 6, cork_opt, @ptrCast(&cork_off), @sizeOf(c_int));
+        }
         conn.write_buf.clearRetainingCapacity();
         conn.write_offset = 0;
-        // Only call disableWrite if we previously registered
         if (conn.write_registered) {
             self.loop.disableWrite(conn.fd, @intCast(conn.fd)) catch {};
             conn.write_registered = false;

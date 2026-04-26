@@ -1114,6 +1114,12 @@ pub const Server = struct {
             const yes: c_int = 1;
             _ = std.c.setsockopt(fd, 6, 1, @ptrCast(&yes), @sizeOf(c_int));
 
+            // Larger socket buffers — more data per syscall, fewer wakeups.
+            const sndbuf: c_int = 256 * 1024; // 256KB send buffer
+            const rcvbuf: c_int = 256 * 1024; // 256KB receive buffer
+            _ = std.c.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.SNDBUF, @ptrCast(&sndbuf), @sizeOf(c_int));
+            _ = std.c.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.RCVBUF, @ptrCast(&rcvbuf), @sizeOf(c_int));
+
             // Set non-blocking.
             _ = std.c.fcntl(fd, std.c.F.SETFL, @as(c_int, @bitCast(std.c.O{ .NONBLOCK = true })));
 

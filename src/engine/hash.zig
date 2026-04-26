@@ -42,10 +42,12 @@ pub const HashStore = struct {
     };
 
     pub fn init(allocator: Allocator) HashStore {
-        return .{
+        var store = HashStore{
             .hashes = std.StringHashMap(FieldMap).init(allocator),
             .allocator = allocator,
         };
+        store.hashes.ensureTotalCapacity(4096) catch {};
+        return store;
     }
 
     pub fn deinit(self: *HashStore) void {
@@ -200,7 +202,10 @@ pub const HashStore = struct {
         const gop = try self.hashes.getOrPut(key);
         if (!gop.found_existing) {
             gop.key_ptr.* = try self.allocator.dupe(u8, key);
-            gop.value_ptr.* = FieldMap.init(self.allocator);
+            var fm = FieldMap.init(self.allocator);
+            // Pre-allocate 32 field slots to avoid resize under write lock
+            fm.fields.ensureTotalCapacity(32) catch {};
+            gop.value_ptr.* = fm;
         }
         return gop.value_ptr;
     }

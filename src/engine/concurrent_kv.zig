@@ -57,9 +57,9 @@ pub const ConcurrentKV = struct {
         const init_fn = @extern(*const fn (*std.c.pthread_rwlock_t, ?*const anyopaque) callconv(.c) c_int, .{ .name = "pthread_rwlock_init" });
         for (&self.stripes) |*s| {
             _ = init_fn(&s.rwlock, null);
-            // Pre-allocate 4096 slots per stripe (256 stripes × 4096 = 1M keys before resize).
+            // Pre-allocate 16384 slots per stripe (256 stripes × 16384 = 4M keys before resize).
             // This prevents HashMap grow during concurrent writes.
-            s.map.ensureTotalCapacity(4096) catch {};
+            s.map.ensureTotalCapacity(16384) catch {};
         }
     }
 
@@ -101,9 +101,13 @@ pub const ConcurrentKV = struct {
         defer readUnlockStripe(s);
 
         const entry = s.map.getPtr(key) orelse return null;
-        if (self.isExpired(entry)) {
-            // Don't evict under read lock — let lazy eviction happen on next write
-            return null;
+        if (self.isExpired(entry)) return null;
+        if (entry.flags.is_integer) {
+            // Format native int to string
+            var buf: [24]u8 = undefined;
+            const str = std.fmt.bufPrint(&buf, "{d}", .{entry.int_value}) catch return null;
+            const copy = self.allocator.dupe(u8, str) catch return null;
+            return .{ .data = copy, .allocator = self.allocator };
         }
         const copy = self.allocator.dupe(u8, entry.value) catch return null;
         return .{ .data = copy, .allocator = self.allocator };
@@ -136,6 +140,24 @@ pub const ConcurrentKV = struct {
             out.appendSlice("$-1\r\n") catch {};
             return false;
         }
+        // For integer entries, format from native int_value (no stored string needed)
+        if (entry.flags.is_integer) {
+            var int_buf: [24]u8 = undefined;
+            const int_str = std.fmt.bufPrint(&int_buf, "{d}", .{entry.int_value}) catch {
+                readUnlockStripe(s);
+                return false;
+            };
+            readUnlockStripe(s);
+            // Format RESP outside lock — int_str is on stack, no aliasing issues
+            var hdr2: [32]u8 = undefined;
+            const h2 = std.fmt.bufPrint(&hdr2, "${d}\r\n", .{int_str.len}) catch return false;
+            out.ensureTotalCapacity(out.items.len + h2.len + int_str.len + 2) catch {};
+            out.appendSliceAssumeCapacity(h2);
+            out.appendSliceAssumeCapacity(int_str);
+            out.appendSliceAssumeCapacity("\r\n");
+            return true;
+        }
+
         // Write RESP bulk string: "$len\r\nvalue\r\n"
         const vlen = entry.value.len;
         var hdr: [32]u8 = undefined;
@@ -145,7 +167,6 @@ pub const ConcurrentKV = struct {
         };
         const total_needed = out.items.len + h.len + vlen + 2;
         if (total_needed > out.capacity) {
-            // Large value — rare path, must realloc under lock
             out.ensureTotalCapacity(total_needed) catch {
                 readUnlockStripe(s);
                 return false;
@@ -179,23 +200,55 @@ pub const ConcurrentKV = struct {
         const has_ttl = expires_at != 0;
         const result = s.map.getPtr(key);
         if (result) |existing| {
-            const old_val = existing.value;
-            existing.value = owned_value;
+            // SeqLock: bump to odd (write in progress)
+            _ = existing.seq.fetchAdd(1, .release);
+
+            if (owned_value.len <= KVStore.INLINE_BUF_SIZE) {
+                // Small value: copy into inline buffer (in-place, no alloc)
+                @memcpy(existing.inline_buf[0..owned_value.len], owned_value);
+                existing.inline_len = @intCast(owned_value.len);
+                existing.value = existing.inline_buf[0..owned_value.len];
+                existing.flags = .{ .has_ttl = has_ttl, .is_inline = true };
+            } else {
+                existing.value = owned_value;
+                existing.flags = .{ .has_ttl = has_ttl };
+            }
             existing.expires_at = expires_at;
-            existing.flags = .{ .has_ttl = has_ttl };
+            existing.flags.is_integer = false;
+
+            // SeqLock: bump to even (write complete)
+            _ = existing.seq.fetchAdd(1, .release);
+
+            const old_val = if (!existing.flags.is_inline) existing.value else null;
             writeUnlockStripe(s);
-            // Free old value + unused key OUTSIDE lock
+            // For inline: free the pre-allocated value (not needed, stored inline)
+            // For non-inline: free the OLD value
+            if (owned_value.len <= KVStore.INLINE_BUF_SIZE) {
+                return .{ .stale_val = owned_value, .stale_key = owned_key };
+            }
             return .{ .stale_val = old_val, .stale_key = owned_key };
         } else {
-            s.map.put(owned_key, .{
-                .value = owned_value,
+            var new_entry = Entry{
                 .expires_at = expires_at,
                 .flags = .{ .has_ttl = has_ttl },
-            }) catch {
+                .value = undefined,
+            };
+            if (owned_value.len <= KVStore.INLINE_BUF_SIZE) {
+                @memcpy(new_entry.inline_buf[0..owned_value.len], owned_value);
+                new_entry.inline_len = @intCast(owned_value.len);
+                new_entry.value = new_entry.inline_buf[0..owned_value.len];
+                new_entry.flags.is_inline = true;
+            } else {
+                new_entry.value = owned_value;
+            }
+            s.map.put(owned_key, new_entry) catch {
                 writeUnlockStripe(s);
                 return .{ .stale_val = owned_value, .stale_key = owned_key };
             };
             writeUnlockStripe(s);
+            if (owned_value.len <= KVStore.INLINE_BUF_SIZE) {
+                return .{ .stale_val = owned_value, .stale_key = null };
+            }
             return .{ .stale_val = null, .stale_key = null };
         }
     }
@@ -299,61 +352,77 @@ pub const ConcurrentKV = struct {
         return result.toOwnedSlice();
     }
 
-    /// Atomic INCR/DECR: parse, add, format under ONE write lock.
-    /// Returns the new value, or error if not an integer.
+    /// Atomic INCR/DECR using native i64 storage. No string parse/format under lock.
+    /// First call parses the string; subsequent calls use cached int_value directly.
     pub fn incrBy(self: *ConcurrentKV, key: []const u8, delta: i64) error{ NotAnInteger, OutOfMemory }!i64 {
         const s = self.getStripe(key);
         writeLockStripe(s);
 
         const result = s.map.getPtr(key);
-        var current: i64 = 0;
         if (result) |existing| {
             if (self.isExpired(existing)) {
                 // Treat expired as 0
-                current = 0;
-            } else {
-                current = std.fmt.parseInt(i64, existing.value, 10) catch {
-                    writeUnlockStripe(s);
-                    return error.NotAnInteger;
-                };
+                existing.int_value = delta;
+                existing.flags = .{ .is_integer = true };
+                existing.last_access = self.cached_now_ms;
+                writeUnlockStripe(s);
+                return delta;
             }
-        }
 
-        const new_val = current + delta;
-        var val_buf: [32]u8 = undefined;
-        const val_str = std.fmt.bufPrint(&val_buf, "{d}", .{new_val}) catch {
-            writeUnlockStripe(s);
-            return error.OutOfMemory;
-        };
-        const owned_value = self.allocator.dupe(u8, val_str) catch {
-            writeUnlockStripe(s);
-            return error.OutOfMemory;
-        };
+            // If already marked as integer, use cached int_value directly (~1ns)
+            if (existing.flags.is_integer) {
+                existing.int_value += delta;
+                existing.last_access = self.cached_now_ms;
+                const new_val = existing.int_value;
+                writeUnlockStripe(s);
+                return new_val;
+            }
 
-        if (result) |existing| {
-            self.allocator.free(existing.value);
-            existing.value = owned_value;
+            // First INCR on a string value — parse once, then use native from here on
+            const current = std.fmt.parseInt(i64, existing.value, 10) catch {
+                writeUnlockStripe(s);
+                return error.NotAnInteger;
+            };
+            existing.int_value = current + delta;
+            existing.flags = .{ .is_integer = true };
             existing.last_access = self.cached_now_ms;
-            existing.flags = .{};
-        } else {
-            const owned_key = self.allocator.dupe(u8, key) catch {
-                self.allocator.free(owned_value);
-                writeUnlockStripe(s);
-                return error.OutOfMemory;
-            };
-            s.map.put(owned_key, .{
-                .value = owned_value,
-                .last_access = self.cached_now_ms,
-            }) catch {
-                self.allocator.free(owned_key);
-                self.allocator.free(owned_value);
-                writeUnlockStripe(s);
-                return error.OutOfMemory;
-            };
+            const new_val = existing.int_value;
+            writeUnlockStripe(s);
+            return new_val;
         }
+
+        // New key — create entry with native integer
+        const owned_key = self.allocator.dupe(u8, key) catch {
+            writeUnlockStripe(s);
+            return error.OutOfMemory;
+        };
+        s.map.put(owned_key, .{
+            .value = &[_]u8{}, // empty — GET will format from int_value
+            .int_value = delta,
+            .last_access = self.cached_now_ms,
+            .flags = .{ .is_integer = true },
+        }) catch {
+            self.allocator.free(owned_key);
+            writeUnlockStripe(s);
+            return error.OutOfMemory;
+        };
 
         writeUnlockStripe(s);
-        return new_val;
+        return delta;
+    }
+
+    // ── Public stripe access (for inlined GET hot path in worker) ──
+
+    pub fn getStripePublic(self: *ConcurrentKV, key: []const u8) *Stripe {
+        return self.getStripe(key);
+    }
+
+    pub fn readLockStripePublic(_: *ConcurrentKV, s: *Stripe) void {
+        readLockStripe(s);
+    }
+
+    pub fn readUnlockStripePublic(_: *ConcurrentKV, s: *Stripe) void {
+        readUnlockStripe(s);
     }
 
     // ── Internal helpers ──

@@ -4,7 +4,7 @@ A high-performance KV + Graph database written in Zig 0.16. Speaks the Redis pro
 
 ## Why Vex?
 
-- **Up to 86% faster than Redis** on same-machine workloads (median of 15 runs, `redis-benchmark` UDS: 5.75M LPOP vs 3.09M)
+- **Up to 79% faster than Redis** on same-machine workloads (median of 15 runs, `redis-benchmark` UDS: 6.17M LPOP vs 3.45M)
 - **22x faster shortest path than Memgraph** via bidirectional BFS + CSR adjacency
 - **Wins all 5 graph operations** vs Memgraph (add, traverse, path, neighbors)
 - **Redis-compatible** -- works with every Redis client library
@@ -73,13 +73,14 @@ Benchmarked with **`redis-benchmark`** (industry standard). Docker containers wi
 
 | Command | Redis TCP | Vex TCP | TCP Δ | Redis UDS | Vex UDS | UDS Δ |
 |---|---|---|---|---|---|---|
-| HSET | 1.02M | **1.55M** | **+51%** | 3.73M | **5.21M** | **+40%** |
-| GET | 1.30M | **1.81M** | **+40%** | 4.85M | **6.33M** | **+30%** |
-| LPOP | 1.51M | **2.05M** | **+36%** | 3.09M | **5.75M** | **+86%** |
-| SADD | 1.32M | **1.74M** | **+32%** | 5.21M | **5.75M** | **+10%** |
-| SET | 1.56M | **1.73M** | **+11%** | 3.88M | **6.25M** | **+61%** |
+| SADD | 1.14M | **1.76M** | **+55%** | 5.49M | **6.41M** | **+17%** |
+| LPOP | 1.35M | **2.08M** | **+55%** | 3.45M | **6.17M** | **+79%** |
+| RPOP | 1.43M | **2.07M** | **+46%** | 4.17M | **5.95M** | **+43%** |
+| RPUSH | 1.24M | **1.74M** | **+41%** | 4.81M | **5.49M** | **+14%** |
+| GET | 1.37M | **1.79M** | **+31%** | 4.90M | **7.04M** | **+44%** |
+| INCR | 1.61M | **1.74M** | **+8%** | 4.59M | **6.41M** | **+40%** |
 
-Median of 15 runs. Vex wins 9/9 TCP, 8/9 UDS. Full results: [Benchmarks](docs/benchmarks.md)
+Median of 15 runs. Vex wins 9/9 TCP (+8% to +55%), 8/9 UDS (+14% to +79%). Full results: [Benchmarks](docs/benchmarks.md)
 
 ### Graph: Vex vs Memgraph (10K nodes / 50K edges)
 
@@ -232,21 +233,32 @@ Redis-compatible KV + graph DB with multi-reactor architecture.
 
 ## Roadmap
 
-### v0.6 -- Partitioned Graph
+### v0.6 -- io_uring & Networking
+- io_uring batched read/write (Linux) — batch syscalls into single kernel submission
+- Full io_uring event loop (replace epoll fallback)
+- Connection lifecycle management via io_uring (accept, close)
+
+### v0.7 -- Partitioned Graph & Graph Query
 - Hash-partition graph nodes across machines
 - Ghost nodes for 1-hop boundary cache
 - BSP BFS for cross-partition traversals
 - Distributed Dijkstra
 - Consistent hash ring with vnodes
+- `GRAPH.MATCH` — pattern matching (subgraph queries)
+- `GRAPH.PAGERANK` — iterative PageRank
+- `GRAPH.COMPONENTS` — connected components (union-find)
+- `GRAPH.DEGREE key [IN|OUT]` — node degree count
+- `GRAPH.COMMON from to` — common neighbors
 
-### v0.7 -- Performance & Internals
-- Custom concurrent hashmap (replace Zig std HashMap for thread-safe resize under concurrent writes)
-- Sorted set skip list (O(log n) ZRANGE/ZRANK instead of O(n log n) sort-per-query)
+### v0.8 -- Engine Internals
+- Custom concurrent hashmap (replace Zig std HashMap for thread-safe resize)
+- Dual encoding for small collections (ziplist for lists/sets < 128 items)
+- Sorted set skip list (O(log n) ZRANGE/ZRANK)
 - Streams (`XADD`/`XREAD`/`XRANGE`/`XLEN`)
 - Persistence for lists, hashes, sets, sorted sets (snapshot + AOF)
-- io_uring batched read/write (Linux)
 
-### v0.8 -- Scripting & Query
+### v0.9 -- DPDK, Scripting & Query
+- DPDK kernel bypass networking (optional, Linux)
 - Lua scripting (`EVAL`/`EVALSHA`)
 - Graph secondary indexes on properties
 - Cypher query language subset

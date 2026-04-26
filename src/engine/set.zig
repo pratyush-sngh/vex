@@ -22,7 +22,9 @@ pub const SetStore = struct {
     };
 
     pub fn init(allocator: Allocator) SetStore {
-        return .{ .sets = std.StringHashMap(MemberSet).init(allocator), .allocator = allocator };
+        var store = SetStore{ .sets = std.StringHashMap(MemberSet).init(allocator), .allocator = allocator };
+        store.sets.ensureTotalCapacity(4096) catch {};
+        return store;
     }
 
     pub fn deinit(self: *SetStore) void {
@@ -192,7 +194,9 @@ pub const SetStore = struct {
         const gop = try self.sets.getOrPut(key);
         if (!gop.found_existing) {
             gop.key_ptr.* = try self.allocator.dupe(u8, key);
-            gop.value_ptr.* = MemberSet.init(self.allocator);
+            var ms = MemberSet.init(self.allocator);
+            ms.members.ensureTotalCapacity(32) catch {};
+            gop.value_ptr.* = ms;
         }
         return gop.value_ptr;
     }

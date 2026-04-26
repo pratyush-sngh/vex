@@ -6,30 +6,48 @@
 set -e
 
 RUNS=${1:-15}
-CMDS="set,get,incr,lpush,rpush,lpop,rpop,sadd,hset"
 TCP_N=500000
 UDS_N=500000
 PIPELINE=50
 CONCURRENCY=16
 
+# Tests to run. Names must match redis-benchmark -t output exactly.
+# Note: LRANGE tests require LPUSH to pre-populate, redis-benchmark handles this.
+TESTS=(
+    "SET"
+    "GET"
+    "INCR"
+    "LPUSH"
+    "RPUSH"
+    "LPOP"
+    "RPOP"
+    "SADD"
+    "HSET"
+    "ZADD"
+    "MSET"
+    "LRANGE_100"
+    "LRANGE_300"
+)
+
 echo "=== Vex vs Redis Benchmark (median of $RUNS runs) ==="
-echo "P=$PIPELINE, c=$CONCURRENCY, n=$TCP_N per run"
+echo "P=$PIPELINE, c=$CONCURRENCY, n=$TCP_N per run, ${#TESTS[@]} commands"
 echo ""
 
 median() {
     sort -n | awk '{a[NR]=$1} END{print a[int((NR+1)/2)]}'
 }
 
-run_bench() {
-    local label=$1
-    local args=$2
-    local cmd=$3
-    local runs=$4
+# For TCP: run from host via port mapping
+run_tcp() {
+    local port=$1
+    local test_name=$2
+    local runs=$3
+    local test_flag=$(echo "$test_name" | tr '[:upper:]' '[:lower:]')
 
     local vals=""
     for i in $(seq 1 $runs); do
-        local rps=$(redis-benchmark $args -c $CONCURRENCY -n $TCP_N -P $PIPELINE -q -t $cmd --csv 2>/dev/null \
-            | grep "\"$cmd\"" | head -1 | cut -d',' -f2 | tr -d '"')
+        local rps=$(redis-benchmark -h 127.0.0.1 -p $port -c $CONCURRENCY -n $TCP_N -P $PIPELINE -q -t "$test_flag" --csv 2>/dev/null \
+            | grep "\"$test_name" | head -1 | cut -d',' -f2 | tr -d '"')
         if [ -n "$rps" ] && [ "$rps" != "0.0" ]; then
             vals="$vals $rps"
         fi
@@ -43,30 +61,30 @@ run_bench() {
     echo "$vals" | tr ' ' '\n' | grep -v '^$' | median
 }
 
-echo "Running TCP benchmarks..."
-echo ""
-printf "%-8s %12s %12s %12s %12s\n" "Command" "Redis TCP" "Vex TCP" "Redis UDS" "Vex UDS"
-printf "%-8s %12s %12s %12s %12s\n" "-------" "---------" "-------" "---------" "-------"
+# For UDS: run inside Docker container
+run_uds() {
+    local sock=$1
+    local test_name=$2
+    local runs=$3
+    local test_flag=$(echo "$test_name" | tr '[:upper:]' '[:lower:]')
 
-for cmd in $(echo $CMDS | tr ',' ' '); do
-    CMD_UPPER=$(echo $cmd | tr '[:lower:]' '[:upper:]')
+    docker exec redis-compare bash -c "
+        for i in \$(seq 1 $runs); do
+            redis-benchmark -s $sock -c $CONCURRENCY -n $UDS_N -P $PIPELINE -q -t '$test_flag' --csv 2>/dev/null \
+                | grep '\"$test_name' | head -1 | cut -d',' -f2 | tr -d '\"'
+        done" 2>/dev/null | grep -v '^$' | median
+}
 
-    redis_tcp=$(run_bench "Redis TCP" "-h 127.0.0.1 -p 16379" "$CMD_UPPER" "$RUNS")
-    vex_tcp=$(run_bench "Vex TCP" "-h 127.0.0.1 -p 16380" "$CMD_UPPER" "$RUNS")
+printf "%-16s %12s %12s %12s %12s\n" "Command" "Redis TCP" "Vex TCP" "Redis UDS" "Vex UDS"
+printf "%-16s %12s %12s %12s %12s\n" "---------------" "---------" "-------" "---------" "-------"
 
-    redis_uds=$(docker exec redis-compare bash -c "
-        for i in \$(seq 1 $RUNS); do
-            redis-benchmark -s /socks/redis.sock -c $CONCURRENCY -n $UDS_N -P $PIPELINE -q -t $cmd --csv 2>/dev/null \
-                | grep '\"$CMD_UPPER\"' | head -1 | cut -d',' -f2 | tr -d '\"'
-        done" 2>/dev/null | grep -v '^$' | median)
+for test_name in "${TESTS[@]}"; do
+    redis_tcp=$(run_tcp 16379 "$test_name" "$RUNS")
+    vex_tcp=$(run_tcp 16380 "$test_name" "$RUNS")
+    redis_uds=$(run_uds /socks/redis.sock "$test_name" "$RUNS")
+    vex_uds=$(run_uds /socks/vex.sock "$test_name" "$RUNS")
 
-    vex_uds=$(docker exec redis-compare bash -c "
-        for i in \$(seq 1 $RUNS); do
-            redis-benchmark -s /socks/vex.sock -c $CONCURRENCY -n $UDS_N -P $PIPELINE -q -t $cmd --csv 2>/dev/null \
-                | grep '\"$CMD_UPPER\"' | head -1 | cut -d',' -f2 | tr -d '\"'
-        done" 2>/dev/null | grep -v '^$' | median)
-
-    printf "%-8s %12s %12s %12s %12s\n" "$CMD_UPPER" "$redis_tcp" "$vex_tcp" "$redis_uds" "$vex_uds"
+    printf "%-16s %12s %12s %12s %12s\n" "$test_name" "$redis_tcp" "$vex_tcp" "$redis_uds" "$vex_uds"
 done
 
 echo ""

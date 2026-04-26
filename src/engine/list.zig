@@ -72,10 +72,12 @@ pub const ListStore = struct {
     };
 
     pub fn init(allocator: Allocator) ListStore {
-        return .{
+        var store = ListStore{
             .lists = std.StringHashMap(List).init(allocator),
             .allocator = allocator,
         };
+        store.lists.ensureTotalCapacity(4096) catch {};
+        return store;
     }
 
     pub fn deinit(self: *ListStore) void {
@@ -87,6 +89,7 @@ pub const ListStore = struct {
         }
         self.lists.deinit();
     }
+
 
     /// LPUSH key value [value ...] — prepend values (O(1) each), returns new length.
     pub fn lpush(self: *ListStore, key: []const u8, values: []const []const u8) !usize {
@@ -276,11 +279,19 @@ pub const ListStore = struct {
         return true;
     }
 
+    pub fn freeVal(allocator: Allocator, v: []u8) void {
+        allocator.free(v);
+    }
+
     fn getOrCreate(self: *ListStore, key: []const u8) !*List {
         const gop = try self.lists.getOrPut(key);
         if (!gop.found_existing) {
             gop.key_ptr.* = try self.allocator.dupe(u8, key);
-            gop.value_ptr.* = List.init(self.allocator);
+            var list = List.init(self.allocator);
+            // Pre-allocate 64 slots per side to avoid realloc under write lock
+            list.head.ensureTotalCapacity(64) catch {};
+            list.tail.ensureTotalCapacity(64) catch {};
+            gop.value_ptr.* = list;
         }
         return gop.value_ptr;
     }
@@ -314,11 +325,11 @@ test "LPOP and RPOP" {
     _ = try store.rpush("q", &[_][]const u8{ "1", "2", "3" });
 
     const left = store.lpop("q").?;
-    defer std.testing.allocator.free(left);
+    defer ListStore.freeVal(std.testing.allocator, left);
     try std.testing.expectEqualStrings("1", left);
 
     const right = store.rpop("q").?;
-    defer std.testing.allocator.free(right);
+    defer ListStore.freeVal(std.testing.allocator, right);
     try std.testing.expectEqualStrings("3", right);
 
     try std.testing.expectEqual(@as(usize, 1), store.llen("q"));
@@ -375,6 +386,6 @@ test "empty after pop auto-deletes" {
 
     _ = try store.rpush("tmp", &[_][]const u8{"x"});
     const v = store.rpop("tmp").?;
-    defer std.testing.allocator.free(v);
+    defer ListStore.freeVal(std.testing.allocator, v);
     try std.testing.expect(!store.exists("tmp"));
 }

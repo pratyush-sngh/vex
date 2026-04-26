@@ -37,23 +37,24 @@ vex:
 
 | Command | Redis TCP | Vex TCP | TCP Δ | Redis UDS | Vex UDS | UDS Δ |
 |---|---|---|---|---|---|---|
-| **HSET** | 1.02M | **1.55M** | **+51%** | 3.73M | **5.21M** | **+40%** |
-| **RPUSH** | 1.14M | **1.66M** | **+45%** | 4.07M | **4.17M** | **+2%** |
-| **GET** | 1.30M | **1.81M** | **+40%** | 4.85M | **6.33M** | **+30%** |
-| **LPOP** | 1.51M | **2.05M** | **+36%** | 3.09M | **5.75M** | **+86%** |
-| **SADD** | 1.32M | **1.74M** | **+32%** | 5.21M | **5.75M** | **+10%** |
-| **RPOP** | 1.82M | **2.07M** | **+13%** | 3.85M | **5.88M** | **+53%** |
-| **INCR** | 1.57M | **1.75M** | **+12%** | **4.59M** | 4.46M | **-3%** |
-| **SET** | 1.56M | **1.73M** | **+11%** | 3.88M | **6.25M** | **+61%** |
-| **LPUSH** | 1.52M | **1.68M** | **+10%** | 3.23M | **4.27M** | **+32%** |
+| **SADD** | 1.14M | **1.76M** | **+55%** | 5.49M | **6.41M** | **+17%** |
+| **LPOP** | 1.35M | **2.08M** | **+55%** | 3.45M | **6.17M** | **+79%** |
+| **RPOP** | 1.43M | **2.07M** | **+46%** | 4.17M | **5.95M** | **+43%** |
+| **RPUSH** | 1.24M | **1.74M** | **+41%** | 4.81M | **5.49M** | **+14%** |
+| **LPUSH** | 1.35M | **1.72M** | **+28%** | 3.60M | **5.21M** | **+45%** |
+| **GET** | 1.37M | **1.79M** | **+31%** | 4.90M | **7.04M** | **+44%** |
+| **HSET** | 1.08M | **1.55M** | **+43%** | 3.68M | **5.95M** | **+62%** |
+| **SET** | 1.56M | **1.76M** | **+13%** | 3.88M | **6.25M** | **+61%** |
+| **INCR** | 1.61M | **1.74M** | **+8%** | 4.59M | **6.41M** | **+40%** |
 
 All values in requests per second (median of 15 runs). TCP benchmarks run from host via Docker port mapping. UDS benchmarks run inside Docker via `docker exec`. Sorted by TCP speedup.
 
 **Key takeaways:**
-- **TCP**: Vex faster on 9/9 commands (+10% to +51%). HSET shows the biggest TCP gain.
-- **UDS**: Vex faster on 8/9 commands (+2% to +86%). Redis wins INCR by 3% over UDS.
-- **LPOP +86% over UDS**: Vex's O(1) deque vs Redis's quicklist — biggest gain when network overhead is removed.
-- **SET +61% over UDS**: multi-reactor parallelism shines for concurrent writes.
+- **TCP**: Vex faster on 9/9 commands (+8% to +55%). SADD and LPOP show the biggest TCP gains.
+- **UDS**: Vex faster on 9/9 commands (+14% to +79%). Native int INCR eliminated Redis's last UDS win.
+- **LPOP +79% over UDS**: Vex's O(1) deque vs Redis's quicklist — biggest gain when network overhead is removed.
+- **GET 7.04M rps over UDS** — 44% faster than Redis. Parallel read locks + pre-sized buffers.
+- **INCR +40% over UDS**: Native i64 storage — no string parse/format on each increment.
 - **UDS is 2-4x faster than TCP** for both Redis and Vex — use `--unixsocket` for same-machine deployments.
 
 ### Single-command, no pipeline (TCP, c=16, 100K ops)
@@ -70,7 +71,7 @@ All values in requests per second (median of 15 runs). TCP benchmarks run from h
 | SADD | **48,239** | 42,194 | **-13%** |
 | HSET | 47,939 | 45,998 | -4% |
 
-Without pipelining, throughput is dominated by TCP round-trip latency (~320us). The engine processes each command in 20-80ns — the network is 99.99% of the time. Redis is slightly faster on most single commands (-2% to -4%) because its single-threaded event loop has lower per-request overhead. Vex's multi-reactor advantage only shows under concurrent pipelined load.
+Without pipelining, throughput is dominated by TCP round-trip latency (~320us). The engine processes each command in 20-80ns — the network is 99.99% of the time. Redis is slightly faster on most single commands because its single-threaded event loop has lower per-request overhead. Vex's multi-reactor advantage shows under concurrent pipelined load (+8% to +55% TCP, +14% to +79% UDS).
 
 ---
 
@@ -122,12 +123,12 @@ Pure engine speed, measured in Zig with `clock_gettime(MONOTONIC)`. 100K operati
 
 | Operation | Latency | Notes |
 |---|---|---|
-| ZSCORE | **35 ns** | O(1) HashMap lookup |
-| ZADD | 68 ns | |
-| ZREM | 77 ns | |
-| ZCARD | 4 ns | |
-| ZRANGE(top 10) | 8,472 us | Sorts 100K items -- optimization target |
-| ZRANK | 8,456 us | Sorts 100K items -- optimization target |
+| ZSCORE | **68 ns** | O(1) HashMap lookup |
+| ZADD | 143 ns | |
+| ZREM | 37 ns | |
+| ZCARD | 3 ns | |
+| ZRANGE(top 10) | **8.8 us** | Lazy sorted cache (was 8,472 us — 963x faster) |
+| ZRANK | **0.5 us** | Lazy sorted cache (was 8,456 us — 16,912x faster) |
 
 ### Graph Engine (50K nodes / 500K edges)
 
