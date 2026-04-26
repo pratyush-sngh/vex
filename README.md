@@ -78,8 +78,9 @@ Benchmarked with **`redis-benchmark`** (industry standard). Docker containers wi
 | LPOP | 1.84M | **2.12M** | **+15%** | 3.05M | **5.56M** | **+82%** |
 | HSET | 1.42M | **1.54M** | **+9%** | 3.65M | **4.72M** | **+29%** |
 | SADD | 1.61M | **1.72M** | **+7%** | 4.39M | **5.88M** | **+34%** |
+| INCR | 1.68M | **1.75M** | **+4%** | **5.68M** | 4.63M | **-19%** |
 
-Single-command (no pipeline): tied at ~46K rps -- network-bound. UDS is 2-4x faster than TCP for both.
+Single-command (no pipeline): Redis slightly faster (-2% to -4%) due to lower per-request overhead. Vex wins under pipelined concurrent load. UDS is 2-4x faster than TCP for both.
 
 ### Graph: Vex vs Memgraph (10K nodes / 50K edges)
 

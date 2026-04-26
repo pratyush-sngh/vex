@@ -39,38 +39,38 @@ vex:
 |---|---|---|---|---|---|---|
 | **GET** | 1.55M | **1.79M** | **+15%** | 4.72M | **7.81M** | **+66%** |
 | **SET** | 1.52M | **1.71M** | **+13%** | 3.76M | **4.95M** | **+32%** |
-| **INCR** | 1.68M | **1.75M** | +4% | 5.68M | 4.63M | -19% |
+| **INCR** | 1.68M | **1.75M** | **+4%** | **5.68M** | 4.63M | **-19%** |
 | **LPOP** | 1.84M | **2.12M** | **+15%** | 3.05M | **5.56M** | **+82%** |
 | **RPOP** | 1.86M | **2.07M** | **+11%** | 3.82M | **4.72M** | **+24%** |
 | **SADD** | 1.61M | **1.72M** | **+7%** | 4.39M | **5.88M** | **+34%** |
 | **HSET** | 1.42M | **1.54M** | **+9%** | 3.65M | **4.72M** | **+29%** |
 | **LPUSH** | 1.58M | **1.66M** | **+5%** | 3.16M | **4.72M** | **+49%** |
-| **RPUSH** | 1.65M | **1.68M** | +2% | 4.13M | **4.55M** | **+10%** |
+| **RPUSH** | 1.65M | **1.68M** | **+2%** | 4.13M | **4.55M** | **+10%** |
 
 All values in requests per second. TCP benchmarks run from host via Docker port mapping. UDS benchmarks run inside Docker via `docker exec`.
 
 **Key takeaways:**
-- **TCP**: Vex wins 9/9 commands (+2% to +15%). TCP overhead compresses the gap.
-- **UDS**: Vex wins 8/9 commands (+10% to +82%). Without TCP stack, the multi-reactor advantage is fully exposed.
+- **TCP**: Vex faster on 9/9 commands (+2% to +15%). TCP overhead compresses the gap.
+- **UDS**: Vex faster on 8/9 commands (+10% to +82%). Redis wins INCR by 19% over UDS.
 - **GET 7.81M rps over UDS** — 66% faster than Redis. Vex's parallel read locks shine when network isn't the bottleneck.
 - **LPOP +82% over UDS**: Vex's O(1) deque vs Redis's quicklist.
 - **UDS is 2-4x faster than TCP** for both Redis and Vex — use `--unixsocket` for same-machine deployments.
 
 ### Single-command, no pipeline (TCP, c=16, 100K ops)
 
-| Command | Redis rps | Vex rps | Delta |
+| Command | Redis rps | Vex rps | Δ |
 |---|---|---|---|
-| SET | 47,893 | 45,788 | tied |
-| GET | 46,729 | 45,704 | tied |
-| INCR | 44,484 | 44,863 | tied |
-| LPUSH | 47,281 | 45,935 | tied |
-| RPUSH | 47,687 | 45,872 | tied |
-| LPOP | 47,037 | 45,600 | tied |
-| RPOP | 46,904 | 46,125 | tied |
-| SADD | 48,239 | 42,194 | tied |
-| HSET | 47,939 | 45,998 | tied |
+| SET | 47,893 | 45,788 | -4% |
+| GET | 46,729 | 45,704 | -2% |
+| INCR | 44,484 | 44,863 | +1% |
+| LPUSH | 47,281 | 45,935 | -3% |
+| RPUSH | 47,687 | 45,872 | -4% |
+| LPOP | 47,037 | 45,600 | -3% |
+| RPOP | 46,904 | 46,125 | -2% |
+| SADD | **48,239** | 42,194 | **-13%** |
+| HSET | 47,939 | 45,998 | -4% |
 
-Without pipelining, throughput is dominated by TCP round-trip latency (~320us). The engine processes each command in 20-80ns — the network is 99.99% of the time.
+Without pipelining, throughput is dominated by TCP round-trip latency (~320us). The engine processes each command in 20-80ns — the network is 99.99% of the time. Redis is slightly faster on most single commands (-2% to -4%) because its single-threaded event loop has lower per-request overhead. Vex's multi-reactor advantage only shows under concurrent pipelined load.
 
 ---
 
