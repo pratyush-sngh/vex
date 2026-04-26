@@ -80,6 +80,17 @@ pub const ListStore = struct {
         return store;
     }
 
+    /// Clear all data but retain HashMap capacity for reuse.
+    pub fn flush(self: *ListStore) void {
+        var it = self.lists.iterator();
+        while (it.next()) |entry| {
+            var list = entry.value_ptr.*;
+            list.deinit(self.allocator);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.lists.clearRetainingCapacity();
+    }
+
     pub fn deinit(self: *ListStore) void {
         var it = self.lists.iterator();
         while (it.next()) |entry| {

@@ -74,6 +74,15 @@ pub const SortedSetStore = struct {
         return .{ .zsets = std.StringHashMap(ZSet).init(allocator), .allocator = allocator };
     }
 
+    pub fn flush(self: *SortedSetStore) void {
+        var it = self.zsets.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.deinit();
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.zsets.clearRetainingCapacity();
+    }
+
     pub fn deinit(self: *SortedSetStore) void {
         var it = self.zsets.iterator();
         while (it.next()) |entry| {

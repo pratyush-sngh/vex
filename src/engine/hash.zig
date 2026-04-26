@@ -50,6 +50,15 @@ pub const HashStore = struct {
         return store;
     }
 
+    pub fn flush(self: *HashStore) void {
+        var it = self.hashes.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.deinit();
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.hashes.clearRetainingCapacity();
+    }
+
     pub fn deinit(self: *HashStore) void {
         var it = self.hashes.iterator();
         while (it.next()) |entry| {

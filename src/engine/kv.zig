@@ -279,7 +279,7 @@ pub const KVStore = struct {
             self.allocator.free(entry.key_ptr.*);
             self.allocator.free(entry.value_ptr.value);
         }
-        self.map.clearAndFree();
+        self.map.clearRetainingCapacity();
         self.ttl_count = 0;
         self.tombstone_count = 0;
         self.live_count = 0;

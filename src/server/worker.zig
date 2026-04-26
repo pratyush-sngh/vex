@@ -1001,6 +1001,17 @@ pub const Worker = struct {
     // ── Pool helpers ──────────────────────────────────────────────────
 
 
+    // ── Flush all stores ──────────────────────────────────────────────
+
+    fn flushAllStores(self: *Worker, ckv: *ConcurrentKV) void {
+        ckv.flushdb();
+        // Flush data stores: free all data but retain pre-allocated HashMap capacity
+        if (self.list_store) |ls| ls.flush();
+        if (self.hash_store) |hs| hs.flush();
+        if (self.set_store) |ss| ss.flush();
+        if (self.sorted_set_store) |zs| zs.flush();
+    }
+
     // ── WATCH/UNWATCH ─────────────────────────────────────────────────
 
     fn handleWatch(self: *Worker, conn: *Connection, args: []const []const u8) void {
@@ -1912,11 +1923,16 @@ pub const Worker = struct {
                     return true;
                 },
                 'F' => if (equalsAsciiUpper(cmd, "FLUSHDB")) {
-                    ckv.flushdb();
+                    self.flushAllStores(ckv);
                     conn.write_buf.appendSlice(ct.resp_ok) catch {};
                     return true;
                 },
                 else => {},
+            },
+            8 => if (first == 'F' and equalsAsciiUpper(cmd, "FLUSHALL")) {
+                self.flushAllStores(ckv);
+                conn.write_buf.appendSlice(ct.resp_ok) catch {};
+                return true;
             },
             else => {},
         }

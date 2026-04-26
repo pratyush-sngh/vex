@@ -27,6 +27,15 @@ pub const SetStore = struct {
         return store;
     }
 
+    pub fn flush(self: *SetStore) void {
+        var it = self.sets.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.deinit();
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.sets.clearRetainingCapacity();
+    }
+
     pub fn deinit(self: *SetStore) void {
         var it = self.sets.iterator();
         while (it.next()) |entry| {
