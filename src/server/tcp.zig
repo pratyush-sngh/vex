@@ -1018,11 +1018,9 @@ pub const Server = struct {
         defer set_store.deinit();
         var sorted_set_store = ZS.init(self.allocator);
         defer sorted_set_store.deinit();
-        var ds_rwlock: std.c.pthread_rwlock_t = undefined;
-        {
-            const init_fn = @extern(*const fn (*std.c.pthread_rwlock_t, ?*const anyopaque) callconv(.c) c_int, .{ .name = "pthread_rwlock_init" });
-            _ = init_fn(&ds_rwlock, null);
-        }
+        const DsStripeLocks = @import("worker.zig").DsStripeLocks;
+        var ds_locks: DsStripeLocks = undefined;
+        ds_locks.init();
         var watch_map = WM.init(self.allocator);
         defer watch_map.deinit();
 
@@ -1054,7 +1052,7 @@ pub const Server = struct {
                 &hash_store,
                 &set_store,
                 &sorted_set_store,
-                &ds_rwlock,
+                &ds_locks,
                 &watch_map,
             );
         }

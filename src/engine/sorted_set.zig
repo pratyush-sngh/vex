@@ -14,16 +14,59 @@ pub const SortedSetStore = struct {
 
     const ZSet = struct {
         scores: std.StringHashMap(f64), // member → score (O(1) lookup)
+        sorted_cache: ?[]Entry, // lazily rebuilt sorted array
+        cache_dirty: bool,
         allocator: Allocator,
 
         fn init(allocator: Allocator) ZSet {
-            return .{ .scores = std.StringHashMap(f64).init(allocator), .allocator = allocator };
+            return .{
+                .scores = std.StringHashMap(f64).init(allocator),
+                .sorted_cache = null,
+                .cache_dirty = true,
+                .allocator = allocator,
+            };
         }
 
         fn deinit(self: *ZSet) void {
+            if (self.sorted_cache) |cache| self.allocator.free(cache);
             var it = self.scores.iterator();
             while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
             self.scores.deinit();
+        }
+
+        fn invalidateCache(self: *ZSet) void {
+            if (self.sorted_cache) |cache| self.allocator.free(cache);
+            self.sorted_cache = null;
+            self.cache_dirty = true;
+        }
+
+        fn ensureSorted(self: *ZSet) ?[]const Entry {
+            if (!self.cache_dirty) {
+                return self.sorted_cache;
+            }
+            // Rebuild sorted cache
+            const count = self.scores.count();
+            if (count == 0) {
+                self.sorted_cache = null;
+                self.cache_dirty = false;
+                return null;
+            }
+            const entries = self.allocator.alloc(Entry, count) catch return null;
+            var i: usize = 0;
+            var it = self.scores.iterator();
+            while (it.next()) |entry| {
+                entries[i] = .{ .member = entry.key_ptr.*, .score = entry.value_ptr.* };
+                i += 1;
+            }
+            std.mem.sort(Entry, entries, {}, struct {
+                fn lessThan(_: void, a: Entry, b: Entry) bool {
+                    if (a.score != b.score) return a.score < b.score;
+                    return std.mem.order(u8, a.member, b.member) == .lt;
+                }
+            }.lessThan);
+            self.sorted_cache = entries;
+            self.cache_dirty = false;
+            return entries;
         }
     };
 
@@ -55,6 +98,7 @@ pub const SortedSetStore = struct {
             }
             gop.value_ptr.* = score;
         }
+        zs.invalidateCache();
         return added;
     }
 
@@ -67,6 +111,7 @@ pub const SortedSetStore = struct {
             self.allocator.free(entry.key);
             removed += 1;
         }
+        if (removed > 0) zs.invalidateCache();
         if (zs.scores.count() == 0) self.removeKey(key);
         return removed;
     }
@@ -85,24 +130,20 @@ pub const SortedSetStore = struct {
 
     /// ZRANK key member — 0-based rank (by ascending score). Returns null if not found.
     pub fn zrank(self: *SortedSetStore, key: []const u8, member: []const u8, allocator: Allocator) !?usize {
+        _ = allocator;
         const zs = self.zsets.getPtr(key) orelse return null;
-        const target_score = zs.scores.get(member) orelse return null;
-        // Count members with lower score, or same score with lexicographically smaller member
-        const sorted = try self.getSorted(key, allocator);
-        defer allocator.free(sorted);
+        _ = zs.scores.get(member) orelse return null;
+        const sorted = zs.ensureSorted() orelse return null;
         for (sorted, 0..) |entry, i| {
-            if (entry.score == target_score and std.mem.eql(u8, entry.member, member)) return i;
+            if (std.mem.eql(u8, entry.member, member)) return i;
         }
         return null;
     }
 
     /// ZRANGE key start stop [WITHSCORES] — return members in rank range (ascending score).
     pub fn zrange(self: *SortedSetStore, key: []const u8, start_in: i64, stop_in: i64, allocator: Allocator) ![]const Entry {
-        const sorted = try self.getSorted(key, allocator);
-        if (sorted.len == 0) {
-            allocator.free(sorted);
-            return &[_]Entry{};
-        }
+        const zs = self.zsets.getPtr(key) orelse return &[_]Entry{};
+        const sorted = zs.ensureSorted() orelse return &[_]Entry{};
         const len: i64 = @intCast(sorted.len);
         var start = start_in;
         var stop = stop_in;
@@ -110,16 +151,12 @@ pub const SortedSetStore = struct {
         if (stop < 0) stop += len;
         if (start < 0) start = 0;
         if (stop >= len) stop = len - 1;
-        if (start > stop) {
-            allocator.free(sorted);
-            return &[_]Entry{};
-        }
+        if (start > stop) return &[_]Entry{};
         const s: usize = @intCast(start);
         const e: usize = @intCast(stop + 1);
-        // Copy the slice we need, free the rest
+        // Copy the slice for the caller
         const result = try allocator.alloc(Entry, e - s);
         @memcpy(result, sorted[s..e]);
-        allocator.free(sorted);
         return result;
     }
 
@@ -133,6 +170,7 @@ pub const SortedSetStore = struct {
         } else {
             gop.value_ptr.* += delta;
         }
+        zs.invalidateCache();
         return gop.value_ptr.*;
     }
 
@@ -158,27 +196,6 @@ pub const SortedSetStore = struct {
         entry.value.deinit();
         self.allocator.free(entry.key);
         return true;
-    }
-
-    /// Get all members sorted by score (ascending), then lexicographically.
-    fn getSorted(self: *SortedSetStore, key: []const u8, allocator: Allocator) ![]Entry {
-        const zs = self.zsets.getPtr(key) orelse return try allocator.alloc(Entry, 0);
-        const count = zs.scores.count();
-        if (count == 0) return try allocator.alloc(Entry, 0);
-        const entries = try allocator.alloc(Entry, count);
-        var i: usize = 0;
-        var it = zs.scores.iterator();
-        while (it.next()) |entry| {
-            entries[i] = .{ .member = entry.key_ptr.*, .score = entry.value_ptr.* };
-            i += 1;
-        }
-        std.mem.sort(Entry, entries, {}, struct {
-            fn lessThan(_: void, a: Entry, b: Entry) bool {
-                if (a.score != b.score) return a.score < b.score;
-                return std.mem.order(u8, a.member, b.member) == .lt;
-            }
-        }.lessThan);
-        return entries;
     }
 
     fn getOrCreate(self: *SortedSetStore, key: []const u8) !*ZSet {

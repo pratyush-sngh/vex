@@ -119,6 +119,37 @@ pub const PubSubRegistry = struct {
     }
 };
 
+/// Striped rwlocks for data type stores (lists, hashes, sets, sorted sets).
+/// 64 stripes — same idea as ConcurrentKV's 256 stripes but for data types.
+pub const DS_STRIPE_COUNT = 64;
+
+pub const DsStripeLocks = struct {
+    locks: [DS_STRIPE_COUNT]std.c.pthread_rwlock_t align(64),
+
+    pub fn init(self: *DsStripeLocks) void {
+        const init_fn = @extern(*const fn (*std.c.pthread_rwlock_t, ?*const anyopaque) callconv(.c) c_int, .{ .name = "pthread_rwlock_init" });
+        for (&self.locks) |*l| {
+            _ = init_fn(l, null);
+        }
+    }
+
+    fn stripeIndex(key: []const u8) usize {
+        return @as(usize, std.hash.Wyhash.hash(0, key)) % DS_STRIPE_COUNT;
+    }
+
+    pub fn rdlock(self: *DsStripeLocks, key: []const u8) void {
+        _ = std.c.pthread_rwlock_rdlock(&self.locks[stripeIndex(key)]);
+    }
+
+    pub fn wrlock(self: *DsStripeLocks, key: []const u8) void {
+        _ = std.c.pthread_rwlock_wrlock(&self.locks[stripeIndex(key)]);
+    }
+
+    pub fn unlock(self: *DsStripeLocks, key: []const u8) void {
+        _ = std.c.pthread_rwlock_unlock(&self.locks[stripeIndex(key)]);
+    }
+};
+
 /// Shared per-key version tracking for WATCH/EXEC optimistic locking.
 /// Every write to a key bumps its version. WATCH snapshots versions.
 /// EXEC aborts if any watched key's version changed.
@@ -286,7 +317,7 @@ pub const Worker = struct {
     hash_store: ?*HashStore,
     set_store: ?*SetStore,
     sorted_set_store: ?*SortedSetStore,
-    ds_rwlock: ?*std.c.pthread_rwlock_t, // shared rwlock for list/hash/set/zset stores
+    ds_locks: ?*DsStripeLocks, // striped rwlocks for list/hash/set/zset stores
     watch_map: ?*WatchMap,
     new_fds: [MAX_NEW_FDS]i32,
     new_fd_head: std.atomic.Value(usize),
@@ -316,7 +347,7 @@ pub const Worker = struct {
         hash_store: ?*HashStore,
         set_store: ?*SetStore,
         sorted_set_store: ?*SortedSetStore,
-        ds_rwlock: ?*std.c.pthread_rwlock_t,
+        ds_locks: ?*DsStripeLocks,
         watch_map: ?*WatchMap,
     ) !Worker {
         return .{
@@ -345,7 +376,7 @@ pub const Worker = struct {
             .hash_store = hash_store,
             .set_store = set_store,
             .sorted_set_store = sorted_set_store,
-            .ds_rwlock = ds_rwlock,
+            .ds_locks = ds_locks,
             .watch_map = watch_map,
             .new_fds = [_]i32{-1} ** MAX_NEW_FDS,
             .new_fd_head = std.atomic.Value(usize).init(0),
@@ -1413,9 +1444,9 @@ pub const Worker = struct {
                     if (args.len >= 4 and equalsAsciiUpper(cmd, "HSET")) {
                         if (self.hash_store) |hs| {
                             const ns = nsKey(conn.selected_db, args[1]) orelse return false;
-                            const rwl = self.ds_rwlock orelse return false;
-                            _ = std.c.pthread_rwlock_wrlock(rwl);
-                            defer _ = std.c.pthread_rwlock_unlock(rwl);
+                            const dsl = self.ds_locks orelse return false;
+                            dsl.wrlock(ns);
+                            defer dsl.unlock(ns);
                             const added = hs.hset(ns, args[2..]) catch return false;
                             if (self.aof) |a| a.logCommand(args);
                             self.bumpWatchVersion(conn.selected_db, args[1]);
@@ -1426,9 +1457,9 @@ pub const Worker = struct {
                     if (args.len >= 3 and equalsAsciiUpper(cmd, "HGET")) {
                         if (self.hash_store) |hs| {
                             const ns = nsKey(conn.selected_db, args[1]) orelse return false;
-                            const rwl = self.ds_rwlock orelse return false;
-                            _ = std.c.pthread_rwlock_rdlock(rwl);
-                            defer _ = std.c.pthread_rwlock_unlock(rwl);
+                            const dsl = self.ds_locks orelse return false;
+                            dsl.rdlock(ns);
+                            defer dsl.unlock(ns);
                             if (hs.hget(ns, args[2])) |val| {
                                 writeBulkTo(&conn.write_buf, val);
                             } else {
@@ -1440,9 +1471,9 @@ pub const Worker = struct {
                     if (args.len >= 2 and equalsAsciiUpper(cmd, "HLEN")) {
                         if (self.hash_store) |hs| {
                             const ns = nsKey(conn.selected_db, args[1]) orelse return false;
-                            const rwl = self.ds_rwlock orelse return false;
-                            _ = std.c.pthread_rwlock_rdlock(rwl);
-                            defer _ = std.c.pthread_rwlock_unlock(rwl);
+                            const dsl = self.ds_locks orelse return false;
+                            dsl.rdlock(ns);
+                            defer dsl.unlock(ns);
                             writeIntTo(&conn.write_buf, @intCast(hs.hlen(ns)));
                             return true;
                         }
@@ -1452,9 +1483,9 @@ pub const Worker = struct {
                     if (args.len >= 2 and equalsAsciiUpper(cmd, "LLEN")) {
                         if (self.list_store) |ls| {
                             const ns = nsKey(conn.selected_db, args[1]) orelse return false;
-                            const rwl = self.ds_rwlock orelse return false;
-                            _ = std.c.pthread_rwlock_rdlock(rwl);
-                            defer _ = std.c.pthread_rwlock_unlock(rwl);
+                            const dsl = self.ds_locks orelse return false;
+                            dsl.rdlock(ns);
+                            defer dsl.unlock(ns);
                             writeIntTo(&conn.write_buf, @intCast(ls.llen(ns)));
                             return true;
                         }
@@ -1462,9 +1493,9 @@ pub const Worker = struct {
                     if (args.len >= 2 and equalsAsciiUpper(cmd, "LPOP")) {
                         if (self.list_store) |ls| {
                             const ns = nsKey(conn.selected_db, args[1]) orelse return false;
-                            const rwl = self.ds_rwlock orelse return false;
-                            _ = std.c.pthread_rwlock_wrlock(rwl);
-                            defer _ = std.c.pthread_rwlock_unlock(rwl);
+                            const dsl = self.ds_locks orelse return false;
+                            dsl.wrlock(ns);
+                            defer dsl.unlock(ns);
                             if (ls.lpop(ns)) |val| {
                                 defer self.allocator.free(val);
                                 if (self.aof) |a| a.logCommand(args);
@@ -1479,9 +1510,9 @@ pub const Worker = struct {
                 'R' => if (args.len >= 2 and equalsAsciiUpper(cmd, "RPOP")) {
                     if (self.list_store) |ls| {
                         const ns = nsKey(conn.selected_db, args[1]) orelse return false;
-                        const rwl = self.ds_rwlock orelse return false;
-                        _ = std.c.pthread_rwlock_wrlock(rwl);
-                        defer _ = std.c.pthread_rwlock_unlock(rwl);
+                        const dsl = self.ds_locks orelse return false;
+                        dsl.wrlock(ns);
+                        defer dsl.unlock(ns);
                         if (ls.rpop(ns)) |val| {
                             defer self.allocator.free(val);
                             if (self.aof) |a| a.logCommand(args);
@@ -1495,9 +1526,9 @@ pub const Worker = struct {
                 'S' => if (args.len >= 3 and equalsAsciiUpper(cmd, "SADD")) {
                     if (self.set_store) |ss| {
                         const ns = nsKey(conn.selected_db, args[1]) orelse return false;
-                        const rwl = self.ds_rwlock orelse return false;
-                        _ = std.c.pthread_rwlock_wrlock(rwl);
-                        defer _ = std.c.pthread_rwlock_unlock(rwl);
+                        const dsl = self.ds_locks orelse return false;
+                        dsl.wrlock(ns);
+                        defer dsl.unlock(ns);
                         const added = ss.sadd(ns, args[2..]) catch return false;
                         if (self.aof) |a| a.logCommand(args);
                         self.bumpWatchVersion(conn.selected_db, args[1]);
@@ -1509,9 +1540,9 @@ pub const Worker = struct {
                     if (args.len >= 4 and equalsAsciiUpper(cmd, "ZADD")) {
                         if (self.sorted_set_store) |zs| {
                             const ns = nsKey(conn.selected_db, args[1]) orelse return false;
-                            const rwl = self.ds_rwlock orelse return false;
-                            _ = std.c.pthread_rwlock_wrlock(rwl);
-                            defer _ = std.c.pthread_rwlock_unlock(rwl);
+                            const dsl = self.ds_locks orelse return false;
+                            dsl.wrlock(ns);
+                            defer dsl.unlock(ns);
                             const added = zs.zadd(ns, args[2..]) catch return false;
                             if (self.aof) |a| a.logCommand(args);
                             self.bumpWatchVersion(conn.selected_db, args[1]);
@@ -1526,9 +1557,9 @@ pub const Worker = struct {
                 'L' => if (args.len >= 3 and equalsAsciiUpper(cmd, "LPUSH")) {
                     if (self.list_store) |ls| {
                         const ns = nsKey(conn.selected_db, args[1]) orelse return false;
-                        const rwl = self.ds_rwlock orelse return false;
-                        _ = std.c.pthread_rwlock_wrlock(rwl);
-                        defer _ = std.c.pthread_rwlock_unlock(rwl);
+                        const dsl = self.ds_locks orelse return false;
+                        dsl.wrlock(ns);
+                        defer dsl.unlock(ns);
                         const len = ls.lpush(ns, args[2..]) catch return false;
                         if (self.aof) |a| a.logCommand(args);
                         self.bumpWatchVersion(conn.selected_db, args[1]);
@@ -1539,9 +1570,9 @@ pub const Worker = struct {
                 'R' => if (args.len >= 3 and equalsAsciiUpper(cmd, "RPUSH")) {
                     if (self.list_store) |ls| {
                         const ns = nsKey(conn.selected_db, args[1]) orelse return false;
-                        const rwl = self.ds_rwlock orelse return false;
-                        _ = std.c.pthread_rwlock_wrlock(rwl);
-                        defer _ = std.c.pthread_rwlock_unlock(rwl);
+                        const dsl = self.ds_locks orelse return false;
+                        dsl.wrlock(ns);
+                        defer dsl.unlock(ns);
                         const len = ls.rpush(ns, args[2..]) catch return false;
                         if (self.aof) |a| a.logCommand(args);
                         self.bumpWatchVersion(conn.selected_db, args[1]);
@@ -1552,9 +1583,9 @@ pub const Worker = struct {
                 'S' => if (args.len >= 2 and equalsAsciiUpper(cmd, "SCARD")) {
                     if (self.set_store) |ss| {
                         const ns = nsKey(conn.selected_db, args[1]) orelse return false;
-                        const rwl = self.ds_rwlock orelse return false;
-                        _ = std.c.pthread_rwlock_rdlock(rwl);
-                        defer _ = std.c.pthread_rwlock_unlock(rwl);
+                        const dsl = self.ds_locks orelse return false;
+                        dsl.rdlock(ns);
+                        defer dsl.unlock(ns);
                         writeIntTo(&conn.write_buf, @intCast(ss.scard(ns)));
                         return true;
                     }
@@ -1562,9 +1593,9 @@ pub const Worker = struct {
                 'Z' => if (args.len >= 2 and equalsAsciiUpper(cmd, "ZCARD")) {
                     if (self.sorted_set_store) |zs| {
                         const ns = nsKey(conn.selected_db, args[1]) orelse return false;
-                        const rwl = self.ds_rwlock orelse return false;
-                        _ = std.c.pthread_rwlock_rdlock(rwl);
-                        defer _ = std.c.pthread_rwlock_unlock(rwl);
+                        const dsl = self.ds_locks orelse return false;
+                        dsl.rdlock(ns);
+                        defer dsl.unlock(ns);
                         writeIntTo(&conn.write_buf, @intCast(zs.zcard(ns)));
                         return true;
                     }
