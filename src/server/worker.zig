@@ -164,6 +164,8 @@ pub const WatchMap = struct {
     versions: std.StringHashMap(u64),
     mutex: std.c.pthread_mutex_t,
     allocator: Allocator,
+    /// Number of active watches across all connections. When 0, bumpVersion is a no-op.
+    active_watches: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     pub fn init(allocator: Allocator) WatchMap {
         return .{
@@ -186,6 +188,8 @@ pub const WatchMap = struct {
     }
 
     pub fn bumpVersion(self: *WatchMap, key: []const u8) void {
+        // Fast exit: no active watches → skip mutex + HashMap entirely
+        if (self.active_watches.load(.monotonic) == 0) return;
         _ = std.c.pthread_mutex_lock(&self.mutex);
         defer _ = std.c.pthread_mutex_unlock(&self.mutex);
         const gop = self.versions.getOrPut(key) catch return;
@@ -1039,11 +1043,16 @@ pub const Worker = struct {
                 self.allocator.free(key_copy);
             };
         }
+        // Track active watches for fast bumpVersion skip
+        _ = wm.active_watches.fetchAdd(1, .monotonic);
         conn.write_buf.appendSlice("+OK\r\n") catch {};
     }
 
     fn clearWatches(self: *Worker, conn: *Connection) void {
         if (conn.watched_keys) |*wk| {
+            if (wk.items.len > 0) {
+                if (self.watch_map) |wm| _ = wm.active_watches.fetchSub(1, .monotonic);
+            }
             for (wk.items) |entry| self.allocator.free(entry.key);
             wk.deinit();
             conn.watched_keys = null;
@@ -1746,8 +1755,8 @@ pub const Worker = struct {
                             dsl.wrlock(ns);
                             const val = ls.lpop(ns);
                             dsl.unlock(ns);
+                            // No free needed — flat buffer list returns slice into internal buf
                             if (val) |v| {
-                                defer self.allocator.free(v);
                                 if (self.aof) |a| a.logCommand(args);
                                 writeBulkTo(&conn.write_buf, v);
                             } else {
@@ -1765,7 +1774,6 @@ pub const Worker = struct {
                         const val = ls.rpop(ns);
                         dsl.unlock(ns);
                         if (val) |v| {
-                            defer self.allocator.free(v);
                             if (self.aof) |a| a.logCommand(args);
                             writeBulkTo(&conn.write_buf, v);
                         } else {
@@ -2170,6 +2178,31 @@ fn parseIntLine(data: []const u8, pos: *usize) ?i64 {
 }
 
 fn writeBulkTo(list: *std.array_list.Managed(u8), data: []const u8) void {
+    // Fast path: small values (< 100 bytes) — build entire response in stack buffer, one appendSlice
+    if (data.len < 100) {
+        var buf: [140]u8 = undefined; // $XX\r\n + 100 bytes + \r\n
+        var pos: usize = 0;
+        buf[pos] = '$';
+        pos += 1;
+        if (data.len < 10) {
+            buf[pos] = @intCast('0' + data.len);
+            pos += 1;
+        } else {
+            buf[pos] = @intCast('0' + data.len / 10);
+            buf[pos + 1] = @intCast('0' + data.len % 10);
+            pos += 2;
+        }
+        buf[pos] = '\r';
+        buf[pos + 1] = '\n';
+        pos += 2;
+        @memcpy(buf[pos .. pos + data.len], data);
+        pos += data.len;
+        buf[pos] = '\r';
+        buf[pos + 1] = '\n';
+        pos += 2;
+        list.appendSlice(buf[0..pos]) catch return;
+        return;
+    }
     var hdr: [32]u8 = undefined;
     const h = std.fmt.bufPrint(&hdr, "${d}\r\n", .{data.len}) catch return;
     list.appendSlice(h) catch return;
@@ -2177,7 +2210,21 @@ fn writeBulkTo(list: *std.array_list.Managed(u8), data: []const u8) void {
     list.appendSlice("\r\n") catch return;
 }
 
+/// Pre-computed RESP integer responses for 0-31 (covers most return values).
+const RESP_INTS = blk: {
+    @setEvalBranchQuota(10000);
+    var table: [32][]const u8 = undefined;
+    for (0..32) |i| {
+        table[i] = std.fmt.comptimePrint(":{d}\r\n", .{i});
+    }
+    break :blk table;
+};
+
 fn writeIntTo(list: *std.array_list.Managed(u8), n: i64) void {
+    if (n >= 0 and n < 32) {
+        list.appendSlice(RESP_INTS[@intCast(n)]) catch return;
+        return;
+    }
     var buf: [32]u8 = undefined;
     const s = std.fmt.bufPrint(&buf, ":{d}\r\n", .{n}) catch return;
     list.appendSlice(s) catch return;

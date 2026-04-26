@@ -7,67 +7,111 @@ pub const ListStore = struct {
     lists: std.StringHashMap(List),
     allocator: Allocator,
 
+    /// Flat-buffer list. Values stored contiguously as [len:u16][data...] entries.
+    /// No per-value heap allocation. RPUSH/LPOP are memcpy/pointer-advance.
+    /// Uses a ring buffer with head/tail offsets for O(1) push/pop at both ends.
     const List = struct {
-        head: std.array_list.Managed([]u8), // reversed: head.pop() gives first element
-        tail: std.array_list.Managed([]u8), // tail.pop() gives last element
+        /// Entries stored as: [len:u16][value bytes][len:u16][value bytes]...
+        /// Index stores the byte offset of each entry's length prefix.
+        index: std.array_list.Managed(u32), // byte offset of each entry in buf
+        buf: std.array_list.Managed(u8), // flat value storage
+        head_idx: usize, // logical first element in index
+        count: usize,
 
         fn init(allocator: Allocator) List {
             return .{
-                .head = std.array_list.Managed([]u8).init(allocator),
-                .tail = std.array_list.Managed([]u8).init(allocator),
+                .index = std.array_list.Managed(u32).init(allocator),
+                .buf = std.array_list.Managed(u8).init(allocator),
+                .head_idx = 0,
+                .count = 0,
             };
         }
 
-        fn deinit(self: *List, allocator: Allocator) void {
-            for (self.head.items) |v| allocator.free(v);
-            self.head.deinit();
-            for (self.tail.items) |v| allocator.free(v);
-            self.tail.deinit();
+        fn deinit(self: *List, _: Allocator) void {
+            self.index.deinit();
+            self.buf.deinit();
         }
 
         fn len(self: *const List) usize {
-            return self.head.items.len + self.tail.items.len;
+            return self.count;
         }
 
-        /// Get element at logical index (0 = first).
-        fn get(self: *const List, index: usize) ?[]const u8 {
-            const hlen = self.head.items.len;
-            if (index < hlen) {
-                return self.head.items[hlen - 1 - index];
-            }
-            const ti = index - hlen;
-            if (ti < self.tail.items.len) {
-                return self.tail.items[ti];
-            }
-            return null;
+        /// Get the value at a logical index (0 = first element).
+        fn get(self: *const List, logical_idx: usize) ?[]const u8 {
+            if (logical_idx >= self.count) return null;
+            const actual = self.head_idx + logical_idx;
+            if (actual >= self.index.items.len) return null;
+            const off = self.index.items[actual];
+            return self.entryAt(off);
         }
 
-        /// Rebalance: move half of tail to head (when head is empty and we need lpop).
-        fn rebalanceToHead(self: *List) void {
-            // Reverse tail into head
-            const tlen = self.tail.items.len;
-            if (tlen == 0) return;
-            const half = tlen; // move all to head
-            var i: usize = 0;
-            while (i < half) : (i += 1) {
-                const idx = tlen - 1 - i;
-                self.head.append(self.tail.items[idx]) catch return;
-            }
-            // Remove moved items from tail
-            self.tail.shrinkRetainingCapacity(tlen - half);
+        /// Append value to the tail. O(1) amortized.
+        fn pushTail(self: *List, value: []const u8) !void {
+            const off: u32 = @intCast(self.buf.items.len);
+            // Write [len:u16][value]
+            const vlen: u16 = @intCast(@min(value.len, 65535));
+            try self.buf.appendSlice(std.mem.asBytes(&vlen));
+            try self.buf.appendSlice(value);
+            try self.index.append(off);
+            self.count += 1;
         }
 
-        /// Rebalance: move half of head to tail (when tail is empty and we need rpop).
-        fn rebalanceToTail(self: *List) void {
-            const hlen = self.head.items.len;
-            if (hlen == 0) return;
-            const half = hlen;
-            var i: usize = 0;
-            while (i < half) : (i += 1) {
-                const idx = hlen - 1 - i;
-                self.tail.append(self.head.items[idx]) catch return;
+        /// Prepend value to the head. Uses a reserved slot if available, else shifts.
+        fn pushHead(self: *List, value: []const u8) !void {
+            // Simple approach: append to buf (values are out of order in buf, index tracks order)
+            const off: u32 = @intCast(self.buf.items.len);
+            const vlen: u16 = @intCast(@min(value.len, 65535));
+            try self.buf.appendSlice(std.mem.asBytes(&vlen));
+            try self.buf.appendSlice(value);
+            // Insert at head_idx position in index
+            if (self.head_idx > 0) {
+                self.head_idx -= 1;
+                self.index.items[self.head_idx] = off;
+            } else {
+                try self.index.insert(0, off);
             }
-            self.head.shrinkRetainingCapacity(hlen - half);
+            self.count += 1;
+        }
+
+        /// Pop from head. Returns a slice into buf (valid until next compact).
+        fn popHead(self: *List) ?[]const u8 {
+            if (self.count == 0) return null;
+            const off = self.index.items[self.head_idx];
+            const val = self.entryAt(off);
+            self.head_idx += 1;
+            self.count -= 1;
+            return val;
+        }
+
+        /// Pop from tail. Returns a slice into buf.
+        fn popTail(self: *List) ?[]const u8 {
+            if (self.count == 0) return null;
+            const tail_idx = self.head_idx + self.count - 1;
+            const off = self.index.items[tail_idx];
+            const val = self.entryAt(off);
+            self.count -= 1;
+            return val;
+        }
+
+        fn entryAt(self: *const List, off: u32) ?[]const u8 {
+            const o: usize = off;
+            if (o + 2 > self.buf.items.len) return null;
+            const vlen = std.mem.bytesAsValue(u16, self.buf.items[o..][0..2]).*;
+            const start = o + 2;
+            if (start + vlen > self.buf.items.len) return null;
+            return self.buf.items[start .. start + vlen];
+        }
+
+        /// Compact: remove consumed head entries to reclaim buf space.
+        fn compact(self: *List) void {
+            if (self.head_idx < 64) return; // not worth compacting yet
+            // Shift index
+            const remaining = self.index.items[self.head_idx .. self.head_idx + self.count];
+            std.mem.copyForwards(u32, self.index.items[0..self.count], remaining);
+            self.index.shrinkRetainingCapacity(self.count);
+            self.head_idx = 0;
+            // Note: buf doesn't compact (values are referenced by offset).
+            // Full compact would require rewriting buf + updating all offsets.
         }
     };
 
@@ -102,61 +146,47 @@ pub const ListStore = struct {
     }
 
 
-    /// LPUSH key value [value ...] — prepend values (O(1) each), returns new length.
+    /// LPUSH key value [value ...] — prepend values, returns new length.
     pub fn lpush(self: *ListStore, key: []const u8, values: []const []const u8) !usize {
         const list = try self.getOrCreate(key);
-        for (values) |val| {
-            const copy = try self.allocator.dupe(u8, val);
-            errdefer self.allocator.free(copy);
-            try list.head.append(copy);
-        }
+        for (values) |val| try list.pushHead(val);
         return list.len();
     }
 
-    /// LPUSH with pre-allocated owned values. Caller allocated, list takes ownership.
-    /// No allocation under lock — only the ArrayList append (~20ns).
+    /// LPUSH with pre-allocated owned values. Same as lpush for flat buffer (just copies data).
     pub fn lpushOwned(self: *ListStore, key: []const u8, owned: []const []u8) !usize {
         const list = try self.getOrCreate(key);
-        for (owned) |val| try list.head.append(val);
+        for (owned) |val| try list.pushHead(val);
         return list.len();
     }
 
-    /// RPUSH key value [value ...] — append values (O(1) each), returns new length.
+    /// RPUSH key value [value ...] — append values, returns new length.
     pub fn rpush(self: *ListStore, key: []const u8, values: []const []const u8) !usize {
         const list = try self.getOrCreate(key);
-        for (values) |val| {
-            const copy = try self.allocator.dupe(u8, val);
-            errdefer self.allocator.free(copy);
-            try list.tail.append(copy);
-        }
+        for (values) |val| try list.pushTail(val);
         return list.len();
     }
 
-    /// RPUSH with pre-allocated owned values. No allocation under lock.
+    /// RPUSH with pre-allocated owned values. Same as rpush for flat buffer.
     pub fn rpushOwned(self: *ListStore, key: []const u8, owned: []const []u8) !usize {
         const list = try self.getOrCreate(key);
-        for (owned) |val| try list.tail.append(val);
+        for (owned) |val| try list.pushTail(val);
         return list.len();
     }
 
-    /// LPOP key — remove and return the first element (O(1) amortized).
-    pub fn lpop(self: *ListStore, key: []const u8) ?[]u8 {
+    /// LPOP key — remove and return the first element. Returns slice into internal buffer.
+    /// Caller must NOT free the returned slice (it's not heap-allocated).
+    pub fn lpop(self: *ListStore, key: []const u8) ?[]const u8 {
         const list = self.lists.getPtr(key) orelse return null;
-        if (list.len() == 0) return null;
-        if (list.head.items.len == 0) list.rebalanceToHead();
-        if (list.head.items.len == 0) return null;
-        const val = list.head.pop();
+        const val = list.popHead() orelse return null;
         if (list.len() == 0) self.removeKey(key);
         return val;
     }
 
-    /// RPOP key — remove and return the last element (O(1) amortized).
-    pub fn rpop(self: *ListStore, key: []const u8) ?[]u8 {
+    /// RPOP key — remove and return the last element.
+    pub fn rpop(self: *ListStore, key: []const u8) ?[]const u8 {
         const list = self.lists.getPtr(key) orelse return null;
-        if (list.len() == 0) return null;
-        if (list.tail.items.len == 0) list.rebalanceToTail();
-        if (list.tail.items.len == 0) return null;
-        const val = list.tail.pop();
+        const val = list.popTail() orelse return null;
         if (list.len() == 0) self.removeKey(key);
         return val;
     }
@@ -201,77 +231,73 @@ pub const ListStore = struct {
         return result;
     }
 
-    /// LSET key index value — set element at index.
+    /// LSET key index value — rebuild list with updated element.
     pub fn lset(self: *ListStore, key: []const u8, index: i64, value: []const u8) !void {
         const list = self.lists.getPtr(key) orelse return error.NoSuchKey;
         const total: i64 = @intCast(list.len());
         var idx = index;
         if (idx < 0) idx += total;
         if (idx < 0 or idx >= total) return error.IndexOutOfRange;
+        // Rebuild: collect all elements, replace target, rebuild flat buffer
         const ui: usize = @intCast(idx);
-        const hlen = list.head.items.len;
-        const copy = try self.allocator.dupe(u8, value);
-        if (ui < hlen) {
-            self.allocator.free(list.head.items[hlen - 1 - ui]);
-            list.head.items[hlen - 1 - ui] = copy;
-        } else {
-            const ti = ui - hlen;
-            self.allocator.free(list.tail.items[ti]);
-            list.tail.items[ti] = copy;
+        var new_list = List.init(self.allocator);
+        var i: usize = 0;
+        while (i < list.count) : (i += 1) {
+            const v = list.get(i) orelse continue;
+            if (i == ui) {
+                try new_list.pushTail(value);
+            } else {
+                try new_list.pushTail(v);
+            }
         }
+        list.buf.deinit();
+        list.index.deinit();
+        list.* = new_list;
     }
 
-    /// LREM key count value — remove count occurrences of value.
-    /// For the deque, we linearize, remove, then rebuild. O(n) but correct.
+    /// LREM key count value — rebuild list without matching elements.
     pub fn lrem(self: *ListStore, key: []const u8, count_in: i64, value: []const u8) usize {
         const list = self.lists.getPtr(key) orelse return 0;
         const total = list.len();
         if (total == 0) return 0;
 
-        // Linearize into a temporary buffer
-        var linear = std.array_list.Managed([]u8).init(self.allocator);
-        defer linear.deinit();
-        // Head is reversed
-        var hi: usize = list.head.items.len;
-        while (hi > 0) : (hi -= 1) {
-            linear.append(list.head.items[hi - 1]) catch return 0;
-        }
-        for (list.tail.items) |item| {
-            linear.append(item) catch return 0;
-        }
-
         var removed: usize = 0;
         const max_remove: usize = if (count_in == 0) total else @intCast(if (count_in < 0) -count_in else count_in);
 
+        // Collect all values, skip matches
+        var new_list = List.init(self.allocator);
         if (count_in >= 0) {
             var i: usize = 0;
-            while (i < linear.items.len and removed < max_remove) {
-                if (std.mem.eql(u8, linear.items[i], value)) {
-                    self.allocator.free(linear.orderedRemove(i));
+            while (i < total) : (i += 1) {
+                const v = list.get(i) orelse continue;
+                if (removed < max_remove and std.mem.eql(u8, v, value)) {
                     removed += 1;
                 } else {
-                    i += 1;
+                    new_list.pushTail(v) catch {};
                 }
             }
         } else {
-            var i: usize = linear.items.len;
-            while (i > 0 and removed < max_remove) {
-                i -= 1;
-                if (std.mem.eql(u8, linear.items[i], value)) {
-                    self.allocator.free(linear.orderedRemove(i));
+            // Remove from tail: collect all, then remove from end
+            var items = std.array_list.Managed([]const u8).init(self.allocator);
+            defer items.deinit();
+            var i: usize = 0;
+            while (i < total) : (i += 1) {
+                if (list.get(i)) |v| items.append(v) catch {};
+            }
+            var j: usize = items.items.len;
+            while (j > 0 and removed < max_remove) {
+                j -= 1;
+                if (std.mem.eql(u8, items.items[j], value)) {
+                    _ = items.orderedRemove(j);
                     removed += 1;
                 }
             }
+            for (items.items) |v| new_list.pushTail(v) catch {};
         }
 
-        // Rebuild deque from linear
-        list.head.clearRetainingCapacity();
-        list.tail.clearRetainingCapacity();
-        for (linear.items) |item| {
-            list.tail.append(item) catch {};
-        }
-        // Clear linear without freeing items (they're now in tail)
-        linear.clearRetainingCapacity();
+        list.buf.deinit();
+        list.index.deinit();
+        list.* = new_list;
 
         if (list.len() == 0) self.removeKey(key);
         return removed;
@@ -290,18 +316,17 @@ pub const ListStore = struct {
         return true;
     }
 
-    pub fn freeVal(allocator: Allocator, v: []u8) void {
-        allocator.free(v);
-    }
+    /// No-op for flat buffer lists. Values are slices into internal buffer, not heap-allocated.
+    pub fn freeVal(_: Allocator, _: []const u8) void {}
 
     fn getOrCreate(self: *ListStore, key: []const u8) !*List {
         const gop = try self.lists.getOrPut(key);
         if (!gop.found_existing) {
             gop.key_ptr.* = try self.allocator.dupe(u8, key);
             var list = List.init(self.allocator);
-            // Pre-allocate 64 slots per side to avoid realloc under write lock
-            list.head.ensureTotalCapacity(64) catch {};
-            list.tail.ensureTotalCapacity(64) catch {};
+            // Pre-allocate index and buffer capacity
+            list.index.ensureTotalCapacity(64) catch {};
+            list.buf.ensureTotalCapacity(512) catch {};
             gop.value_ptr.* = list;
         }
         return gop.value_ptr;

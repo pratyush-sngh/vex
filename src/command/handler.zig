@@ -1234,7 +1234,7 @@ pub const CommandHandler = struct {
         var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeBulkString(w, null); return; };
         defer key_ref.deinit(self.allocator);
         if (self.getListStore().lpop(key_ref.key)) |val| {
-            defer self.allocator.free(val);
+            // No free — flat buffer list returns slice into internal storage
             self.logToAOF(args);
             try resp.serializeBulkString(w, val);
         } else {
@@ -1248,7 +1248,7 @@ pub const CommandHandler = struct {
         var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeBulkString(w, null); return; };
         defer key_ref.deinit(self.allocator);
         if (self.getListStore().rpop(key_ref.key)) |val| {
-            defer self.allocator.free(val);
+            // No free — flat buffer list returns slice into internal storage
             self.logToAOF(args);
             try resp.serializeBulkString(w, val);
         } else {
