@@ -1065,6 +1065,11 @@ pub const Server = struct {
             );
         }
 
+        // Wire up stripe affinity: each worker knows about all workers for migration
+        for (workers) |*w| {
+            w.all_workers = workers;
+        }
+
         // Spawn worker threads.
         for (workers) |*w| {
             const t = try std.Thread.spawn(.{}, Worker.run, .{w});

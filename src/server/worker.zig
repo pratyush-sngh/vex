@@ -21,6 +21,7 @@ const SortedSetStore = @import("../engine/sorted_set.zig").SortedSetStore;
 
 const READ_BUF_SIZE = 64 * 1024;
 const MAX_NEW_FDS = 256;
+const MAX_MIGRATE = 256;
 
 // ─── Precomputed DB prefixes (fix #4) ───────────────────────────────
 // Avoids std.fmt.bufPrint("db:{d}:") per command (~20ns saved per op)
@@ -131,12 +132,17 @@ pub const PubSubRegistry = struct {
 /// ~10ns uncontended vs ~100-200ns for pthread_rwlock. Critical sections are
 /// 20-80ns (HashMap lookup + value copy), well within spinlock sweet spot.
 pub const DS_STRIPE_COUNT = 256;
+pub const STRIPE_UNOWNED: u16 = 0xFFFF;
 
 pub const DsStripeLocks = struct {
     locks: [DS_STRIPE_COUNT]std.atomic.Value(u32) align(64),
+    /// Stripe affinity: tracks which worker "owns" each stripe.
+    /// Connections are migrated to the owning worker to minimize contention.
+    stripe_owner: [DS_STRIPE_COUNT]std.atomic.Value(u16),
 
     pub fn init(self: *DsStripeLocks) void {
         for (&self.locks) |*l| l.* = std.atomic.Value(u32).init(0);
+        for (&self.stripe_owner) |*s| s.* = std.atomic.Value(u16).init(STRIPE_UNOWNED);
     }
 
     pub fn stripeIndex(key: []const u8) usize {
@@ -230,6 +236,9 @@ const Connection = struct {
     watched_keys: ?std.array_list.Managed(WatchEntry),
     /// Set to true if a watched key was modified (dirty flag)
     watch_dirty: bool,
+    /// Stripe affinity: set to target worker ID when this connection should migrate.
+    /// 0xFFFF = no migration pending.
+    migrate_to: u16,
 
     const TxCommand = struct {
         args: [][]u8,
@@ -265,6 +274,7 @@ const Connection = struct {
             .tx_queue = null,
             .watched_keys = null,
             .watch_dirty = false,
+            .migrate_to = STRIPE_UNOWNED,
         };
         return conn;
     }
@@ -339,6 +349,11 @@ pub const Worker = struct {
     new_fds: [MAX_NEW_FDS]i32,
     new_fd_head: std.atomic.Value(usize),
     new_fd_tail: std.atomic.Value(usize),
+    all_workers: ?[]Worker,
+    // Migration queue: transferred Connection pointers from other workers
+    migrate_slots: [MAX_MIGRATE]*Connection,
+    migrate_head: std.atomic.Value(usize),
+    migrate_tail: std.atomic.Value(usize),
 
     pub fn init(
         allocator: Allocator,
@@ -398,6 +413,10 @@ pub const Worker = struct {
             .new_fds = [_]i32{-1} ** MAX_NEW_FDS,
             .new_fd_head = std.atomic.Value(usize).init(0),
             .new_fd_tail = std.atomic.Value(usize).init(0),
+            .all_workers = null,
+            .migrate_slots = undefined,
+            .migrate_head = std.atomic.Value(usize).init(0),
+            .migrate_tail = std.atomic.Value(usize).init(0),
         };
     }
 
@@ -452,6 +471,52 @@ pub const Worker = struct {
         }
     }
 
+    /// Stripe affinity: after processing a data-store command, check if this
+    /// connection should migrate to the worker that owns the stripe.
+    /// Processes current command normally (with lock), migration happens after flush.
+    fn checkAffinity(self: *Worker, conn: *Connection, key: []const u8) void {
+        const dsl = self.ds_locks orelse return;
+        if (self.all_workers == null) return;
+        _ = conn;
+
+        const idx = DsStripeLocks.stripeIndex(key);
+        const owner = dsl.stripe_owner[idx].load(.monotonic);
+
+        if (owner == STRIPE_UNOWNED) {
+            // First worker to touch this stripe claims it
+            _ = dsl.stripe_owner[idx].cmpxchgStrong(STRIPE_UNOWNED, self.id, .monotonic, .monotonic);
+        }
+        // TODO: connection migration — currently disabled pending stability fix.
+        // Stripe ownership is tracked but connections stay on their assigned worker.
+    }
+
+    /// Migrate a connection to the target worker. Transfers the Connection
+    /// pointer as-is — no state loss, no re-auth needed.
+    fn migrateConnection(self: *Worker, conn: *Connection) void {
+        const target = conn.migrate_to;
+        const workers = self.all_workers orelse return;
+        if (target >= workers.len) return;
+
+        // Remove fd from our event loop (stop getting events)
+        self.loop.removeFd(conn.fd);
+        // Remove from our connection map (but don't free — target takes ownership)
+        _ = self.conns.fetchRemove(conn.fd);
+
+        // Reset migration flag and push to target worker's migrate queue
+        conn.migrate_to = STRIPE_UNOWNED;
+        workers[target].pushMigratedConn(conn);
+    }
+
+    /// Accept a migrated connection from another worker. Lock-free SPSC push.
+    fn pushMigratedConn(self: *Worker, conn: *Connection) void {
+        const tail = self.migrate_tail.load(.monotonic);
+        const head = self.migrate_head.load(.acquire);
+        if (tail -% head >= MAX_MIGRATE) return;
+        self.migrate_slots[tail % MAX_MIGRATE] = conn;
+        self.migrate_tail.store(tail +% 1, .release);
+        self.loop.notify();
+    }
+
     // ── Internal helpers ─────────────────────────────────────────────
 
     fn acceptQueuedFds(self: *Worker) void {
@@ -464,6 +529,32 @@ pub const Worker = struct {
             self.new_fd_head.store(head +% 1, .release);
 
             self.registerConnection(fd);
+        }
+
+        // Drain migrated connections from other workers (stripe affinity)
+        while (true) {
+            const mh = self.migrate_head.load(.monotonic);
+            const mt = self.migrate_tail.load(.acquire);
+            if (mh == mt) break;
+            const conn = self.migrate_slots[mh % MAX_MIGRATE];
+            self.migrate_head.store(mh +% 1, .release);
+            // Re-register the existing connection on our event loop
+            self.loop.addFd(conn.fd, @intCast(@intFromPtr(conn))) catch {
+                // Can't add to event loop — close connection
+                _ = std.c.close(conn.fd);
+                conn.accum.deinit();
+                conn.write_buf.deinit();
+                self.allocator.destroy(conn);
+                continue;
+            };
+            self.conns.put(conn.fd, conn) catch {
+                self.loop.removeFd(conn.fd);
+                _ = std.c.close(conn.fd);
+                conn.accum.deinit();
+                conn.write_buf.deinit();
+                self.allocator.destroy(conn);
+                continue;
+            };
         }
     }
 
@@ -622,6 +713,12 @@ pub const Worker = struct {
         if (conn.write_buf.items.len > conn.write_offset) {
             self.directFlush(conn);
         }
+
+        // Stripe affinity: migrate connection to owning worker after flushing response.
+        // Connection state (accum buffer, auth, db) transfers with it.
+        if (conn.migrate_to != STRIPE_UNOWNED) {
+            self.migrateConnection(conn);
+        }
     }
 
     fn processOneCommand(self: *Worker, conn: *Connection) bool {
@@ -707,6 +804,30 @@ pub const Worker = struct {
             if (self.ckv) |ckv| {
                 if (self.executeHotFast(conn, args, ckv)) {
                     self.maybeBroadcast(args);
+                    // Stripe affinity: check if connection should migrate to the
+                    // worker that owns this key's stripe (data-store commands only).
+                    if (args.len >= 2 and self.ds_locks != null and args[0].len >= 4) {
+                        const cmd0 = args[0];
+                        const is_ds = switch (std.ascii.toUpper(cmd0[0])) {
+                            'L' => cmd0.len >= 4 and (cmd0[1] == 'P' or cmd0[1] == 'p' or
+                                cmd0[1] == 'L' or cmd0[1] == 'l' or
+                                cmd0[1] == 'R' or cmd0[1] == 'r' or
+                                cmd0[1] == 'S' or cmd0[1] == 's' or
+                                cmd0[1] == 'I' or cmd0[1] == 'i'),
+                            'R' => cmd0.len >= 4 and (cmd0[1] == 'P' or cmd0[1] == 'p'),
+                            'H' => cmd0.len >= 4 and (cmd0[1] == 'S' or cmd0[1] == 's' or
+                                cmd0[1] == 'G' or cmd0[1] == 'g' or
+                                cmd0[1] == 'D' or cmd0[1] == 'd'),
+                            'Z' => true,
+                            'S' => cmd0.len == 4 and (std.ascii.toUpper(cmd0[1]) == 'A'), // SADD only
+                            else => false,
+                        };
+                        if (is_ds) {
+                            if (nsKey(conn.selected_db, args[1])) |ns| {
+                                self.checkAffinity(conn, ns);
+                            }
+                        }
+                    }
                     return;
                 }
             }
