@@ -2139,8 +2139,12 @@ fn isGraphWriteCommand(args: []const []const u8) bool {
 
 fn equalsAsciiUpper(s: []const u8, comptime upper: []const u8) bool {
     if (s.len != upper.len) return false;
-    for (s, 0..) |c, i| {
-        if (std.ascii.toUpper(c) != upper[i]) return false;
+    // Compare with mask: OR 0x20 to lowercase both sides, then compare.
+    // Single pass, no branch per byte.
+    comptime var mask: [upper.len]u8 = undefined;
+    comptime for (upper, 0..) |c, i| { mask[i] = c | 0x20; };
+    inline for (0..upper.len) |i| {
+        if ((s[i] | 0x20) != mask[i]) return false;
     }
     return true;
 }
