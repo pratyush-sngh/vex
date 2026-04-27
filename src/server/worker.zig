@@ -127,17 +127,16 @@ pub const PubSubRegistry = struct {
 /// Freed blocks go to a per-worker free list for instant reuse (~2ns).
 /// Cross-worker frees (RPUSH on worker A, LPOP on worker B) go to C free() — safe.
 
-/// Striped rwlocks for data type stores (lists, hashes, sets, sorted sets).
+/// Striped atomic spinlocks for data type stores (lists, hashes, sets, sorted sets).
+/// ~10ns uncontended vs ~100-200ns for pthread_rwlock. Critical sections are
+/// 20-80ns (HashMap lookup + value copy), well within spinlock sweet spot.
 pub const DS_STRIPE_COUNT = 256;
 
 pub const DsStripeLocks = struct {
-    locks: [DS_STRIPE_COUNT]std.c.pthread_rwlock_t align(64),
+    locks: [DS_STRIPE_COUNT]std.atomic.Value(u32) align(64),
 
     pub fn init(self: *DsStripeLocks) void {
-        const init_fn = @extern(*const fn (*std.c.pthread_rwlock_t, ?*const anyopaque) callconv(.c) c_int, .{ .name = "pthread_rwlock_init" });
-        for (&self.locks) |*l| {
-            _ = init_fn(l, null);
-        }
+        for (&self.locks) |*l| l.* = std.atomic.Value(u32).init(0);
     }
 
     pub fn stripeIndex(key: []const u8) usize {
@@ -145,15 +144,18 @@ pub const DsStripeLocks = struct {
     }
 
     pub fn rdlock(self: *DsStripeLocks, key: []const u8) void {
-        _ = std.c.pthread_rwlock_rdlock(&self.locks[stripeIndex(key)]);
+        self.wrlock(key); // spinlock is exclusive; with 256 stripes contention is rare
     }
 
     pub fn wrlock(self: *DsStripeLocks, key: []const u8) void {
-        _ = std.c.pthread_rwlock_wrlock(&self.locks[stripeIndex(key)]);
+        const idx = stripeIndex(key);
+        while (self.locks[idx].cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
     }
 
     pub fn unlock(self: *DsStripeLocks, key: []const u8) void {
-        _ = std.c.pthread_rwlock_unlock(&self.locks[stripeIndex(key)]);
+        self.locks[stripeIndex(key)].store(0, .release);
     }
 };
 
