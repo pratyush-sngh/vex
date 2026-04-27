@@ -1735,8 +1735,20 @@ pub const Worker = struct {
                         if (self.hash_store) |hs| {
                             const ns = nsKey(conn.selected_db, args[1]) orelse return false;
                             const dsl = self.ds_locks orelse return false;
+                            // Pre-alloc field+value pairs OUTSIDE the lock
+                            const fv = args[2..];
+                            var owned_buf: [32][]u8 = undefined;
+                            if (fv.len > owned_buf.len) return false;
+                            for (fv, 0..) |v, i| {
+                                owned_buf[i] = self.allocator.dupe(u8, v) catch return false;
+                            }
+                            const owned = owned_buf[0..fv.len];
                             dsl.wrlock(ns, self.id, &self.last_stripe);
-                            const added = hs.hset(ns, args[2..]) catch { dsl.unlock(ns); return false; };
+                            const added = hs.hsetOwned(ns, owned) catch {
+                                dsl.unlock(ns);
+                                for (owned) |o| self.allocator.free(o);
+                                return false;
+                            };
                             dsl.unlock(ns);
                             if (self.aof) |a| a.logCommand(args);
                             self.bumpWatchVersion(conn.selected_db, args[1]);
@@ -1817,8 +1829,30 @@ pub const Worker = struct {
                     if (self.set_store) |ss| {
                         const ns = nsKey(conn.selected_db, args[1]) orelse return false;
                         const dsl = self.ds_locks orelse return false;
+                        // Read-before-write: single member, check if exists under read lock
+                        if (args.len == 3) {
+                            dsl.rdlock(ns, self.id, &self.last_stripe);
+                            const already = ss.sismember(ns, args[2]);
+                            dsl.unlock(ns);
+                            if (already) {
+                                writeIntTo(&conn.write_buf, 0);
+                                return true;
+                            }
+                        }
+                        // Pre-alloc members OUTSIDE the lock
+                        const members = args[2..];
+                        var owned_buf: [16][]u8 = undefined;
+                        if (members.len > owned_buf.len) return false;
+                        for (members, 0..) |m, i| {
+                            owned_buf[i] = self.allocator.dupe(u8, m) catch return false;
+                        }
+                        const owned = owned_buf[0..members.len];
                         dsl.wrlock(ns, self.id, &self.last_stripe);
-                        const added = ss.sadd(ns, args[2..]) catch { dsl.unlock(ns); return false; };
+                        const added = ss.saddOwned(ns, owned) catch {
+                            dsl.unlock(ns);
+                            for (owned) |o| self.allocator.free(o);
+                            return false;
+                        };
                         dsl.unlock(ns);
                         if (self.aof) |a| a.logCommand(args);
                         self.bumpWatchVersion(conn.selected_db, args[1]);
