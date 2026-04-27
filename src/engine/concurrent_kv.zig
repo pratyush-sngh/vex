@@ -1,16 +1,13 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const KVStore = @import("kv.zig").KVStore;
-const LockFreeMap = @import("lockfree_map.zig").LockFreeMap;
 
 const STRIPE_COUNT = 256;
 const STRIPE_MASK = STRIPE_COUNT - 1;
-const SLOTS_PER_STRIPE = 16384;
 
-/// Lock-free concurrent KV store.
-/// 256 stripes, each with a lock-free open-addressing hash table.
-/// GET: atomic load + probe (~20ns). SET: CAS on empty slot or SeqLock update.
-/// No pthread locks. No spinlocks. Pure atomic operations.
+/// Thread-safe KV store using bucket-striped locking.
+/// 256 stripes, each with its own mutex + HashMap.
+/// Any thread can access any key with minimal contention.
 pub const ConcurrentKV = struct {
     stripes: [STRIPE_COUNT]Stripe,
     allocator: Allocator,
@@ -19,9 +16,11 @@ pub const ConcurrentKV = struct {
 
     pub const Entry = KVStore.Entry;
 
-    /// Each stripe is a lock-free hash table. No rwlock needed.
+    /// Cache-line aligned to prevent false sharing between workers.
+    /// Uses pthread_rwlock: GETs take read-lock (parallel), SETs take write-lock (exclusive).
     const Stripe = struct {
-        map: LockFreeMap,
+        rwlock: std.c.pthread_rwlock_t align(64) = std.mem.zeroes(std.c.pthread_rwlock_t),
+        map: std.StringHashMap(Entry),
         ttl_count: u32 = 0,
         tombstone_count: u32 = 0,
     };
@@ -43,19 +42,31 @@ pub const ConcurrentKV = struct {
             .io = io,
         };
         for (&self.stripes) |*s| {
-            s.map = LockFreeMap.init(allocator, SLOTS_PER_STRIPE) catch
-                LockFreeMap.init(allocator, 1024) catch unreachable;
+            s.map = std.StringHashMap(Entry).init(allocator);
+            // Zero-init rwlock — works on Linux. macOS needs initStripes() after placement.
         }
         return self;
     }
 
-    /// No-op for lock-free map (no rwlocks to init). Kept for API compatibility.
+    /// Initialize rwlocks and pre-allocate stripe capacity. Must be called AFTER the
+    /// ConcurrentKV is at its final memory address for macOS compatibility.
+    /// Pre-allocation avoids HashMap resize under concurrent writes (which causes crashes
+    /// due to Zig HashMap's non-thread-safe grow path).
     pub fn initStripes(self: *ConcurrentKV) void {
-        _ = self;
+        const init_fn = @extern(*const fn (*std.c.pthread_rwlock_t, ?*const anyopaque) callconv(.c) c_int, .{ .name = "pthread_rwlock_init" });
+        for (&self.stripes) |*s| {
+            _ = init_fn(&s.rwlock, null);
+            s.map.ensureTotalCapacity(16384) catch {};
+        }
     }
 
     pub fn deinit(self: *ConcurrentKV) void {
         for (&self.stripes) |*s| {
+            var iter = s.map.iterator();
+            while (iter.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                self.allocator.free(entry.value_ptr.value);
+            }
             s.map.deinit();
         }
     }
@@ -64,14 +75,18 @@ pub const ConcurrentKV = struct {
     pub fn importFrom(self: *ConcurrentKV, source: *KVStore) !void {
         var iter = source.map.iterator();
         while (iter.next()) |entry| {
-            if (entry.value_ptr.flags.deleted) continue;
             const idx = stripeIndex(entry.key_ptr.*);
             const s = &self.stripes[idx];
-            const result = try s.map.getOrPut(entry.key_ptr.*);
+            const owned_key = try self.allocator.dupe(u8, entry.key_ptr.*);
+            errdefer self.allocator.free(owned_key);
             const owned_val = try self.allocator.dupe(u8, entry.value_ptr.value);
-            result.entry.value = owned_val;
-            result.entry.expires_at = entry.value_ptr.expires_at;
-            result.entry.flags = entry.value_ptr.flags;
+            errdefer self.allocator.free(owned_val);
+            if (entry.value_ptr.flags.deleted) continue; // skip tombstones
+            try s.map.put(owned_key, .{
+                .value = owned_val,
+                .expires_at = entry.value_ptr.expires_at,
+                .flags = entry.value_ptr.flags,
+            });
         }
     }
 
@@ -79,9 +94,13 @@ pub const ConcurrentKV = struct {
 
     pub fn get(self: *ConcurrentKV, key: []const u8) ?OwnedValue {
         const s = self.getStripe(key);
+        readLockStripe(s);
+        defer readUnlockStripe(s);
+
         const entry = s.map.getPtr(key) orelse return null;
         if (self.isExpired(entry)) return null;
         if (entry.flags.is_integer) {
+            // Format native int to string
             var buf: [24]u8 = undefined;
             const str = std.fmt.bufPrint(&buf, "{d}", .{entry.int_value}) catch return null;
             const copy = self.allocator.dupe(u8, str) catch return null;
@@ -95,24 +114,38 @@ pub const ConcurrentKV = struct {
     /// Multiple GETs on the same stripe run in PARALLEL (no blocking).
     /// Pre-sizes buffer OUTSIDE the lock so most GETs never allocate under lock.
     pub fn getAndWriteBulk(self: *ConcurrentKV, key: []const u8, out: *std.array_list.Managed(u8)) bool {
+        // Optimistic pre-size: ensure room for a typical response before taking the lock.
+        // "$" + up to 6 digits + "\r\n" + up to 256 bytes value + "\r\n" = ~270 bytes.
+        // If the value is larger, ensureTotalCapacity will be called under lock (rare path).
         out.ensureTotalCapacity(out.items.len + 270) catch {};
 
         const s = self.getStripe(key);
+        readLockStripe(s);
+
         const entry = s.map.getPtr(key) orelse {
+            readUnlockStripe(s);
             out.appendSlice("$-1\r\n") catch {};
             return false;
         };
         if (entry.flags.deleted) {
+            readUnlockStripe(s);
             out.appendSlice("$-1\r\n") catch {};
             return false;
         }
         if (entry.flags.has_ttl and self.cached_now_ms > entry.expires_at) {
+            readUnlockStripe(s);
             out.appendSlice("$-1\r\n") catch {};
             return false;
         }
+        // For integer entries, format from native int_value (no stored string needed)
         if (entry.flags.is_integer) {
             var int_buf: [24]u8 = undefined;
-            const int_str = std.fmt.bufPrint(&int_buf, "{d}", .{entry.int_value}) catch return false;
+            const int_str = std.fmt.bufPrint(&int_buf, "{d}", .{entry.int_value}) catch {
+                readUnlockStripe(s);
+                return false;
+            };
+            readUnlockStripe(s);
+            // Format RESP outside lock — int_str is on stack, no aliasing issues
             var hdr2: [32]u8 = undefined;
             const h2 = std.fmt.bufPrint(&hdr2, "${d}\r\n", .{int_str.len}) catch return false;
             out.ensureTotalCapacity(out.items.len + h2.len + int_str.len + 2) catch {};
@@ -122,16 +155,24 @@ pub const ConcurrentKV = struct {
             return true;
         }
 
+        // Write RESP bulk string: "$len\r\nvalue\r\n"
         const vlen = entry.value.len;
         var hdr: [32]u8 = undefined;
-        const h = std.fmt.bufPrint(&hdr, "${d}\r\n", .{vlen}) catch return false;
+        const h = std.fmt.bufPrint(&hdr, "${d}\r\n", .{vlen}) catch {
+            readUnlockStripe(s);
+            return false;
+        };
         const total_needed = out.items.len + h.len + vlen + 2;
         if (total_needed > out.capacity) {
-            out.ensureTotalCapacity(total_needed) catch return false;
+            out.ensureTotalCapacity(total_needed) catch {
+                readUnlockStripe(s);
+                return false;
+            };
         }
         out.appendSliceAssumeCapacity(h);
         out.appendSliceAssumeCapacity(entry.value);
         out.appendSliceAssumeCapacity("\r\n");
+        readUnlockStripe(s);
         return true;
     }
 
@@ -151,43 +192,59 @@ pub const ConcurrentKV = struct {
         expires_at: i64,
     ) struct { stale_val: ?[]const u8, stale_key: ?[]const u8 } {
         const s = self.getStripe(key);
+        writeLockStripe(s);
+
         const has_ttl = expires_at != 0;
+        const result = s.map.getPtr(key);
+        if (result) |existing| {
+            // SeqLock: bump to odd (write in progress)
+            _ = existing.seq.fetchAdd(1, .release);
 
-        // Lock-free: getOrPut uses CAS on empty slot for new keys
-        const result = s.map.getOrPut(key) catch {
-            return .{ .stale_val = owned_value, .stale_key = owned_key };
-        };
+            if (owned_value.len <= KVStore.INLINE_BUF_SIZE) {
+                // Small value: copy into inline buffer (in-place, no alloc)
+                @memcpy(existing.inline_buf[0..owned_value.len], owned_value);
+                existing.inline_len = @intCast(owned_value.len);
+                existing.value = existing.inline_buf[0..owned_value.len];
+                existing.flags = .{ .has_ttl = has_ttl, .is_inline = true };
+            } else {
+                existing.value = owned_value;
+                existing.flags = .{ .has_ttl = has_ttl };
+            }
+            existing.expires_at = expires_at;
+            existing.flags.is_integer = false;
 
-        const existing = result.entry;
+            // SeqLock: bump to even (write complete)
+            _ = existing.seq.fetchAdd(1, .release);
 
-        // SeqLock: bump to odd (write in progress)
-        _ = existing.seq.fetchAdd(1, .release);
-
-        if (owned_value.len <= KVStore.INLINE_BUF_SIZE) {
-            @memcpy(existing.inline_buf[0..owned_value.len], owned_value);
-            existing.inline_len = @intCast(owned_value.len);
-            existing.value = existing.inline_buf[0..owned_value.len];
-            existing.flags = .{ .has_ttl = has_ttl, .is_inline = true };
-        } else {
-            existing.value = owned_value;
-            existing.flags = .{ .has_ttl = has_ttl };
-        }
-        existing.expires_at = expires_at;
-        existing.flags.is_integer = false;
-
-        // SeqLock: bump to even (write complete)
-        _ = existing.seq.fetchAdd(1, .release);
-
-        if (result.found) {
-            // Update: free pre-allocated key, free old value if non-inline
+            const old_val = if (!existing.flags.is_inline) existing.value else null;
+            writeUnlockStripe(s);
+            // For inline: free the pre-allocated value (not needed, stored inline)
+            // For non-inline: free the OLD value
             if (owned_value.len <= KVStore.INLINE_BUF_SIZE) {
                 return .{ .stale_val = owned_value, .stale_key = owned_key };
             }
-            return .{ .stale_val = null, .stale_key = owned_key };
+            return .{ .stale_val = old_val, .stale_key = owned_key };
         } else {
-            // New key: key is owned by the map, free pre-allocated value if inline
+            var new_entry = Entry{
+                .expires_at = expires_at,
+                .flags = .{ .has_ttl = has_ttl },
+                .value = undefined,
+            };
             if (owned_value.len <= KVStore.INLINE_BUF_SIZE) {
+                @memcpy(new_entry.inline_buf[0..owned_value.len], owned_value);
+                new_entry.inline_len = @intCast(owned_value.len);
+                new_entry.value = new_entry.inline_buf[0..owned_value.len];
+                new_entry.flags.is_inline = true;
+            } else {
+                new_entry.value = owned_value;
+            }
+            s.map.put(owned_key, new_entry) catch {
+                writeUnlockStripe(s);
                 return .{ .stale_val = owned_value, .stale_key = owned_key };
+            };
+            writeUnlockStripe(s);
+            if (owned_value.len <= KVStore.INLINE_BUF_SIZE) {
+                return .{ .stale_val = owned_value, .stale_key = null };
             }
             return .{ .stale_val = null, .stale_key = null };
         }
@@ -205,11 +262,11 @@ pub const ConcurrentKV = struct {
     /// Delete a key. Returns stale key+value for caller to free OUTSIDE any lock.
     pub fn deleteStale(self: *ConcurrentKV, key: []const u8) struct { found: bool, stale_key: ?[]const u8, stale_val: ?[]const u8 } {
         const s = self.getStripe(key);
-        const removed = s.map.remove(key);
-        if (removed) |entry| {
-            const val = if (!entry.flags.is_inline) entry.value else null;
-            self.allocator.destroy(entry);
-            return .{ .found = true, .stale_key = null, .stale_val = val };
+        writeLockStripe(s);
+        const result = s.map.fetchRemove(key);
+        writeUnlockStripe(s);
+        if (result) |kv| {
+            return .{ .found = true, .stale_key = kv.key, .stale_val = kv.value.value };
         }
         return .{ .found = false, .stale_key = null, .stale_val = null };
     }
@@ -223,6 +280,9 @@ pub const ConcurrentKV = struct {
 
     pub fn exists(self: *ConcurrentKV, key: []const u8) bool {
         const s = self.getStripe(key);
+        readLockStripe(s);
+        defer readUnlockStripe(s);
+
         const entry = s.map.getPtr(key) orelse return false;
         if (self.isExpired(entry)) return false;
         return true;
@@ -230,6 +290,9 @@ pub const ConcurrentKV = struct {
 
     pub fn ttl(self: *ConcurrentKV, key: []const u8) ?i64 {
         const s = self.getStripe(key);
+        readLockStripe(s);
+        defer readUnlockStripe(s);
+
         const entry = s.map.getPtr(key) orelse return null;
         if (self.isExpired(entry)) return null;
         if (!entry.flags.has_ttl) return -1;
@@ -243,20 +306,37 @@ pub const ConcurrentKV = struct {
     // ── Bulk operations (lock all stripes) ──
 
     pub fn flushdb(self: *ConcurrentKV) void {
+        self.writeLockAll();
+        defer self.writeUnlockAll();
+
         for (&self.stripes) |*s| {
-            s.map.clear();
+            var iter = s.map.iterator();
+            while (iter.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                if (!entry.value_ptr.flags.is_inline and entry.value_ptr.value.len > 0) {
+                    self.allocator.free(entry.value_ptr.value);
+                }
+            }
+            // Retain capacity — preserves pre-allocated HashMap slots
+            s.map.clearRetainingCapacity();
         }
     }
 
     pub fn dbsize(self: *ConcurrentKV) usize {
+        self.readLockAll();
+        defer self.readUnlockAll();
+
         var total: usize = 0;
         for (&self.stripes) |*s| {
-            total += s.map.getCount();
+            total += s.map.count();
         }
         return total;
     }
 
     pub fn keys(self: *ConcurrentKV, allocator: Allocator, pattern: []const u8) ![][]const u8 {
+        self.readLockAll();
+        defer self.readUnlockAll();
+
         var result = std.array_list.Managed([]const u8).init(allocator);
         errdefer result.deinit();
 
@@ -264,8 +344,8 @@ pub const ConcurrentKV = struct {
         for (&self.stripes) |*s| {
             var iter = s.map.iterator();
             while (iter.next()) |entry| {
-                if (match_all or globMatch(pattern, entry.key)) {
-                    try result.append(entry.key);
+                if (match_all or globMatch(pattern, entry.key_ptr.*)) {
+                    try result.append(entry.key_ptr.*);
                 }
             }
         }
@@ -276,35 +356,58 @@ pub const ConcurrentKV = struct {
     /// First call parses the string; subsequent calls use cached int_value directly.
     pub fn incrBy(self: *ConcurrentKV, key: []const u8, delta: i64) error{ NotAnInteger, OutOfMemory }!i64 {
         const s = self.getStripe(key);
+        writeLockStripe(s);
 
-        // Lock-free getOrPut: CAS insert for new keys
-        const result = s.map.getOrPut(key) catch return error.OutOfMemory;
-        const entry = result.entry;
-
-        if (result.found) {
-            if (self.isExpired(entry)) {
-                entry.int_value = delta;
-                entry.flags = .{ .is_integer = true };
-                entry.last_access = self.cached_now_ms;
+        const result = s.map.getPtr(key);
+        if (result) |existing| {
+            if (self.isExpired(existing)) {
+                // Treat expired as 0
+                existing.int_value = delta;
+                existing.flags = .{ .is_integer = true };
+                existing.last_access = self.cached_now_ms;
+                writeUnlockStripe(s);
                 return delta;
             }
-            if (entry.flags.is_integer) {
-                entry.int_value += delta;
-                entry.last_access = self.cached_now_ms;
-                return entry.int_value;
+
+            // If already marked as integer, use cached int_value directly (~1ns)
+            if (existing.flags.is_integer) {
+                existing.int_value += delta;
+                existing.last_access = self.cached_now_ms;
+                const new_val = existing.int_value;
+                writeUnlockStripe(s);
+                return new_val;
             }
-            const current = std.fmt.parseInt(i64, entry.value, 10) catch return error.NotAnInteger;
-            entry.int_value = current + delta;
-            entry.flags = .{ .is_integer = true };
-            entry.last_access = self.cached_now_ms;
-            return entry.int_value;
+
+            // First INCR on a string value — parse once, then use native from here on
+            const current = std.fmt.parseInt(i64, existing.value, 10) catch {
+                writeUnlockStripe(s);
+                return error.NotAnInteger;
+            };
+            existing.int_value = current + delta;
+            existing.flags = .{ .is_integer = true };
+            existing.last_access = self.cached_now_ms;
+            const new_val = existing.int_value;
+            writeUnlockStripe(s);
+            return new_val;
         }
 
-        // New key
-        entry.value = &[_]u8{};
-        entry.int_value = delta;
-        entry.last_access = self.cached_now_ms;
-        entry.flags = .{ .is_integer = true };
+        // New key — create entry with native integer
+        const owned_key = self.allocator.dupe(u8, key) catch {
+            writeUnlockStripe(s);
+            return error.OutOfMemory;
+        };
+        s.map.put(owned_key, .{
+            .value = &[_]u8{}, // empty — GET will format from int_value
+            .int_value = delta,
+            .last_access = self.cached_now_ms,
+            .flags = .{ .is_integer = true },
+        }) catch {
+            self.allocator.free(owned_key);
+            writeUnlockStripe(s);
+            return error.OutOfMemory;
+        };
+
+        writeUnlockStripe(s);
         return delta;
     }
 
@@ -314,29 +417,43 @@ pub const ConcurrentKV = struct {
         return self.getStripe(key);
     }
 
-    /// No-op: lock-free map doesn't need locking. Kept for API compatibility.
-    pub fn readLockStripePublic(_: *ConcurrentKV, _: *Stripe) void {}
-    pub fn readUnlockStripePublic(_: *ConcurrentKV, _: *Stripe) void {}
+    pub fn readLockStripePublic(_: *ConcurrentKV, s: *Stripe) void {
+        readLockStripe(s);
+    }
+
+    pub fn readUnlockStripePublic(_: *ConcurrentKV, s: *Stripe) void {
+        readUnlockStripe(s);
+    }
 
     // ── Internal helpers ──
 
     fn setInternal(self: *ConcurrentKV, key: []const u8, value: []const u8, expires_at: i64) !void {
         const s = self.getStripe(key);
-        const has_ttl = expires_at != 0;
-        const now = self.cached_now_ms;
-
-        const result = try s.map.getOrPut(key);
-        const entry = result.entry;
-
-        if (result.found and !entry.flags.is_inline and entry.value.len > 0) {
-            self.allocator.free(entry.value);
-        }
+        writeLockStripe(s);
+        defer writeUnlockStripe(s);
 
         const owned_value = try self.allocator.dupe(u8, value);
-        entry.value = owned_value;
-        entry.expires_at = expires_at;
-        entry.last_access = now;
-        entry.flags = .{ .has_ttl = has_ttl };
+        errdefer self.allocator.free(owned_value);
+
+        const has_ttl = expires_at != 0;
+        const now = self.cached_now_ms;
+        const result = s.map.getPtr(key);
+        if (result) |existing| {
+            self.allocator.free(existing.value);
+            existing.value = owned_value;
+            existing.expires_at = expires_at;
+            existing.last_access = now;
+            existing.flags = .{ .has_ttl = has_ttl };
+        } else {
+            const owned_key = try self.allocator.dupe(u8, key);
+            errdefer self.allocator.free(owned_key);
+            try s.map.put(owned_key, .{
+                .value = owned_value,
+                .expires_at = expires_at,
+                .last_access = now,
+                .flags = .{ .has_ttl = has_ttl },
+            });
+        }
     }
 
     fn stripeIndex(key: []const u8) usize {
@@ -347,6 +464,40 @@ pub const ConcurrentKV = struct {
         return &self.stripes[stripeIndex(key)];
     }
 
+    /// Read-lock: multiple readers in parallel (for GET, EXISTS, TTL)
+    fn readLockStripe(s: *Stripe) void {
+        _ = std.c.pthread_rwlock_rdlock(&s.rwlock);
+    }
+
+    fn readUnlockStripe(s: *Stripe) void {
+        _ = std.c.pthread_rwlock_unlock(&s.rwlock);
+    }
+
+    fn writeLockStripe(s: *Stripe) void {
+        _ = std.c.pthread_rwlock_wrlock(&s.rwlock);
+    }
+
+    fn writeUnlockStripe(s: *Stripe) void {
+        _ = std.c.pthread_rwlock_unlock(&s.rwlock);
+    }
+
+    fn readLockAll(self: *ConcurrentKV) void {
+        for (&self.stripes) |*s| readLockStripe(s);
+    }
+
+    fn readUnlockAll(self: *ConcurrentKV) void {
+        for (&self.stripes) |*s| readUnlockStripe(s);
+    }
+
+    fn writeLockAll(self: *ConcurrentKV) void {
+        for (&self.stripes) |*s| writeLockStripe(s);
+    }
+
+    fn writeUnlockAll(self: *ConcurrentKV) void {
+        for (&self.stripes) |*s| writeUnlockStripe(s);
+    }
+
+    /// Update cached clock. Call once per event loop tick.
     pub fn updateClock(self: *ConcurrentKV) void {
         self.cached_now_ms = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
     }
@@ -358,6 +509,15 @@ pub const ConcurrentKV = struct {
     fn isExpired(self: *const ConcurrentKV, entry: *const Entry) bool {
         if (!entry.flags.has_ttl) return false;
         return self.cached_now_ms > entry.expires_at;
+    }
+
+    /// Remove an expired entry while the stripe is already locked.
+    fn evictLocked(self: *ConcurrentKV, s: *Stripe, key: []const u8) void {
+        const result = s.map.fetchRemove(key);
+        if (result) |kv| {
+            self.allocator.free(kv.key);
+            self.allocator.free(kv.value.value);
+        }
     }
 };
 
