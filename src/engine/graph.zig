@@ -3,6 +3,8 @@ const Allocator = std.mem.Allocator;
 const StringIntern = @import("string_intern.zig").StringIntern;
 const TypeMask = @import("string_intern.zig").TypeMask;
 const PropertyStore = @import("property_store.zig").PropertyStore;
+pub const VectorStore = @import("vector_store.zig").VectorStore;
+pub const HnswIndex = @import("hnsw.zig").HnswIndex;
 
 pub const NodeId = u32;
 pub const EdgeId = u32;
@@ -95,6 +97,10 @@ pub const GraphEngine = struct {
     node_props: PropertyStore,
     edge_props: PropertyStore,
 
+    // ─── Vector Infrastructure (lazy: null until first GRAPH.SETVEC) ──
+    vec_store: ?VectorStore,
+    vec_indices: ?std.StringHashMap(*HnswIndex),
+
     // ─── Compaction state ───────────────────
     needs_compact: bool,
     /// Monotonically increasing mutation counter. Incremented on every
@@ -131,6 +137,8 @@ pub const GraphEngine = struct {
             .type_intern = StringIntern.init(allocator),
             .node_props = PropertyStore.init(allocator),
             .edge_props = PropertyStore.init(allocator),
+            .vec_store = null,
+            .vec_indices = null,
             .needs_compact = false,
             .mutation_seq = 0,
             .all_base_edges_alive = true,
@@ -159,6 +167,16 @@ pub const GraphEngine = struct {
         self.type_intern.deinit();
         self.node_props.deinit();
         self.edge_props.deinit();
+        if (self.vec_indices) |*vi| {
+            var vi_iter = vi.iterator();
+            while (vi_iter.next()) |entry| {
+                self.allocator.free(entry.key_ptr.*);
+                entry.value_ptr.*.deinit();
+                self.allocator.destroy(entry.value_ptr.*);
+            }
+            vi.deinit();
+        }
+        if (self.vec_store) |*vs| vs.deinit();
     }
 
     // ─── Node Operations ──────────────────────────────────────────────
@@ -229,6 +247,100 @@ pub const GraphEngine = struct {
         self.mutation_seq += 1;
     }
 
+    /// Lazily initialize vector infrastructure on first use.
+    fn ensureVecInit(self: *GraphEngine) void {
+        if (self.vec_store == null) {
+            self.vec_store = VectorStore.init(self.allocator);
+            self.vec_indices = std.StringHashMap(*HnswIndex).init(self.allocator);
+        }
+    }
+
+    /// Store a vector on a node. Creates HNSW index for the field if needed.
+    /// Lazily initializes vector infrastructure on first call.
+    pub fn setVector(self: *GraphEngine, key: []const u8, field: []const u8, vec: []const f32) !void {
+        const id = self.resolveKey(key) orelse return error.NodeNotFound;
+        self.ensureVecInit();
+        var vs = &self.vec_store.?;
+        try vs.set(id, field, vec);
+
+        var vi = &self.vec_indices.?;
+        if (!vi.contains(field)) {
+            const dim = vs.fieldDim(field) orelse return error.InternalError;
+            const field_id = vs.field_intern.find(field) orelse return error.InternalError;
+            const idx = try self.allocator.create(HnswIndex);
+            idx.* = HnswIndex.init(self.allocator, dim, vs, field_id);
+            const owned_field = try self.allocator.dupe(u8, field);
+            try vi.put(owned_field, idx);
+        }
+
+        const idx = vi.get(field).?;
+        try idx.insert(id);
+        self.mutation_seq += 1;
+    }
+
+    /// Get a node's vector for a field. Returns null if vectors not initialized.
+    pub fn getVector(self: *const GraphEngine, key: []const u8, field: []const u8) ?[]const f32 {
+        const vs = self.vec_store orelse return null;
+        const id = self.resolveKey(key) orelse return null;
+        return vs.get(id, field);
+    }
+
+    /// Save all vector fields to .vvf files. No-op if vectors not initialized.
+    pub fn saveVectors(self: *GraphEngine, data_dir: []const u8) !void {
+        var vs = &(self.vec_store orelse return);
+        try vs.saveAllFields(data_dir);
+    }
+
+    /// Load vector files from data_dir/vectors/ and rebuild HNSW indices.
+    /// Lazily initializes vector infrastructure if .vvf files exist.
+    pub fn loadVectors(self: *GraphEngine, data_dir: []const u8) !void {
+        self.ensureVecInit();
+        var vs = &self.vec_store.?;
+        try vs.loadAllFields(data_dir);
+
+        // Check if anything was actually loaded
+        var has_vectors = false;
+        for (vs.mmap_fields) |mf| {
+            if (mf != null) { has_vectors = true; break; }
+        }
+        if (!has_vectors) {
+            // Nothing loaded — revert to null to stay lazy
+            vs.deinit();
+            self.vec_store = null;
+            self.vec_indices.?.deinit();
+            self.vec_indices = null;
+            return;
+        }
+
+        // Rebuild HNSW indices from loaded mmap data
+        var vi = &self.vec_indices.?;
+        const field_count = vs.field_intern.count();
+        for (0..field_count) |fi| {
+            const field_id: u16 = @intCast(fi);
+            if (vs.mmap_fields[fi] == null) continue;
+
+            const field_name = vs.field_intern.resolve(field_id);
+            const dim = vs.field_dims[fi];
+
+            if (!vi.contains(field_name)) {
+                const idx = try self.allocator.create(HnswIndex);
+                idx.* = HnswIndex.init(self.allocator, dim, vs, field_id);
+                const owned_field = try self.allocator.dupe(u8, field_name);
+                try vi.put(owned_field, idx);
+            }
+
+            const mf = &vs.mmap_fields[fi].?;
+            var node_ids = std.array_list.Managed(u32).init(self.allocator);
+            defer node_ids.deinit();
+            try mf.iterNodeIds(&node_ids);
+
+            const idx = vi.get(field_name).?;
+            for (node_ids.items) |nid| {
+                idx.insert(nid) catch continue;
+            }
+        }
+    }
+
     pub fn removeNode(self: *GraphEngine, key: []const u8) !void {
         const id = self.resolveKey(key) orelse return error.NodeNotFound;
 
@@ -243,6 +355,7 @@ pub const GraphEngine = struct {
         self.node_alive.unset(id);
         _ = self.key_to_id.remove(key);
         self.node_props.deleteAll(id);
+        if (self.vec_store) |*vs| vs.deleteAll(id);
         self.needs_compact = true;
         self.mutation_seq += 1;
     }

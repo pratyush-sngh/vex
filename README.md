@@ -9,6 +9,7 @@ A high-performance KV + Graph database written in Zig 0.16. Speaks the Redis pro
 - **Wins all 5 graph operations** vs Memgraph (add, traverse, path, neighbors)
 - **Redis-compatible** -- works with every Redis client library
 - **Zero dependencies** -- pure Zig standard library, single binary
+- **Vector search + GRAPH.RAG** -- HNSW ANN search on graph nodes, semantic search → graph traversal in one command
 - **Production features** -- TLS, transactions, pub/sub, LRU eviction, background saves, config files, structured logging, clustering with automatic failover
 
 ## Documentation
@@ -26,7 +27,9 @@ A high-performance KV + Graph database written in Zig 0.16. Speaks the Redis pro
 | **[Clustering](docs/clustering.md)** | Leader/follower replication, automatic failover, consistency model |
 | **[Benchmarks](docs/benchmarks.md)** | KV vs Redis, graph vs Memgraph, internal engine benchmarks |
 | **[Deployment](docs/deployment.md)** | Production checklist, systemd, Docker, tuning |
-| **[Testing](docs/testing.md)** | 107 tests, coverage table, test patterns |
+| **[Vector Search & GRAPH.RAG](docs/vector-search.md)** | HNSW vector search, f16 mmap storage, RAG pipeline examples |
+| **[Vector Benchmarks](docs/vector-benchmarks.md)** | Benchmark design: Vex vs Redis+RediSearch vs Qdrant vs Weaviate |
+| **[Testing](docs/testing.md)** | 158 tests, coverage table, test patterns |
 
 ---
 
@@ -130,7 +133,24 @@ QUEUED
 1) "subscribe"
 2) "news"
 3) (integer) 1
+
+# Vector search + graph expansion (RAG)
+127.0.0.1:6380> GRAPH.ADDNODE doc:1 document
+(integer) 0
+127.0.0.1:6380> GRAPH.ADDNODE topic:ai topic
+(integer) 1
+127.0.0.1:6380> GRAPH.ADDEDGE doc:1 topic:ai about
+(integer) 0
+127.0.0.1:6380> GRAPH.SETVEC doc:1 embedding <f32_bytes>
+OK
+127.0.0.1:6380> GRAPH.RAG embedding <query_bytes> K 5 DEPTH 1 DIR OUT
+1) 1) "doc:1"
+   2) "0.9523"
+   3) 1) "title"  2) "Attention Is All You Need"
+   4) 1) "topic:ai"
 ```
+
+See [Vector Search & GRAPH.RAG](docs/vector-search.md) for full RAG pipeline examples with Python.
 
 ---
 
@@ -144,6 +164,7 @@ QUEUED
 | **Sets** | SADD/SREM/SMEMBERS/SISMEMBER/SCARD/SUNION/SINTER/SDIFF |
 | **Sorted Sets** | ZADD/ZREM/ZRANGE/ZSCORE/ZRANK/ZCARD/ZINCRBY/ZCOUNT |
 | **Graph** | ADDNODE/ADDEDGE/TRAVERSE/PATH/WPATH/NEIGHBORS + 6 more |
+| **Vector Search** | GRAPH.SETVEC/GETVEC/VECSEARCH + GRAPH.RAG (search + traverse in one call) |
 | **Transactions** | MULTI/EXEC/DISCARD + WATCH/UNWATCH optimistic locking |
 | **Pub/Sub** | SUBSCRIBE/PUBLISH/UNSUBSCRIBE/PSUBSCRIBE/PUNSUBSCRIBE |
 | **Persistence** | Snapshot (CRC-32) + AOF with group commit + BGSAVE |
@@ -198,8 +219,11 @@ src/
 │   ├── hash.zig          # Hash data type (field maps)
 │   ├── set.zig           # Set data type (unique members)
 │   ├── sorted_set.zig    # Sorted set (score-ordered)
-│   ├── graph.zig         # CSR graph engine
-│   └── query.zig         # BFS, Dijkstra, traversal
+│   ├── graph.zig         # CSR graph engine + vector integration
+│   ├── query.zig         # BFS, Dijkstra, traversal
+│   ├── vector_store.zig  # f32 vector storage (per node, per field)
+│   ├── hnsw.zig          # HNSW approximate nearest neighbor index
+│   └── rag.zig           # GRAPH.RAG executor (search + expand)
 ├── command/
 │   └── handler.zig       # Command dispatch + BGSAVE
 ├── cluster/
@@ -212,6 +236,9 @@ src/
 ---
 
 ## Changelog
+
+### v0.6.0 -- Vector Search & GRAPH.RAG
+GRAPH.SETVEC/GETVEC/VECSEARCH for storing and searching embeddings on graph nodes. GRAPH.RAG combines vector ANN search + graph BFS expansion in a single command — purpose-built for agentic AI and RAG pipelines. HNSW index (M=16, ef=200/50), cosine similarity, graph-native NodeId results.
 
 ### v0.5.0 -- Sets & Sorted Sets
 Sets (SADD/SREM/SMEMBERS/SISMEMBER/SCARD/SUNION/SINTER/SDIFF), Sorted Sets (ZADD/ZREM/ZRANGE/ZSCORE/ZRANK/ZCARD/ZINCRBY/ZCOUNT). All 5 Redis data types now supported.

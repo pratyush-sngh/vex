@@ -39,6 +39,7 @@ pub const CommandHandler = struct {
     hash_store: ?*HashStore,
     set_store: ?*SetStore,
     sorted_set_store: ?*SortedSetStore,
+    data_dir: ?[]const u8,
 
     pub fn init(
         allocator: Allocator,
@@ -62,6 +63,7 @@ pub const CommandHandler = struct {
             .hash_store = null,
             .set_store = null,
             .sorted_set_store = null,
+            .data_dir = null,
         };
     }
 
@@ -226,13 +228,17 @@ pub const CommandHandler = struct {
                     if (std.mem.eql(u8, sub, "ADDNODE")) return self.cmdGraphAddNode(args, w);
                     if (std.mem.eql(u8, sub, "ADDEDGE")) return self.cmdGraphAddEdge(args, w);
                 },
-                'G' => if (std.mem.eql(u8, sub, "GETNODE")) return self.cmdGraphGetNode(args, w),
+                'G' => {
+                    if (std.mem.eql(u8, sub, "GETNODE")) return self.cmdGraphGetNode(args, w);
+                    if (std.mem.eql(u8, sub, "GETVEC")) return self.cmdGraphGetVec(args, w);
+                },
                 'D' => {
                     if (std.mem.eql(u8, sub, "DELNODE")) return self.cmdGraphDelNode(args, w);
                     if (std.mem.eql(u8, sub, "DELEDGE")) return self.cmdGraphDelEdge(args, w);
                 },
                 'S' => {
                     if (std.mem.eql(u8, sub, "SETPROP")) return self.cmdGraphSetProp(args, w);
+                    if (std.mem.eql(u8, sub, "SETVEC")) return self.cmdGraphSetVec(args, w);
                     if (std.mem.eql(u8, sub, "STATS")) return self.cmdGraphStats(w);
                 },
                 'N' => if (std.mem.eql(u8, sub, "NEIGHBORS")) return self.cmdGraphNeighbors(args, w),
@@ -240,6 +246,8 @@ pub const CommandHandler = struct {
                 'P' => if (std.mem.eql(u8, sub, "PATH")) return self.cmdGraphPath(args, w),
                 'W' => if (std.mem.eql(u8, sub, "WPATH")) return self.cmdGraphWPath(args, w),
                 'C' => if (std.mem.eql(u8, sub, "COMPACT")) return self.cmdGraphCompact(w),
+                'V' => if (std.mem.eql(u8, sub, "VECSEARCH")) return self.cmdGraphVecSearch(args, w),
+                'R' => if (std.mem.eql(u8, sub, "RAG")) return self.cmdGraphRag(args, w),
                 else => {},
             }
         }
@@ -2072,6 +2080,90 @@ pub const CommandHandler = struct {
         try resp.serializeInteger(w, @intCast(edges));
     }
 
+    // ── Vector Commands ────────────────────────────────────────────────
+
+    fn cmdGraphSetVec(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 4) { try resp.serializeError(w, "usage: GRAPH.SETVEC <key> <field> <f32_bytes>"); return; }
+        const nk = graphNamespacedKey(self, args[1]) catch { try resp.serializeError(w, "internal error"); return; };
+        defer self.allocator.free(nk);
+        const raw = args[3];
+        if (raw.len == 0 or raw.len % 4 != 0) { try resp.serializeError(w, "vector bytes must be non-empty and multiple of 4"); return; }
+        const dim = raw.len / 4;
+        const aligned = self.allocator.alloc(f32, dim) catch { try resp.serializeError(w, "out of memory"); return; };
+        defer self.allocator.free(aligned);
+        @memcpy(std.mem.sliceAsBytes(aligned), raw);
+        self.graph.setVector(nk, args[2], aligned) catch |err| { try resp.serializeError(w, @errorName(err)); return; };
+        self.logToAOF(args);
+        try resp.serializeSimpleString(w, "OK");
+    }
+
+    fn cmdGraphGetVec(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 3) { try resp.serializeError(w, "usage: GRAPH.GETVEC <key> <field>"); return; }
+        const nk = graphNamespacedKey(self, args[1]) catch { try resp.serializeError(w, "internal error"); return; };
+        defer self.allocator.free(nk);
+        const vec = self.graph.getVector(nk, args[2]) orelse { try resp.serializeBulkString(w, null); return; };
+        try resp.serializeBulkString(w, std.mem.sliceAsBytes(vec));
+    }
+
+    fn cmdGraphVecSearch(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 5) { try resp.serializeError(w, "usage: GRAPH.VECSEARCH <field> <query> K <n>"); return; }
+        const field = args[1];
+        const raw_query = args[2];
+        if (raw_query.len == 0 or raw_query.len % 4 != 0) { try resp.serializeError(w, "query bytes must be multiple of 4"); return; }
+        const k_str = if (args[3].len == 1 and (args[3][0] == 'K' or args[3][0] == 'k')) args[4] else args[3];
+        const k = std.fmt.parseInt(u32, k_str, 10) catch { try resp.serializeError(w, "K must be integer"); return; };
+        const dim = raw_query.len / 4;
+        const qa = self.allocator.alloc(f32, dim) catch { try resp.serializeError(w, "out of memory"); return; };
+        defer self.allocator.free(qa);
+        @memcpy(std.mem.sliceAsBytes(qa), raw_query);
+        const vi = self.graph.vec_indices orelse { try resp.serializeError(w, "no vector index for field"); return; };
+        const idx = vi.get(field) orelse { try resp.serializeError(w, "no vector index for field"); return; };
+        @import("../engine/vector_store.zig").VectorStore.normalize(qa);
+        const results = idx.search(qa, k, &self.graph.node_alive) catch { try resp.serializeError(w, "search failed"); return; };
+        defer self.allocator.free(results);
+        try resp.serializeArrayHeader(w, results.len * 2);
+        for (results) |r| {
+            const node = self.graph.getNodeById(r.node_id);
+            if (node) |n| { try resp.serializeBulkString(w, stripGraphDbPrefix(self, n.key) orelse n.key); } else { try resp.serializeBulkString(w, null); }
+            var sb: [32]u8 = undefined;
+            try resp.serializeBulkString(w, std.fmt.bufPrint(&sb, "{d:.4}", .{1.0 - r.distance}) catch "0");
+        }
+    }
+
+    fn cmdGraphRag(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        const rag_mod = @import("../engine/rag.zig");
+        if (args.len < 5) { try resp.serializeError(w, "usage: GRAPH.RAG <field> <query> K <n> [DEPTH d] [DIR d]"); return; }
+        const field = args[1];
+        const raw_query = args[2];
+        if (raw_query.len == 0 or raw_query.len % 4 != 0) { try resp.serializeError(w, "query bytes must be multiple of 4"); return; }
+        const k_idx: usize = if (args[3].len == 1 and (args[3][0] == 'K' or args[3][0] == 'k')) 4 else 3;
+        const k = std.fmt.parseInt(u32, if (k_idx < args.len) args[k_idx] else "5", 10) catch 5;
+        var opts = rag_mod.RagOptions{};
+        var i: usize = k_idx + 1;
+        while (i < args.len) {
+            var fb: [64]u8 = undefined;
+            const flag = toUpper(args[i], &fb);
+            if (std.mem.eql(u8, flag, "DEPTH") and i + 1 < args.len) { opts.depth = std.fmt.parseInt(u32, args[i + 1], 10) catch 1; i += 2; } else if (std.mem.eql(u8, flag, "DIR") and i + 1 < args.len) { var db: [64]u8 = undefined; const d = toUpper(args[i + 1], &db); if (std.mem.eql(u8, d, "IN")) { opts.direction = .incoming; } else if (std.mem.eql(u8, d, "BOTH")) { opts.direction = .both; } i += 2; } else if (std.mem.eql(u8, flag, "EDGETYPE") and i + 1 < args.len) { opts.edge_type_filter = args[i + 1]; i += 2; } else if (std.mem.eql(u8, flag, "NODETYPE") and i + 1 < args.len) { opts.node_type_filter = args[i + 1]; i += 2; } else { i += 1; }
+        }
+        const dim = raw_query.len / 4;
+        const qa = self.allocator.alloc(f32, dim) catch { try resp.serializeError(w, "out of memory"); return; };
+        defer self.allocator.free(qa);
+        @memcpy(std.mem.sliceAsBytes(qa), raw_query);
+        const results = rag_mod.ragSearch(self.graph, self.allocator, field, qa, k, opts) catch |err| { try resp.serializeError(w, @errorName(err)); return; };
+        defer { for (results) |*r| { var rm = r.*; rm.deinit(self.allocator); } self.allocator.free(results); }
+        try resp.serializeArrayHeader(w, results.len);
+        for (results) |r| {
+            try resp.serializeArrayHeader(w, 4);
+            try resp.serializeBulkString(w, stripGraphDbPrefix(self, r.key) orelse r.key);
+            var sb: [32]u8 = undefined;
+            try resp.serializeBulkString(w, std.fmt.bufPrint(&sb, "{d:.4}", .{r.score}) catch "0");
+            try resp.serializeArrayHeader(w, r.props.len * 2);
+            for (r.props) |p| { try resp.serializeBulkString(w, p.key); try resp.serializeBulkString(w, p.value); }
+            try resp.serializeArrayHeader(w, r.neighbor_keys.len);
+            for (r.neighbor_keys) |nk| { try resp.serializeBulkString(w, stripGraphDbPrefix(self, nk) orelse nk); }
+        }
+    }
+
     // ── Persistence Commands ─────────────────────────────────────────
 
     /// SAVE -- foreground snapshot + AOF truncate
@@ -2085,6 +2177,10 @@ pub const CommandHandler = struct {
             return;
         };
         a.truncate() catch {};
+        // Save vector files
+        if (self.data_dir) |dd| {
+            self.graph.saveVectors(dd) catch {};
+        }
         a.last_save_time = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
         try resp.serializeSimpleString(w, "OK");
     }
@@ -2114,13 +2210,13 @@ pub const CommandHandler = struct {
             snapshot_path: []const u8,
             aof_ptr: *AOF,
             graph_rwlock: ?*std.c.pthread_rwlock_t,
+            data_dir: ?[]const u8,
 
             fn run(ctx: *@This()) void {
                 defer {
                     bgsave_in_progress.store(false, .release);
                     ctx.allocator.destroy(ctx);
                 }
-                // Acquire read locks for consistent snapshot
                 if (ctx.graph_rwlock) |rwl| {
                     _ = std.c.pthread_rwlock_rdlock(rwl);
                 }
@@ -2130,6 +2226,9 @@ pub const CommandHandler = struct {
 
                 snapshot.save(ctx.io, ctx.allocator, ctx.kv, ctx.graph, ctx.snapshot_path) catch return;
                 ctx.aof_ptr.truncate() catch {};
+                if (ctx.data_dir) |dd| {
+                    ctx.graph.saveVectors(dd) catch {};
+                }
                 ctx.aof_ptr.last_save_time = std.Io.Timestamp.now(ctx.io, .real).toMilliseconds();
             }
         };
@@ -2147,6 +2246,7 @@ pub const CommandHandler = struct {
             .snapshot_path = a.snapshot_path,
             .aof_ptr = a,
             .graph_rwlock = self.graph_rwlock,
+            .data_dir = self.data_dir,
         };
 
         const t = std.Thread.spawn(.{}, BgSaveCtx.run, .{ctx}) catch {

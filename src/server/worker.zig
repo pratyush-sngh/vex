@@ -1847,7 +1847,8 @@ fn isGraphWriteCommand(args: []const []const u8) bool {
     if (cmd.len >= 13 and equalsAsciiUpperPrefix(cmd[6..], "SETPRO")) return true;
     if (cmd.len >= 12 and equalsAsciiUpperPrefix(cmd[6..], "ADDEDG")) return true;
     if (cmd.len >= 12 and equalsAsciiUpperPrefix(cmd[6..], "DELEDG")) return true;
-    return false; // GETNODE, NEIGHBORS, TRAVERSE, PATH, WPATH, STATS = read
+    if (cmd.len >= 12 and equalsAsciiUpperPrefix(cmd[6..], "SETVEC")) return true;
+    return false; // GETNODE, GETVEC, NEIGHBORS, TRAVERSE, PATH, WPATH, STATS, VECSEARCH, RAG = read
 }
 
 fn equalsAsciiUpper(s: []const u8, comptime upper: []const u8) bool {

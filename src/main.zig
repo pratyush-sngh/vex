@@ -318,6 +318,13 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // ── Load vector files (mmap'd .vvf) ────────────────────────────
+    if (!config.no_persistence) {
+        graph.loadVectors(config.data_dir) catch |err| {
+            log("warning: vector load failed: {s}", .{@errorName(err)});
+        };
+    }
+
     printBanner(config.port, kv.dbsize(), graph.nodeCount(), replayed);
 
     var server = try Server.init(
@@ -359,6 +366,9 @@ pub fn main(init: std.process.Init) !void {
                 log("shutdown snapshot failed: {s}", .{@errorName(err)});
             };
             a.truncate() catch {};
+            graph.saveVectors(config.data_dir) catch |err| {
+                log("shutdown vector save failed: {s}", .{@errorName(err)});
+            };
             log("state saved", .{});
         }
     }
@@ -715,4 +725,7 @@ test {
     _ = @import("engine/hash.zig");
     _ = @import("engine/set.zig");
     _ = @import("engine/sorted_set.zig");
+    _ = @import("engine/vector_store.zig");
+    _ = @import("engine/hnsw.zig");
+    _ = @import("engine/rag.zig");
 }
