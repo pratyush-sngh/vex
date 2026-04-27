@@ -3,6 +3,8 @@ const Allocator = std.mem.Allocator;
 const StringIntern = @import("string_intern.zig").StringIntern;
 const TypeMask = @import("string_intern.zig").TypeMask;
 const PropertyStore = @import("property_store.zig").PropertyStore;
+pub const VectorStore = @import("vector_store.zig").VectorStore;
+pub const HnswIndex = @import("hnsw.zig").HnswIndex;
 
 pub const NodeId = u32;
 pub const EdgeId = u32;
@@ -95,6 +97,10 @@ pub const GraphEngine = struct {
     node_props: PropertyStore,
     edge_props: PropertyStore,
 
+    // ─── Vector Infrastructure ──────────────
+    vec_store: VectorStore,
+    vec_indices: std.StringHashMap(*HnswIndex),
+
     // ─── Compaction state ───────────────────
     needs_compact: bool,
     /// Monotonically increasing mutation counter. Incremented on every
@@ -131,6 +137,8 @@ pub const GraphEngine = struct {
             .type_intern = StringIntern.init(allocator),
             .node_props = PropertyStore.init(allocator),
             .edge_props = PropertyStore.init(allocator),
+            .vec_store = VectorStore.init(allocator),
+            .vec_indices = std.StringHashMap(*HnswIndex).init(allocator),
             .needs_compact = false,
             .mutation_seq = 0,
             .all_base_edges_alive = true,
@@ -159,6 +167,16 @@ pub const GraphEngine = struct {
         self.type_intern.deinit();
         self.node_props.deinit();
         self.edge_props.deinit();
+
+        // Free HNSW indices
+        var vi_iter = self.vec_indices.iterator();
+        while (vi_iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.*.deinit();
+            self.allocator.destroy(entry.value_ptr.*);
+        }
+        self.vec_indices.deinit();
+        self.vec_store.deinit();
     }
 
     // ─── Node Operations ──────────────────────────────────────────────
@@ -229,6 +247,33 @@ pub const GraphEngine = struct {
         self.mutation_seq += 1;
     }
 
+    /// Store a vector on a node for a given field. Creates HNSW index for field if needed.
+    pub fn setVector(self: *GraphEngine, key: []const u8, field: []const u8, vec: []const f32) !void {
+        const id = self.resolveKey(key) orelse return error.NodeNotFound;
+        try self.vec_store.set(id, field, vec);
+
+        // Ensure HNSW index exists for this field
+        if (!self.vec_indices.contains(field)) {
+            const dim = self.vec_store.fieldDim(field) orelse return error.InternalError;
+            const field_id = self.vec_store.field_intern.find(field) orelse return error.InternalError;
+            const idx = try self.allocator.create(HnswIndex);
+            idx.* = HnswIndex.init(self.allocator, dim, &self.vec_store, field_id);
+            const owned_field = try self.allocator.dupe(u8, field);
+            try self.vec_indices.put(owned_field, idx);
+        }
+
+        // Insert into HNSW
+        const idx = self.vec_indices.get(field).?;
+        try idx.insert(id);
+        self.mutation_seq += 1;
+    }
+
+    /// Get a node's vector for a field.
+    pub fn getVector(self: *const GraphEngine, key: []const u8, field: []const u8) ?[]const f32 {
+        const id = self.resolveKey(key) orelse return null;
+        return self.vec_store.get(id, field);
+    }
+
     pub fn removeNode(self: *GraphEngine, key: []const u8) !void {
         const id = self.resolveKey(key) orelse return error.NodeNotFound;
 
@@ -243,6 +288,7 @@ pub const GraphEngine = struct {
         self.node_alive.unset(id);
         _ = self.key_to_id.remove(key);
         self.node_props.deleteAll(id);
+        self.vec_store.deleteAll(id);
         self.needs_compact = true;
         self.mutation_seq += 1;
     }

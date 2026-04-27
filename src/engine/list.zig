@@ -6,76 +6,243 @@ const Allocator = std.mem.Allocator;
 pub const ListStore = struct {
     lists: std.StringHashMap(List),
     allocator: Allocator,
+    /// Mutex for top-level HashMap mutations (new key creation).
+    map_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
 
+    /// Quicklist: doubly-linked list of 8KB data blocks.
+    /// Each block stores values as packed [len:u16][data...][len:u16] entries.
+    /// The trailing u16 enables O(1) RPOP (walk backwards from tail).
+    /// Per-block offset ring buffer enables O(1) LINDEX/LRANGE within a block.
+    /// New blocks start from the middle — room for both LPUSH and RPUSH.
+    /// No per-value heap allocation. O(1) push/pop/index at both ends.
     const List = struct {
-        head: std.array_list.Managed([]u8), // reversed: head.pop() gives first element
-        tail: std.array_list.Managed([]u8), // tail.pop() gives last element
+        const BLOCK_SIZE: usize = 8192; // 8KB per block (matches Redis default)
+        const HEADER_SIZE: usize = 2; // u16 length prefix per entry
+        const TRAILER_SIZE: usize = 2; // u16 length suffix for O(1) backward scan
+        const ENTRY_OVERHEAD: usize = HEADER_SIZE + TRAILER_SIZE; // 4 bytes per entry
+        const MAX_ENTRIES: usize = 512; // max entries per block; forces new block if exceeded
+
+        const Block = struct {
+            data: [BLOCK_SIZE]u8,
+            head: usize, // first used byte (grows toward 0 on LPUSH)
+            tail: usize, // first free byte after last entry (grows toward BLOCK_SIZE on RPUSH)
+            entry_count: usize,
+            prev: ?*Block,
+            next: ?*Block,
+            // Ring buffer of byte offsets for O(1) random access within block.
+            // off_ring[off_start..off_start+entry_count] (mod MAX_ENTRIES) = entry offsets.
+            off_ring: [MAX_ENTRIES]u16,
+            off_start: u16, // index of first logical entry in ring
+        };
+
+        first: ?*Block,
+        last: ?*Block,
+        total_count: usize,
+        allocator: Allocator,
 
         fn init(allocator: Allocator) List {
-            return .{
-                .head = std.array_list.Managed([]u8).init(allocator),
-                .tail = std.array_list.Managed([]u8).init(allocator),
-            };
+            return .{ .first = null, .last = null, .total_count = 0, .allocator = allocator };
         }
 
-        fn deinit(self: *List, allocator: Allocator) void {
-            for (self.head.items) |v| allocator.free(v);
-            self.head.deinit();
-            for (self.tail.items) |v| allocator.free(v);
-            self.tail.deinit();
+        fn deinit(self: *List, _: Allocator) void {
+            var cur = self.first;
+            while (cur) |block| {
+                const next = block.next;
+                self.allocator.destroy(block);
+                cur = next;
+            }
+            self.first = null;
+            self.last = null;
+            self.total_count = 0;
         }
 
         fn len(self: *const List) usize {
-            return self.head.items.len + self.tail.items.len;
+            return self.total_count;
         }
 
-        /// Get element at logical index (0 = first).
-        fn get(self: *const List, index: usize) ?[]const u8 {
-            const hlen = self.head.items.len;
-            if (index < hlen) {
-                return self.head.items[hlen - 1 - index];
+        fn newBlock(self: *List) !*Block {
+            const block = try self.allocator.create(Block);
+            block.* = .{
+                .data = undefined,
+                .head = BLOCK_SIZE / 2, // start from middle
+                .tail = BLOCK_SIZE / 2,
+                .entry_count = 0,
+                .prev = null,
+                .next = null,
+                .off_ring = undefined,
+                .off_start = 0,
+            };
+            return block;
+        }
+
+        /// RPUSH: append to tail of last block. If full or max entries, allocate new block.
+        fn pushTail(self: *List, value: []const u8) !void {
+            const needed = ENTRY_OVERHEAD + value.len;
+            if (needed > BLOCK_SIZE) return error.ValueTooLarge;
+
+            var block = self.last orelse blk: {
+                const b = try self.newBlock();
+                self.first = b;
+                self.last = b;
+                break :blk b;
+            };
+
+            // Check if room at tail of last block (space + entry limit)
+            if (block.tail + needed > BLOCK_SIZE or block.entry_count >= MAX_ENTRIES) {
+                const new = try self.newBlock();
+                new.head = 0; // new tail block starts from beginning
+                new.tail = 0;
+                new.prev = block;
+                block.next = new;
+                self.last = new;
+                block = new;
             }
-            const ti = index - hlen;
-            if (ti < self.tail.items.len) {
-                return self.tail.items[ti];
+
+            // Record offset in ring buffer (append at end)
+            const ring_idx = (block.off_start +% @as(u16, @intCast(block.entry_count))) % MAX_ENTRIES;
+            block.off_ring[ring_idx] = @intCast(block.tail);
+
+            // Write [len:u16][value][len:u16] at tail
+            const vlen: u16 = @intCast(value.len);
+            @memcpy(block.data[block.tail..][0..2], std.mem.asBytes(&vlen));
+            @memcpy(block.data[block.tail + HEADER_SIZE ..][0..value.len], value);
+            @memcpy(block.data[block.tail + HEADER_SIZE + value.len ..][0..2], std.mem.asBytes(&vlen));
+            block.tail += needed;
+            block.entry_count += 1;
+            self.total_count += 1;
+        }
+
+        /// LPUSH: prepend to head of first block. If full or max entries, allocate new block.
+        fn pushHead(self: *List, value: []const u8) !void {
+            const needed = ENTRY_OVERHEAD + value.len;
+            if (needed > BLOCK_SIZE) return error.ValueTooLarge;
+
+            var block = self.first orelse blk: {
+                const b = try self.newBlock();
+                self.first = b;
+                self.last = b;
+                break :blk b;
+            };
+
+            // Check if room at head of first block (space + entry limit)
+            if (block.head < needed or block.entry_count >= MAX_ENTRIES) {
+                const new = try self.newBlock();
+                new.head = BLOCK_SIZE; // new head block starts from end
+                new.tail = BLOCK_SIZE;
+                new.next = block;
+                block.prev = new;
+                self.first = new;
+                block = new;
+            }
+
+            // Write [len:u16][value][len:u16] growing leftward from head
+            block.head -= needed;
+            const vlen: u16 = @intCast(value.len);
+            @memcpy(block.data[block.head..][0..2], std.mem.asBytes(&vlen));
+            @memcpy(block.data[block.head + HEADER_SIZE ..][0..value.len], value);
+            @memcpy(block.data[block.head + HEADER_SIZE + value.len ..][0..2], std.mem.asBytes(&vlen));
+
+            // Prepend offset in ring buffer (decrement off_start)
+            block.off_start = (block.off_start +% @as(u16, MAX_ENTRIES) -% 1) % @as(u16, MAX_ENTRIES);
+            block.off_ring[block.off_start] = @intCast(block.head);
+            block.entry_count += 1;
+            self.total_count += 1;
+        }
+
+        /// LPOP: remove from head of first block.
+        fn popHead(self: *List) ?[]const u8 {
+            const block = self.first orelse return null;
+            if (block.head >= block.tail) {
+                // Block empty — remove it
+                self.removeBlock(block);
+                // Try next block
+                const next = self.first orelse return null;
+                return self.popHeadFromBlock(next);
+            }
+            return self.popHeadFromBlock(block);
+        }
+
+        fn popHeadFromBlock(self: *List, block: *Block) ?[]const u8 {
+            if (block.head >= block.tail) return null;
+            const vlen = std.mem.bytesAsValue(u16, block.data[block.head..][0..2]).*;
+            const start = block.head + HEADER_SIZE;
+            const val = block.data[start .. start + vlen];
+            block.head += ENTRY_OVERHEAD + vlen;
+            // Advance ring buffer start
+            block.off_start = (block.off_start +% 1) % @as(u16, MAX_ENTRIES);
+            block.entry_count -= 1;
+            self.total_count -= 1;
+            return val;
+        }
+
+        /// RPOP: remove from tail of last block.
+        fn popTail(self: *List) ?[]const u8 {
+            const block = self.last orelse return null;
+            if (block.head >= block.tail) {
+                self.removeBlock(block);
+                const prev = self.last orelse return null;
+                return self.popTailFromBlock(prev);
+            }
+            return self.popTailFromBlock(block);
+        }
+
+        fn popTailFromBlock(self: *List, block: *Block) ?[]const u8 {
+            if (block.head >= block.tail) return null;
+            // O(1): read trailer to find last entry length, then step back
+            const vlen = std.mem.bytesAsValue(u16, block.data[block.tail - TRAILER_SIZE ..][0..2]).*;
+            const entry_start = block.tail - ENTRY_OVERHEAD - vlen;
+            const val = block.data[entry_start + HEADER_SIZE ..][0..vlen];
+            block.tail = entry_start;
+            // Ring buffer tail shrinks automatically (entry_count decremented)
+            block.entry_count -= 1;
+            self.total_count -= 1;
+            return val;
+        }
+
+        /// Get element at logical index. O(blocks) to find block, O(1) within block via offset ring.
+        fn get(self: *const List, logical_idx: usize) ?[]const u8 {
+            if (logical_idx >= self.total_count) return null;
+            var remaining = logical_idx;
+            var cur = self.first;
+            while (cur) |block| {
+                if (remaining < block.entry_count) {
+                    // O(1) lookup via ring buffer
+                    const ring_idx = (block.off_start +% @as(u16, @intCast(remaining))) % MAX_ENTRIES;
+                    const pos = block.off_ring[ring_idx];
+                    const vlen = std.mem.bytesAsValue(u16, block.data[pos..][0..2]).*;
+                    return block.data[pos + HEADER_SIZE ..][0..vlen];
+                }
+                remaining -= block.entry_count;
+                cur = block.next;
             }
             return null;
         }
 
-        /// Rebalance: move half of tail to head (when head is empty and we need lpop).
-        fn rebalanceToHead(self: *List) void {
-            // Reverse tail into head
-            const tlen = self.tail.items.len;
-            if (tlen == 0) return;
-            const half = tlen; // move all to head
-            var i: usize = 0;
-            while (i < half) : (i += 1) {
-                const idx = tlen - 1 - i;
-                self.head.append(self.tail.items[idx]) catch return;
-            }
-            // Remove moved items from tail
-            self.tail.shrinkRetainingCapacity(tlen - half);
-        }
-
-        /// Rebalance: move half of head to tail (when tail is empty and we need rpop).
-        fn rebalanceToTail(self: *List) void {
-            const hlen = self.head.items.len;
-            if (hlen == 0) return;
-            const half = hlen;
-            var i: usize = 0;
-            while (i < half) : (i += 1) {
-                const idx = hlen - 1 - i;
-                self.tail.append(self.head.items[idx]) catch return;
-            }
-            self.head.shrinkRetainingCapacity(hlen - half);
+        fn removeBlock(self: *List, block: *Block) void {
+            if (block.prev) |p| p.next = block.next else self.first = block.next;
+            if (block.next) |n| n.prev = block.prev else self.last = block.prev;
+            self.allocator.destroy(block);
         }
     };
 
     pub fn init(allocator: Allocator) ListStore {
-        return .{
+        var store = ListStore{
             .lists = std.StringHashMap(List).init(allocator),
             .allocator = allocator,
         };
+        store.lists.ensureTotalCapacity(4096) catch {};
+        return store;
+    }
+
+    /// Clear all data but retain HashMap capacity for reuse.
+    pub fn flush(self: *ListStore) void {
+        var it = self.lists.iterator();
+        while (it.next()) |entry| {
+            var list = entry.value_ptr.*;
+            list.deinit(self.allocator);
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.lists.clearRetainingCapacity();
     }
 
     pub fn deinit(self: *ListStore) void {
@@ -88,63 +255,49 @@ pub const ListStore = struct {
         self.lists.deinit();
     }
 
-    /// LPUSH key value [value ...] — prepend values (O(1) each), returns new length.
+
+    /// LPUSH key value [value ...] — prepend values, returns new length.
     pub fn lpush(self: *ListStore, key: []const u8, values: []const []const u8) !usize {
         const list = try self.getOrCreate(key);
-        for (values) |val| {
-            const copy = try self.allocator.dupe(u8, val);
-            errdefer self.allocator.free(copy);
-            try list.head.append(copy);
-        }
+        for (values) |val| try list.pushHead(val);
         return list.len();
     }
 
-    /// LPUSH with pre-allocated owned values. Caller allocated, list takes ownership.
-    /// No allocation under lock — only the ArrayList append (~20ns).
+    /// LPUSH with pre-allocated owned values. Same as lpush for flat buffer (just copies data).
     pub fn lpushOwned(self: *ListStore, key: []const u8, owned: []const []u8) !usize {
         const list = try self.getOrCreate(key);
-        for (owned) |val| try list.head.append(val);
+        for (owned) |val| try list.pushHead(val);
         return list.len();
     }
 
-    /// RPUSH key value [value ...] — append values (O(1) each), returns new length.
+    /// RPUSH key value [value ...] — append values, returns new length.
     pub fn rpush(self: *ListStore, key: []const u8, values: []const []const u8) !usize {
         const list = try self.getOrCreate(key);
-        for (values) |val| {
-            const copy = try self.allocator.dupe(u8, val);
-            errdefer self.allocator.free(copy);
-            try list.tail.append(copy);
-        }
+        for (values) |val| try list.pushTail(val);
         return list.len();
     }
 
-    /// RPUSH with pre-allocated owned values. No allocation under lock.
+    /// RPUSH with pre-allocated owned values. Same as rpush for flat buffer.
     pub fn rpushOwned(self: *ListStore, key: []const u8, owned: []const []u8) !usize {
         const list = try self.getOrCreate(key);
-        for (owned) |val| try list.tail.append(val);
+        for (owned) |val| try list.pushTail(val);
         return list.len();
     }
 
-    /// LPOP key — remove and return the first element (O(1) amortized).
-    pub fn lpop(self: *ListStore, key: []const u8) ?[]u8 {
+    /// LPOP key — remove and return the first element. Returns slice into internal buffer.
+    /// Caller must NOT free the returned slice (it's not heap-allocated).
+    /// Note: empty lists are NOT auto-deleted — the returned slice points into block memory
+    /// that would be freed by removeKey. Cleanup happens on next push/pop or DEL/FLUSHALL.
+    pub fn lpop(self: *ListStore, key: []const u8) ?[]const u8 {
         const list = self.lists.getPtr(key) orelse return null;
-        if (list.len() == 0) return null;
-        if (list.head.items.len == 0) list.rebalanceToHead();
-        if (list.head.items.len == 0) return null;
-        const val = list.head.pop();
-        if (list.len() == 0) self.removeKey(key);
-        return val;
+        return list.popHead();
     }
 
-    /// RPOP key — remove and return the last element (O(1) amortized).
-    pub fn rpop(self: *ListStore, key: []const u8) ?[]u8 {
+    /// RPOP key — remove and return the last element.
+    /// Note: see lpop comment about deferred cleanup.
+    pub fn rpop(self: *ListStore, key: []const u8) ?[]const u8 {
         const list = self.lists.getPtr(key) orelse return null;
-        if (list.len() == 0) return null;
-        if (list.tail.items.len == 0) list.rebalanceToTail();
-        if (list.tail.items.len == 0) return null;
-        const val = list.tail.pop();
-        if (list.len() == 0) self.removeKey(key);
-        return val;
+        return list.popTail();
     }
 
     /// LLEN key — return list length.
@@ -187,77 +340,71 @@ pub const ListStore = struct {
         return result;
     }
 
-    /// LSET key index value — set element at index.
+    /// LSET key index value — rebuild list with updated element.
     pub fn lset(self: *ListStore, key: []const u8, index: i64, value: []const u8) !void {
         const list = self.lists.getPtr(key) orelse return error.NoSuchKey;
         const total: i64 = @intCast(list.len());
         var idx = index;
         if (idx < 0) idx += total;
         if (idx < 0 or idx >= total) return error.IndexOutOfRange;
+        // Rebuild: collect all elements, replace target, rebuild flat buffer
         const ui: usize = @intCast(idx);
-        const hlen = list.head.items.len;
-        const copy = try self.allocator.dupe(u8, value);
-        if (ui < hlen) {
-            self.allocator.free(list.head.items[hlen - 1 - ui]);
-            list.head.items[hlen - 1 - ui] = copy;
-        } else {
-            const ti = ui - hlen;
-            self.allocator.free(list.tail.items[ti]);
-            list.tail.items[ti] = copy;
+        var new_list = List.init(self.allocator);
+        var i: usize = 0;
+        while (i < list.total_count) : (i += 1) {
+            const v = list.get(i) orelse continue;
+            if (i == ui) {
+                try new_list.pushTail(value);
+            } else {
+                try new_list.pushTail(v);
+            }
         }
+        list.deinit(self.allocator);
+        list.* = new_list;
     }
 
-    /// LREM key count value — remove count occurrences of value.
-    /// For the deque, we linearize, remove, then rebuild. O(n) but correct.
+    /// LREM key count value — rebuild list without matching elements.
     pub fn lrem(self: *ListStore, key: []const u8, count_in: i64, value: []const u8) usize {
         const list = self.lists.getPtr(key) orelse return 0;
         const total = list.len();
         if (total == 0) return 0;
 
-        // Linearize into a temporary buffer
-        var linear = std.array_list.Managed([]u8).init(self.allocator);
-        defer linear.deinit();
-        // Head is reversed
-        var hi: usize = list.head.items.len;
-        while (hi > 0) : (hi -= 1) {
-            linear.append(list.head.items[hi - 1]) catch return 0;
-        }
-        for (list.tail.items) |item| {
-            linear.append(item) catch return 0;
-        }
-
         var removed: usize = 0;
         const max_remove: usize = if (count_in == 0) total else @intCast(if (count_in < 0) -count_in else count_in);
 
+        // Collect all values, skip matches
+        var new_list = List.init(self.allocator);
         if (count_in >= 0) {
             var i: usize = 0;
-            while (i < linear.items.len and removed < max_remove) {
-                if (std.mem.eql(u8, linear.items[i], value)) {
-                    self.allocator.free(linear.orderedRemove(i));
+            while (i < total) : (i += 1) {
+                const v = list.get(i) orelse continue;
+                if (removed < max_remove and std.mem.eql(u8, v, value)) {
                     removed += 1;
                 } else {
-                    i += 1;
+                    new_list.pushTail(v) catch {};
                 }
             }
         } else {
-            var i: usize = linear.items.len;
-            while (i > 0 and removed < max_remove) {
-                i -= 1;
-                if (std.mem.eql(u8, linear.items[i], value)) {
-                    self.allocator.free(linear.orderedRemove(i));
+            // Remove from tail: collect all, then remove from end
+            var items = std.array_list.Managed([]const u8).init(self.allocator);
+            defer items.deinit();
+            var i: usize = 0;
+            while (i < total) : (i += 1) {
+                if (list.get(i)) |v| items.append(v) catch {};
+            }
+            var j: usize = items.items.len;
+            while (j > 0 and removed < max_remove) {
+                j -= 1;
+                if (std.mem.eql(u8, items.items[j], value)) {
+                    _ = items.orderedRemove(j);
                     removed += 1;
                 }
             }
+            for (items.items) |v| new_list.pushTail(v) catch {};
         }
 
-        // Rebuild deque from linear
-        list.head.clearRetainingCapacity();
-        list.tail.clearRetainingCapacity();
-        for (linear.items) |item| {
-            list.tail.append(item) catch {};
-        }
-        // Clear linear without freeing items (they're now in tail)
-        linear.clearRetainingCapacity();
+        list.deinit(self.allocator);
+        list.* = new_list;
 
         if (list.len() == 0) self.removeKey(key);
         return removed;
@@ -276,16 +423,26 @@ pub const ListStore = struct {
         return true;
     }
 
+    /// No-op for flat buffer lists. Values are slices into internal buffer, not heap-allocated.
+    pub fn freeVal(_: Allocator, _: []const u8) void {}
+
     fn getOrCreate(self: *ListStore, key: []const u8) !*List {
+        // Fast path: key exists — no mutex needed
+        if (self.lists.getPtr(key)) |existing| return existing;
+        // Slow path: new key — mutex protects HashMap mutation
+        _ = std.c.pthread_mutex_lock(&self.map_mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.map_mutex);
+        // Double-check after acquiring mutex (another thread may have created it)
+        if (self.lists.getPtr(key)) |existing| return existing;
         const gop = try self.lists.getOrPut(key);
-        if (!gop.found_existing) {
-            gop.key_ptr.* = try self.allocator.dupe(u8, key);
-            gop.value_ptr.* = List.init(self.allocator);
-        }
+        gop.key_ptr.* = try self.allocator.dupe(u8, key);
+        gop.value_ptr.* = List.init(self.allocator);
         return gop.value_ptr;
     }
 
     fn removeKey(self: *ListStore, key: []const u8) void {
+        _ = std.c.pthread_mutex_lock(&self.map_mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.map_mutex);
         var entry = self.lists.fetchRemove(key) orelse return;
         entry.value.deinit(self.allocator);
         self.allocator.free(entry.key);
@@ -314,11 +471,11 @@ test "LPOP and RPOP" {
     _ = try store.rpush("q", &[_][]const u8{ "1", "2", "3" });
 
     const left = store.lpop("q").?;
-    defer std.testing.allocator.free(left);
+    defer ListStore.freeVal(std.testing.allocator, left);
     try std.testing.expectEqualStrings("1", left);
 
     const right = store.rpop("q").?;
-    defer std.testing.allocator.free(right);
+    defer ListStore.freeVal(std.testing.allocator, right);
     try std.testing.expectEqualStrings("3", right);
 
     try std.testing.expectEqual(@as(usize, 1), store.llen("q"));
@@ -369,12 +526,15 @@ test "LINDEX negative" {
     try std.testing.expect(store.lindex("n", 3) == null);
 }
 
-test "empty after pop auto-deletes" {
+test "empty after pop keeps key (deferred cleanup)" {
     var store = ListStore.init(std.testing.allocator);
     defer store.deinit();
 
     _ = try store.rpush("tmp", &[_][]const u8{"x"});
     const v = store.rpop("tmp").?;
-    defer std.testing.allocator.free(v);
-    try std.testing.expect(!store.exists("tmp"));
+    defer ListStore.freeVal(std.testing.allocator, v);
+    try std.testing.expectEqualStrings("x", v);
+    // Key still exists (empty list) — block memory keeps val alive.
+    // Cleanup happens on next operation or DEL/FLUSHALL.
+    try std.testing.expectEqual(@as(usize, 0), store.llen("tmp"));
 }

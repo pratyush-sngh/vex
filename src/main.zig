@@ -715,4 +715,8 @@ test {
     _ = @import("engine/hash.zig");
     _ = @import("engine/set.zig");
     _ = @import("engine/sorted_set.zig");
+    _ = @import("engine/vector_store.zig");
+    _ = @import("engine/hnsw.zig");
+    _ = @import("engine/rag.zig");
+    _ = @import("engine/lockfree_map.zig");
 }
