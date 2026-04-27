@@ -1735,18 +1735,6 @@ pub const Worker = struct {
                         if (self.hash_store) |hs| {
                             const ns = nsKey(conn.selected_db, args[1]) orelse return false;
                             const dsl = self.ds_locks orelse return false;
-                            // Read-before-write: single field, check if value unchanged (only if hash exists)
-                            if (args.len == 4 and hs.hexists(ns, args[2])) {
-                                dsl.rdlock(ns, self.id, &self.last_stripe);
-                                if (hs.hget(ns, args[2])) |existing| {
-                                    if (std.mem.eql(u8, existing, args[3])) {
-                                        dsl.unlock(ns);
-                                        writeIntTo(&conn.write_buf, 0);
-                                        return true;
-                                    }
-                                }
-                                dsl.unlock(ns);
-                            }
                             // Pre-alloc field+value pairs OUTSIDE the lock
                             const fv = args[2..];
                             var owned_buf: [32][]u8 = undefined;
@@ -1841,19 +1829,6 @@ pub const Worker = struct {
                     if (self.set_store) |ss| {
                         const ns = nsKey(conn.selected_db, args[1]) orelse return false;
                         const dsl = self.ds_locks orelse return false;
-                        // Read-before-write: check if members exist (only if set exists)
-                        if (ss.scard(ns) > 0) {
-                            dsl.rdlock(ns, self.id, &self.last_stripe);
-                            var all_exist = true;
-                            for (args[2..]) |member| {
-                                if (!ss.sismember(ns, member)) { all_exist = false; break; }
-                            }
-                            dsl.unlock(ns);
-                            if (all_exist) {
-                                writeIntTo(&conn.write_buf, 0);
-                                return true;
-                            }
-                        }
                         // Pre-alloc members OUTSIDE the lock
                         const members = args[2..];
                         var owned_buf: [16][]u8 = undefined;
@@ -1880,19 +1855,6 @@ pub const Worker = struct {
                         if (self.sorted_set_store) |zs| {
                             const ns = nsKey(conn.selected_db, args[1]) orelse return false;
                             const dsl = self.ds_locks orelse return false;
-                            // Read-before-write: single member, check if score unchanged (only if zset exists)
-                            if (args.len == 4 and zs.exists(ns)) {
-                                const score = std.fmt.parseFloat(f64, args[2]) catch 0;
-                                dsl.rdlock(ns, self.id, &self.last_stripe);
-                                if (zs.zscore(ns, args[3])) |existing_score| {
-                                    if (existing_score == score) {
-                                        dsl.unlock(ns);
-                                        writeIntTo(&conn.write_buf, 0);
-                                        return true;
-                                    }
-                                }
-                                dsl.unlock(ns);
-                            }
                             dsl.wrlock(ns, self.id, &self.last_stripe);
                             const added = zs.zadd(ns, args[2..]) catch { dsl.unlock(ns); return false; };
                             dsl.unlock(ns);
