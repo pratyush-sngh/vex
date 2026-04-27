@@ -39,6 +39,7 @@ pub const CommandHandler = struct {
     hash_store: ?*HashStore,
     set_store: ?*SetStore,
     sorted_set_store: ?*SortedSetStore,
+    data_dir: ?[]const u8,
 
     pub fn init(
         allocator: Allocator,
@@ -62,6 +63,7 @@ pub const CommandHandler = struct {
             .hash_store = null,
             .set_store = null,
             .sorted_set_store = null,
+            .data_dir = null,
         };
     }
 
@@ -2174,6 +2176,10 @@ pub const CommandHandler = struct {
             return;
         };
         a.truncate() catch {};
+        // Save vector files
+        if (self.data_dir) |dd| {
+            self.graph.saveVectors(dd) catch {};
+        }
         a.last_save_time = std.Io.Timestamp.now(self.io, .real).toMilliseconds();
         try resp.serializeSimpleString(w, "OK");
     }
@@ -2203,13 +2209,13 @@ pub const CommandHandler = struct {
             snapshot_path: []const u8,
             aof_ptr: *AOF,
             graph_rwlock: ?*std.c.pthread_rwlock_t,
+            data_dir: ?[]const u8,
 
             fn run(ctx: *@This()) void {
                 defer {
                     bgsave_in_progress.store(false, .release);
                     ctx.allocator.destroy(ctx);
                 }
-                // Acquire read locks for consistent snapshot
                 if (ctx.graph_rwlock) |rwl| {
                     _ = std.c.pthread_rwlock_rdlock(rwl);
                 }
@@ -2219,6 +2225,9 @@ pub const CommandHandler = struct {
 
                 snapshot.save(ctx.io, ctx.allocator, ctx.kv, ctx.graph, ctx.snapshot_path) catch return;
                 ctx.aof_ptr.truncate() catch {};
+                if (ctx.data_dir) |dd| {
+                    ctx.graph.saveVectors(dd) catch {};
+                }
                 ctx.aof_ptr.last_save_time = std.Io.Timestamp.now(ctx.io, .real).toMilliseconds();
             }
         };
@@ -2236,6 +2245,7 @@ pub const CommandHandler = struct {
             .snapshot_path = a.snapshot_path,
             .aof_ptr = a,
             .graph_rwlock = self.graph_rwlock,
+            .data_dir = self.data_dir,
         };
 
         const t = std.Thread.spawn(.{}, BgSaveCtx.run, .{ctx}) catch {

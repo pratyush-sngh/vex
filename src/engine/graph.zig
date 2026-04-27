@@ -270,6 +270,45 @@ pub const GraphEngine = struct {
         return self.vec_store.get(id, field);
     }
 
+    /// Save all vector fields to .vvf files in data_dir/vectors/.
+    pub fn saveVectors(self: *GraphEngine, data_dir: []const u8) !void {
+        try self.vec_store.saveAllFields(data_dir);
+    }
+
+    /// Load vector files from data_dir/vectors/ and rebuild HNSW indices.
+    pub fn loadVectors(self: *GraphEngine, data_dir: []const u8) !void {
+        try self.vec_store.loadAllFields(data_dir);
+
+        // Rebuild HNSW indices from loaded mmap data
+        const field_count = self.vec_store.field_intern.count();
+        for (0..field_count) |fi| {
+            const field_id: u16 = @intCast(fi);
+            if (self.vec_store.mmap_fields[fi] == null) continue;
+
+            const field_name = self.vec_store.field_intern.resolve(field_id);
+            const dim = self.vec_store.field_dims[fi];
+
+            // Create HNSW index if not already present
+            if (!self.vec_indices.contains(field_name)) {
+                const idx = try self.allocator.create(HnswIndex);
+                idx.* = HnswIndex.init(self.allocator, dim, &self.vec_store, field_id);
+                const owned_field = try self.allocator.dupe(u8, field_name);
+                try self.vec_indices.put(owned_field, idx);
+            }
+
+            // Insert all mmap'd vectors into HNSW
+            const mf = &self.vec_store.mmap_fields[fi].?;
+            var node_ids = std.array_list.Managed(u32).init(self.allocator);
+            defer node_ids.deinit();
+            try mf.iterNodeIds(&node_ids);
+
+            const idx = self.vec_indices.get(field_name).?;
+            for (node_ids.items) |nid| {
+                idx.insert(nid) catch continue;
+            }
+        }
+    }
+
     pub fn removeNode(self: *GraphEngine, key: []const u8) !void {
         const id = self.resolveKey(key) orelse return error.NodeNotFound;
 
