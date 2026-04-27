@@ -37,30 +37,31 @@ vex:
 
 | Command | Redis TCP | Vex TCP | TCP Δ | Redis UDS | Vex UDS | UDS Δ |
 |---|---|---|---|---|---|---|
-| **MSET** | 354K | **559K** | **+58%** | 663K | **1.63M** | **+146%** |
-| **ZADD** | 873K | **1.22M** | **+39%** | 3.25M | **4.90M** | **+51%** |
-| **SET** | 1.02M | **1.32M** | **+29%** | 3.57M | **4.67M** | **+31%** |
-| **RPUSH** | 1.05M | **1.35M** | **+28%** | 3.91M | **4.76M** | **+22%** |
-| **SADD** | 1.14M | **1.41M** | **+24%** | 4.13M | **6.49M** | **+57%** |
-| **INCR** | 1.10M | **1.36M** | **+23%** | 4.13M | **6.67M** | **+61%** |
-| **LRANGE_100** | 167K | **197K** | **+18%** | 275K | **316K** | **+15%** |
-| **HSET** | 1.03M | **1.19M** | **+16%** | 3.47M | **4.39M** | **+26%** |
-| **LPUSH** | 1.16M | **1.34M** | **+15%** | 2.96M | **4.31M** | **+46%** |
-| **LPOP** | 1.46M | **1.67M** | **+15%** | **5.88M** | 3.60M | -39% |
-| **RPOP** | 1.59M | **1.72M** | **+9%** | **5.95M** | 3.62M | -39% |
-| **GET** | 1.25M | **1.32M** | **+5%** | 5.75M | **7.46M** | **+30%** |
-| **LRANGE_300** | 70.2K | **71.9K** | **+2%** | **77.1K** | 76.1K | -1% |
+| **LPUSH** | 971K | **1.38M** | **+42%** | 3.01M | **4.10M** | **+36%** |
+| **RPUSH** | 1.08M | **1.33M** | **+24%** | 3.79M | **4.17M** | **+10%** |
+| **SADD** | 1.19M | **1.42M** | **+19%** | 4.13M | **6.85M** | **+66%** |
+| **MSET** | 491K | **583K** | **+19%** | 668K | **1.84M** | **+175%** |
+| **LPOP** | 1.46M | **1.72M** | **+18%** | 5.88M | **7.25M** | **+23%** |
+| **ZADD** | 1.07M | **1.25M** | **+16%** | 3.27M | **5.49M** | **+68%** |
+| **HSET** | 1.03M | **1.19M** | **+16%** | 3.33M | **4.63M** | **+39%** |
+| **SET** | 1.16M | **1.31M** | **+13%** | 3.57M | **3.91M** | **+9%** |
+| **INCR** | 1.17M | **1.31M** | **+13%** | 4.10M | **6.49M** | **+58%** |
+| **LRANGE_100** | 184K | **202K** | **+10%** | 273K | **316K** | **+16%** |
+| **GET** | 1.28M | **1.39M** | **+9%** | 5.81M | **7.35M** | **+27%** |
+| **RPOP** | 1.60M | **1.74M** | **+9%** | 5.95M | **7.35M** | **+24%** |
+| **LRANGE_300** | 69.3K | **71.4K** | **+3%** | **77.2K** | 76.8K | -1% |
 
 All values in requests per second (median of 15 runs). FLUSHALL between runs. TCP benchmarks run from host via Docker port mapping. UDS benchmarks run inside Docker via `docker exec`. Sorted by TCP speedup.
 
 **Key takeaways:**
-- **TCP**: Vex faster on **13/13 commands** (+2% to +58%). Every TCP command is faster.
-- **UDS**: Vex faster on 10/13 commands (+15% to +146%). MSET +146% over UDS is the standout.
-- **GET 7.46M rps over UDS** — 30% faster than Redis. Lock-free SeqLock reads + pre-sized buffers.
-- **INCR +61% over UDS**: Native i64 storage — no string parse/format on each increment.
-- **ZADD +39% TCP / +51% UDS**: Lazy sorted cache + O(1) HashMap score lookup.
-- **LRANGE_100 +18% TCP / +15% UDS**: O(1) offset ring buffer eliminates linear scan within quicklist blocks.
-- **LPOP/RPOP -39% UDS**: Multi-reactor lock overhead shows under zero-network UDS. TCP hides this (+15%/+9%).
+- **TCP**: Vex faster on **13/13 commands** (+3% to +42%). Every TCP command is faster.
+- **UDS**: Vex faster on **12/13 commands** (+9% to +175%). Only LRANGE_300 is tied (-1%).
+- **LPOP 7.25M / RPOP 7.35M rps over UDS** — +23%/+24% faster than Redis. Atomic spinlocks (~10ns) replaced pthread_rwlock (~100-200ns).
+- **MSET +175% over UDS**: Bulk key-value writes benefit from multi-reactor parallelism.
+- **SADD +66% / ZADD +68% over UDS**: Atomic spinlocks + pre-allocated HashMaps.
+- **INCR +58% over UDS**: Native i64 storage — no string parse/format on each increment.
+- **GET 7.35M rps over UDS** — 27% faster than Redis. Lock-free SeqLock reads + pre-sized buffers.
+- **LRANGE_100 +16% UDS**: O(1) offset ring buffer eliminates linear scan within quicklist blocks.
 - **UDS is 2-4x faster than TCP** for both Redis and Vex — use `--unixsocket` for same-machine deployments.
 
 ---
@@ -191,7 +192,7 @@ See [Architecture](architecture.md) for detailed explanation. Summary:
 
 | Optimization | Impact |
 |---|---|
-| 256-stripe rwlock | Parallel GETs across workers |
+| 256-stripe atomic spinlock | ~10ns CAS vs ~100-200ns pthread_rwlock |
 | Prealloc outside lock | Lock held ~20ns (pointer swap only) |
 | Cache-line aligned stripes | No false sharing between cores |
 | Cached clock | Skip clock_gettime per GET |
