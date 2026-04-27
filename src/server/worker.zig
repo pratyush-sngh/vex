@@ -21,7 +21,6 @@ const SortedSetStore = @import("../engine/sorted_set.zig").SortedSetStore;
 
 const READ_BUF_SIZE = 64 * 1024;
 const MAX_NEW_FDS = 256;
-const MAX_MIGRATE = 256;
 
 // ─── Precomputed DB prefixes (fix #4) ───────────────────────────────
 // Avoids std.fmt.bufPrint("db:{d}:") per command (~20ns saved per op)
@@ -135,33 +134,57 @@ pub const DS_STRIPE_COUNT = 256;
 pub const STRIPE_UNOWNED: u16 = 0xFFFF;
 
 pub const DsStripeLocks = struct {
-    locks: [DS_STRIPE_COUNT]std.atomic.Value(u32) align(64),
-    /// Stripe affinity: tracks which worker "owns" each stripe.
-    /// Connections are migrated to the owning worker to minimize contention.
-    stripe_owner: [DS_STRIPE_COUNT]std.atomic.Value(u16),
+    /// Stripe lease: holds the worker_id that currently owns the stripe.
+    /// STRIPE_UNOWNED = free. Worker that owns a lease can access the stripe
+    /// without any atomic ops (~1ns check vs ~10ns CAS per command).
+    /// Leases are held for the duration of a pipeline batch, then released.
+    /// With P=50: 1 CAS acquire + 49 free checks + 1 release = 3 atomic ops
+    /// vs old approach: 50 CAS acquire + 50 release = 100 atomic ops.
+    lease: [DS_STRIPE_COUNT]std.atomic.Value(u16) align(64),
 
     pub fn init(self: *DsStripeLocks) void {
-        for (&self.locks) |*l| l.* = std.atomic.Value(u32).init(0);
-        for (&self.stripe_owner) |*s| s.* = std.atomic.Value(u16).init(STRIPE_UNOWNED);
+        for (&self.lease) |*l| l.* = std.atomic.Value(u16).init(STRIPE_UNOWNED);
     }
 
     pub fn stripeIndex(key: []const u8) usize {
         return @as(usize, std.hash.Wyhash.hash(0, key)) % DS_STRIPE_COUNT;
     }
 
-    pub fn rdlock(self: *DsStripeLocks, key: []const u8) void {
-        self.wrlock(key); // spinlock is exclusive; with 256 stripes contention is rare
+    pub fn rdlock(self: *DsStripeLocks, key: []const u8, worker_id: u16, last: *u16) void {
+        self.wrlock(key, worker_id, last);
     }
 
-    pub fn wrlock(self: *DsStripeLocks, key: []const u8) void {
-        const idx = stripeIndex(key);
-        while (self.locks[idx].cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+    /// Acquire lease. If same stripe as last call: ~1ns (no atomic op at all).
+    /// If different stripe: release old, acquire new (~15ns).
+    /// Only holds ONE stripe at a time — other workers unblocked immediately
+    /// when we move to a different key.
+    pub fn wrlock(self: *DsStripeLocks, key: []const u8, worker_id: u16, last: *u16) void {
+        const idx: u16 = @intCast(stripeIndex(key));
+        // Fast path: same stripe as last command — nothing to do
+        if (idx == last.*) return;
+        // Release previous stripe (if any)
+        if (last.* != STRIPE_UNOWNED) {
+            self.lease[last.*].store(STRIPE_UNOWNED, .release);
+        }
+        // Acquire new stripe
+        while (self.lease[idx].cmpxchgWeak(STRIPE_UNOWNED, worker_id, .acquire, .monotonic) != null) {
             std.atomic.spinLoopHint();
         }
+        last.* = idx;
     }
 
+    /// No-op: lease released on next wrlock or releaseLast.
     pub fn unlock(self: *DsStripeLocks, key: []const u8) void {
-        self.locks[stripeIndex(key)].store(0, .release);
+        _ = self;
+        _ = key;
+    }
+
+    /// Release the single held stripe at end of handleRead.
+    pub fn releaseLast(self: *DsStripeLocks, last: *u16) void {
+        if (last.* != STRIPE_UNOWNED) {
+            self.lease[last.*].store(STRIPE_UNOWNED, .release);
+            last.* = STRIPE_UNOWNED;
+        }
     }
 };
 
@@ -236,9 +259,6 @@ const Connection = struct {
     watched_keys: ?std.array_list.Managed(WatchEntry),
     /// Set to true if a watched key was modified (dirty flag)
     watch_dirty: bool,
-    /// Stripe affinity: set to target worker ID when this connection should migrate.
-    /// 0xFFFF = no migration pending.
-    migrate_to: u16,
 
     const TxCommand = struct {
         args: [][]u8,
@@ -274,7 +294,6 @@ const Connection = struct {
             .tx_queue = null,
             .watched_keys = null,
             .watch_dirty = false,
-            .migrate_to = STRIPE_UNOWNED,
         };
         return conn;
     }
@@ -349,11 +368,8 @@ pub const Worker = struct {
     new_fds: [MAX_NEW_FDS]i32,
     new_fd_head: std.atomic.Value(usize),
     new_fd_tail: std.atomic.Value(usize),
-    all_workers: ?[]Worker,
-    // Migration queue: transferred Connection pointers from other workers
-    migrate_slots: [MAX_MIGRATE]*Connection,
-    migrate_head: std.atomic.Value(usize),
-    migrate_tail: std.atomic.Value(usize),
+    /// Last stripe lease held by this worker (only one at a time)
+    last_stripe: u16,
 
     pub fn init(
         allocator: Allocator,
@@ -413,10 +429,7 @@ pub const Worker = struct {
             .new_fds = [_]i32{-1} ** MAX_NEW_FDS,
             .new_fd_head = std.atomic.Value(usize).init(0),
             .new_fd_tail = std.atomic.Value(usize).init(0),
-            .all_workers = null,
-            .migrate_slots = undefined,
-            .migrate_head = std.atomic.Value(usize).init(0),
-            .migrate_tail = std.atomic.Value(usize).init(0),
+            .last_stripe = STRIPE_UNOWNED,
         };
     }
 
@@ -474,49 +487,6 @@ pub const Worker = struct {
     /// Stripe affinity: after processing a data-store command, check if this
     /// connection should migrate to the worker that owns the stripe.
     /// Processes current command normally (with lock), migration happens after flush.
-    fn checkAffinity(self: *Worker, conn: *Connection, key: []const u8) void {
-        const dsl = self.ds_locks orelse return;
-        if (self.all_workers == null) return;
-        _ = conn;
-
-        const idx = DsStripeLocks.stripeIndex(key);
-        const owner = dsl.stripe_owner[idx].load(.monotonic);
-
-        if (owner == STRIPE_UNOWNED) {
-            // First worker to touch this stripe claims it
-            _ = dsl.stripe_owner[idx].cmpxchgStrong(STRIPE_UNOWNED, self.id, .monotonic, .monotonic);
-        }
-        // TODO: connection migration — currently disabled pending stability fix.
-        // Stripe ownership is tracked but connections stay on their assigned worker.
-    }
-
-    /// Migrate a connection to the target worker. Transfers the Connection
-    /// pointer as-is — no state loss, no re-auth needed.
-    fn migrateConnection(self: *Worker, conn: *Connection) void {
-        const target = conn.migrate_to;
-        const workers = self.all_workers orelse return;
-        if (target >= workers.len) return;
-
-        // Remove fd from our event loop (stop getting events)
-        self.loop.removeFd(conn.fd);
-        // Remove from our connection map (but don't free — target takes ownership)
-        _ = self.conns.fetchRemove(conn.fd);
-
-        // Reset migration flag and push to target worker's migrate queue
-        conn.migrate_to = STRIPE_UNOWNED;
-        workers[target].pushMigratedConn(conn);
-    }
-
-    /// Accept a migrated connection from another worker. Lock-free SPSC push.
-    fn pushMigratedConn(self: *Worker, conn: *Connection) void {
-        const tail = self.migrate_tail.load(.monotonic);
-        const head = self.migrate_head.load(.acquire);
-        if (tail -% head >= MAX_MIGRATE) return;
-        self.migrate_slots[tail % MAX_MIGRATE] = conn;
-        self.migrate_tail.store(tail +% 1, .release);
-        self.loop.notify();
-    }
-
     // ── Internal helpers ─────────────────────────────────────────────
 
     fn acceptQueuedFds(self: *Worker) void {
@@ -529,32 +499,6 @@ pub const Worker = struct {
             self.new_fd_head.store(head +% 1, .release);
 
             self.registerConnection(fd);
-        }
-
-        // Drain migrated connections from other workers (stripe affinity)
-        while (true) {
-            const mh = self.migrate_head.load(.monotonic);
-            const mt = self.migrate_tail.load(.acquire);
-            if (mh == mt) break;
-            const conn = self.migrate_slots[mh % MAX_MIGRATE];
-            self.migrate_head.store(mh +% 1, .release);
-            // Re-register the existing connection on our event loop
-            self.loop.addFd(conn.fd, @intCast(@intFromPtr(conn))) catch {
-                // Can't add to event loop — close connection
-                _ = std.c.close(conn.fd);
-                conn.accum.deinit();
-                conn.write_buf.deinit();
-                self.allocator.destroy(conn);
-                continue;
-            };
-            self.conns.put(conn.fd, conn) catch {
-                self.loop.removeFd(conn.fd);
-                _ = std.c.close(conn.fd);
-                conn.accum.deinit();
-                conn.write_buf.deinit();
-                self.allocator.destroy(conn);
-                continue;
-            };
         }
     }
 
@@ -714,11 +658,8 @@ pub const Worker = struct {
             self.directFlush(conn);
         }
 
-        // Stripe affinity: migrate connection to owning worker after flushing response.
-        // Connection state (accum buffer, auth, db) transfers with it.
-        if (conn.migrate_to != STRIPE_UNOWNED) {
-            self.migrateConnection(conn);
-        }
+        // Release the single held stripe lease.
+        if (self.ds_locks) |dsl| dsl.releaseLast(&self.last_stripe);
     }
 
     fn processOneCommand(self: *Worker, conn: *Connection) bool {
@@ -804,30 +745,6 @@ pub const Worker = struct {
             if (self.ckv) |ckv| {
                 if (self.executeHotFast(conn, args, ckv)) {
                     self.maybeBroadcast(args);
-                    // Stripe affinity: check if connection should migrate to the
-                    // worker that owns this key's stripe (data-store commands only).
-                    if (args.len >= 2 and self.ds_locks != null and args[0].len >= 4) {
-                        const cmd0 = args[0];
-                        const is_ds = switch (std.ascii.toUpper(cmd0[0])) {
-                            'L' => cmd0.len >= 4 and (cmd0[1] == 'P' or cmd0[1] == 'p' or
-                                cmd0[1] == 'L' or cmd0[1] == 'l' or
-                                cmd0[1] == 'R' or cmd0[1] == 'r' or
-                                cmd0[1] == 'S' or cmd0[1] == 's' or
-                                cmd0[1] == 'I' or cmd0[1] == 'i'),
-                            'R' => cmd0.len >= 4 and (cmd0[1] == 'P' or cmd0[1] == 'p'),
-                            'H' => cmd0.len >= 4 and (cmd0[1] == 'S' or cmd0[1] == 's' or
-                                cmd0[1] == 'G' or cmd0[1] == 'g' or
-                                cmd0[1] == 'D' or cmd0[1] == 'd'),
-                            'Z' => true,
-                            'S' => cmd0.len == 4 and (std.ascii.toUpper(cmd0[1]) == 'A'), // SADD only
-                            else => false,
-                        };
-                        if (is_ds) {
-                            if (nsKey(conn.selected_db, args[1])) |ns| {
-                                self.checkAffinity(conn, ns);
-                            }
-                        }
-                    }
                     return;
                 }
             }
@@ -1815,7 +1732,7 @@ pub const Worker = struct {
                         if (self.hash_store) |hs| {
                             const ns = nsKey(conn.selected_db, args[1]) orelse return false;
                             const dsl = self.ds_locks orelse return false;
-                            dsl.wrlock(ns);
+                            dsl.wrlock(ns, self.id, &self.last_stripe);
                             const added = hs.hset(ns, args[2..]) catch { dsl.unlock(ns); return false; };
                             dsl.unlock(ns);
                             if (self.aof) |a| a.logCommand(args);
@@ -1828,7 +1745,7 @@ pub const Worker = struct {
                         if (self.hash_store) |hs| {
                             const ns = nsKey(conn.selected_db, args[1]) orelse return false;
                             const dsl = self.ds_locks orelse return false;
-                            dsl.rdlock(ns);
+                            dsl.rdlock(ns, self.id, &self.last_stripe);
                             defer dsl.unlock(ns);
                             if (hs.hget(ns, args[2])) |val| {
                                 writeBulkTo(&conn.write_buf, val);
@@ -1842,7 +1759,7 @@ pub const Worker = struct {
                         if (self.hash_store) |hs| {
                             const ns = nsKey(conn.selected_db, args[1]) orelse return false;
                             const dsl = self.ds_locks orelse return false;
-                            dsl.rdlock(ns);
+                            dsl.rdlock(ns, self.id, &self.last_stripe);
                             defer dsl.unlock(ns);
                             writeIntTo(&conn.write_buf, @intCast(hs.hlen(ns)));
                             return true;
@@ -1854,7 +1771,7 @@ pub const Worker = struct {
                         if (self.list_store) |ls| {
                             const ns = nsKey(conn.selected_db, args[1]) orelse return false;
                             const dsl = self.ds_locks orelse return false;
-                            dsl.rdlock(ns);
+                            dsl.rdlock(ns, self.id, &self.last_stripe);
                             defer dsl.unlock(ns);
                             writeIntTo(&conn.write_buf, @intCast(ls.llen(ns)));
                             return true;
@@ -1864,7 +1781,7 @@ pub const Worker = struct {
                         if (self.list_store) |ls| {
                             const ns = nsKey(conn.selected_db, args[1]) orelse return false;
                             const dsl = self.ds_locks orelse return false;
-                            dsl.wrlock(ns);
+                            dsl.wrlock(ns, self.id, &self.last_stripe);
                             const val = ls.lpop(ns);
                             dsl.unlock(ns);
                             if (val) |v| {
@@ -1881,7 +1798,7 @@ pub const Worker = struct {
                     if (self.list_store) |ls| {
                         const ns = nsKey(conn.selected_db, args[1]) orelse return false;
                         const dsl = self.ds_locks orelse return false;
-                        dsl.wrlock(ns);
+                        dsl.wrlock(ns, self.id, &self.last_stripe);
                         const val = ls.rpop(ns);
                         dsl.unlock(ns);
                         if (val) |v| {
@@ -1897,7 +1814,7 @@ pub const Worker = struct {
                     if (self.set_store) |ss| {
                         const ns = nsKey(conn.selected_db, args[1]) orelse return false;
                         const dsl = self.ds_locks orelse return false;
-                        dsl.wrlock(ns);
+                        dsl.wrlock(ns, self.id, &self.last_stripe);
                         const added = ss.sadd(ns, args[2..]) catch { dsl.unlock(ns); return false; };
                         dsl.unlock(ns);
                         if (self.aof) |a| a.logCommand(args);
@@ -1911,7 +1828,7 @@ pub const Worker = struct {
                         if (self.sorted_set_store) |zs| {
                             const ns = nsKey(conn.selected_db, args[1]) orelse return false;
                             const dsl = self.ds_locks orelse return false;
-                            dsl.wrlock(ns);
+                            dsl.wrlock(ns, self.id, &self.last_stripe);
                             const added = zs.zadd(ns, args[2..]) catch { dsl.unlock(ns); return false; };
                             dsl.unlock(ns);
                             if (self.aof) |a| a.logCommand(args);
@@ -1928,7 +1845,7 @@ pub const Worker = struct {
                     if (self.list_store) |ls| {
                         const ns = nsKey(conn.selected_db, args[1]) orelse return false;
                         const dsl = self.ds_locks orelse return false;
-                        dsl.wrlock(ns);
+                        dsl.wrlock(ns, self.id, &self.last_stripe);
                         const list_len = ls.lpush(ns, args[2..]) catch { dsl.unlock(ns); return false; };
                         dsl.unlock(ns);
                         if (self.aof) |a| a.logCommand(args);
@@ -1941,7 +1858,7 @@ pub const Worker = struct {
                     if (self.list_store) |ls| {
                         const ns = nsKey(conn.selected_db, args[1]) orelse return false;
                         const dsl = self.ds_locks orelse return false;
-                        dsl.wrlock(ns);
+                        dsl.wrlock(ns, self.id, &self.last_stripe);
                         const list_len = ls.rpush(ns, args[2..]) catch { dsl.unlock(ns); return false; };
                         dsl.unlock(ns);
                         if (self.aof) |a| a.logCommand(args);
@@ -1954,7 +1871,7 @@ pub const Worker = struct {
                     if (self.set_store) |ss| {
                         const ns = nsKey(conn.selected_db, args[1]) orelse return false;
                         const dsl = self.ds_locks orelse return false;
-                        dsl.rdlock(ns);
+                        dsl.rdlock(ns, self.id, &self.last_stripe);
                         defer dsl.unlock(ns);
                         writeIntTo(&conn.write_buf, @intCast(ss.scard(ns)));
                         return true;
@@ -1964,7 +1881,7 @@ pub const Worker = struct {
                     if (self.sorted_set_store) |zs| {
                         const ns = nsKey(conn.selected_db, args[1]) orelse return false;
                         const dsl = self.ds_locks orelse return false;
-                        dsl.rdlock(ns);
+                        dsl.rdlock(ns, self.id, &self.last_stripe);
                         defer dsl.unlock(ns);
                         writeIntTo(&conn.write_buf, @intCast(zs.zcard(ns)));
                         return true;
