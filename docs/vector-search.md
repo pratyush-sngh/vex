@@ -242,17 +242,59 @@ GRAPH.RAG embedding <query> K 5 DEPTH 1
        RESP response
 ```
 
+### Storage: Dual-Tier with f16 Quantization
+
+Vectors are stored on disk as **f16** (half precision) in `.vvf` files and backed by **mmap**. The OS manages hot/cold paging — frequently accessed vectors stay in RAM, cold vectors are on disk with zero RSS.
+
+```
+Write path:  GRAPH.SETVEC → normalize → heap f32 (write buffer)
+Save path:   SAVE/BGSAVE → merge write buffer + mmap → sorted f16 .vvf → atomic rename
+Read path:   getById() → check write buffer (f32) → binary search mmap (f16→f32 conversion)
+```
+
+**On-disk format (.vvf):**
+```
+Header (20 bytes): magic("VXVF") + version + dtype(f16) + dim + count
+Data (sorted by node_id): [node_id:u32 + vector:[dim]f16]*
+```
+
 ### Memory Usage
 
-| Vectors | Dims | Vector Data | HNSW Overhead | Total |
-|---------|------|------------|---------------|-------|
-| 10K | 384 | 15 MB | ~3 MB | ~18 MB |
-| 10K | 768 | 30 MB | ~3 MB | ~33 MB |
-| 100K | 384 | 150 MB | ~30 MB | ~180 MB |
-| 100K | 768 | 300 MB | ~30 MB | ~330 MB |
-| 1M | 768 | 3 GB | ~300 MB | ~3.3 GB |
+| Vectors | Dims | f32 heap (old) | f16 mmap (new) | HNSW | Total RSS |
+|---------|------|---------------|----------------|------|-----------|
+| 10K | 384 | 15 MB | 7.5 MB disk, ~0 cold | ~3 MB | ~3 MB cold |
+| 10K | 768 | 30 MB | 15 MB disk, ~0 cold | ~3 MB | ~3 MB cold |
+| 100K | 384 | 150 MB | 75 MB disk | ~30 MB | ~30 MB cold |
+| 100K | 768 | 300 MB | 147 MB disk | ~30 MB | ~30 MB cold |
+| 1M | 768 | 3 GB | 1.47 GB disk | ~300 MB | ~300 MB cold |
 
-For most agentic AI use cases (caching embeddings for RAG), 10K-100K vectors is the sweet spot.
+Hot vectors (being searched by HNSW) are paged in by the OS. Cold vectors have zero RSS. HNSW neighbor lists (~300 bytes/node) always stay in memory.
+
+### Lazy Initialization
+
+Vector infrastructure is **null by default** — zero memory overhead when vectors are not used. Initialized on first `GRAPH.SETVEC` call. If no `.vvf` files exist on startup, stays null.
+
+---
+
+## Persistence
+
+Vectors are persisted in separate `.vvf` files (not in the main `.zdb` snapshot):
+
+```
+data/
+├── vex.zdb              # KV + graph snapshot (unchanged)
+├── vex.aof              # append-only log (unchanged)
+└── vectors/
+    ├── embedding.vvf    # mmap'd vector file for "embedding" field
+    └── image_vec.vvf    # separate file per vector field
+```
+
+- **SAVE/BGSAVE**: writes .vvf files (merge write buffer + existing mmap → sorted f16 → atomic rename)
+- **Startup**: mmap .vvf files → rebuild HNSW indices from stored vectors
+- **Crash safety**: .vvf.tmp written first, atomic rename. Crash during save leaves old .vvf intact
+- **Backward compatible**: no changes to .zdb format. Servers without vectors load fine
+
+HNSW indices are **rebuilt from vectors on load** (~2-5s for 100K vectors). Not persisted separately.
 
 ---
 
@@ -261,27 +303,29 @@ For most agentic AI use cases (caching embeddings for RAG), 10K-100K vectors is 
 - `GRAPH.SETVEC` acquires the **graph write lock** (exclusive). Other graph reads/writes block.
 - `GRAPH.GETVEC`, `GRAPH.VECSEARCH`, `GRAPH.RAG` acquire the **graph read lock** (shared). Multiple searches run in parallel.
 - HNSW index is modified only during `SETVEC` (under write lock). Reads are lock-free.
+- f16→f32 conversion uses **double scratch buffers** (alternated per access) for safe concurrent reference handling.
 
 ---
 
 ## Limitations
 
-- **In-memory only**: vectors and HNSW index are stored in RAM. Disk-backed storage (mmap) planned.
-- **f32 only**: no quantization (f16/int8) yet. Planned for memory reduction.
-- **No persistence yet**: vectors are not saved in snapshots. HNSW is rebuilt from vectors on load. Snapshot v3 format planned.
-- **No HNSW parameter tuning**: M, ef_construction, ef_search are fixed at compile time. Runtime tuning planned.
+- **HNSW always in memory**: neighbor lists (~300 bytes/node) are not mmap'd. Fine for <1M vectors.
+- **No HNSW parameter tuning at runtime**: M, ef_construction, ef_search are fixed. Compile-time config.
 - **Lazy deletion only**: deleted nodes waste HNSW connections. Periodic rebuild planned.
 - **Max 64 vector fields**: limited by StringIntern's u64 bitmask. Sufficient for practical use.
+- **f16 precision**: ~3 decimal digits. Cosine distance error ~1e-3. Acceptable for ANN, not for exact match.
 
 ---
 
 ## Comparison with Other Vector Databases
 
-| Feature | Redis (RediSearch) | Pinecone | Weaviate | Vex |
-|---------|-------------------|----------|----------|-----|
-| Vector search | HNSW or FLAT | Proprietary | HNSW | HNSW |
+| Feature | Redis (RediSearch) | Qdrant | Weaviate | Vex |
+|---------|-------------------|--------|----------|-----|
+| Vector search | HNSW or FLAT | HNSW | HNSW | HNSW |
 | Graph traversal | No (RedisGraph discontinued) | No | No | Native CSR |
 | Combined search+traverse | No | No | No | `GRAPH.RAG` |
-| Protocol | RESP + FT.* | REST API | REST/gRPC | RESP (redis-cli compatible) |
-| Deployment | Server + module | SaaS only | Server/SaaS | Single binary |
-| In-process distance calc | Yes | No (network) | Yes | Yes |
+| f16 quantization | No (f32 only) | Scalar/Product | No | f16 on disk |
+| mmap vectors | No | Yes | No | Yes (.vvf files) |
+| Protocol | RESP + FT.* | REST/gRPC | REST/gRPC | RESP (redis-cli) |
+| Deployment | Server + module | Server/Cloud | Server/Cloud | Single binary |
+| KV + Vectors + Graph | 3 separate systems | Vectors only | Vectors only | All in one process |

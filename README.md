@@ -27,7 +27,8 @@ A high-performance KV + Graph database written in Zig 0.16. Speaks the Redis pro
 | **[Clustering](docs/clustering.md)** | Leader/follower replication, automatic failover, consistency model |
 | **[Benchmarks](docs/benchmarks.md)** | KV vs Redis, graph vs Memgraph, internal engine benchmarks |
 | **[Deployment](docs/deployment.md)** | Production checklist, systemd, Docker, tuning |
-| **[Vector Search & GRAPH.RAG](docs/vector-search.md)** | HNSW vector search, GRAPH.RAG, RAG pipeline examples |
+| **[Vector Search & GRAPH.RAG](docs/vector-search.md)** | HNSW vector search, f16 mmap storage, RAG pipeline examples |
+| **[Vector Benchmarks](docs/vector-benchmarks.md)** | Benchmark design: Vex vs Redis+RediSearch vs Qdrant vs Weaviate |
 | **[Testing](docs/testing.md)** | 158 tests, coverage table, test patterns |
 
 ---
