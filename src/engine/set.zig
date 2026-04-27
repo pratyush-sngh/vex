@@ -5,6 +5,7 @@ const Allocator = std.mem.Allocator;
 pub const SetStore = struct {
     sets: std.StringHashMap(MemberSet),
     allocator: Allocator,
+    map_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
 
     const MemberSet = struct {
         members: std.StringHashMap(void),
@@ -200,17 +201,21 @@ pub const SetStore = struct {
     }
 
     fn getOrCreate(self: *SetStore, key: []const u8) !*MemberSet {
+        if (self.sets.getPtr(key)) |existing| return existing;
+        _ = std.c.pthread_mutex_lock(&self.map_mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.map_mutex);
+        if (self.sets.getPtr(key)) |existing| return existing;
         const gop = try self.sets.getOrPut(key);
-        if (!gop.found_existing) {
-            gop.key_ptr.* = try self.allocator.dupe(u8, key);
-            var ms = MemberSet.init(self.allocator);
-            ms.members.ensureTotalCapacity(32) catch {};
-            gop.value_ptr.* = ms;
-        }
+        gop.key_ptr.* = try self.allocator.dupe(u8, key);
+        var ms = MemberSet.init(self.allocator);
+        ms.members.ensureTotalCapacity(32) catch {};
+        gop.value_ptr.* = ms;
         return gop.value_ptr;
     }
 
     fn removeKey(self: *SetStore, key: []const u8) void {
+        _ = std.c.pthread_mutex_lock(&self.map_mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.map_mutex);
         var entry = self.sets.fetchRemove(key) orelse return;
         entry.value.deinit();
         self.allocator.free(entry.key);

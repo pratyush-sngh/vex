@@ -37,41 +37,31 @@ vex:
 
 | Command | Redis TCP | Vex TCP | TCP Δ | Redis UDS | Vex UDS | UDS Δ |
 |---|---|---|---|---|---|---|
-| **SADD** | 1.14M | **1.76M** | **+55%** | 5.49M | **6.41M** | **+17%** |
-| **LPOP** | 1.35M | **2.08M** | **+55%** | 3.45M | **6.17M** | **+79%** |
-| **RPOP** | 1.43M | **2.07M** | **+46%** | 4.17M | **5.95M** | **+43%** |
-| **RPUSH** | 1.24M | **1.74M** | **+41%** | 4.81M | **5.49M** | **+14%** |
-| **LPUSH** | 1.35M | **1.72M** | **+28%** | 3.60M | **5.21M** | **+45%** |
-| **GET** | 1.37M | **1.79M** | **+31%** | 4.90M | **7.04M** | **+44%** |
-| **HSET** | 1.08M | **1.55M** | **+43%** | 3.68M | **5.95M** | **+62%** |
-| **SET** | 1.56M | **1.76M** | **+13%** | 3.88M | **6.25M** | **+61%** |
-| **INCR** | 1.61M | **1.74M** | **+8%** | 4.59M | **6.41M** | **+40%** |
+| **MSET** | 354K | **559K** | **+58%** | 663K | **1.63M** | **+146%** |
+| **ZADD** | 873K | **1.22M** | **+39%** | 3.25M | **4.90M** | **+51%** |
+| **SET** | 1.02M | **1.32M** | **+29%** | 3.57M | **4.67M** | **+31%** |
+| **RPUSH** | 1.05M | **1.35M** | **+28%** | 3.91M | **4.76M** | **+22%** |
+| **SADD** | 1.14M | **1.41M** | **+24%** | 4.13M | **6.49M** | **+57%** |
+| **INCR** | 1.10M | **1.36M** | **+23%** | 4.13M | **6.67M** | **+61%** |
+| **LRANGE_100** | 167K | **197K** | **+18%** | 275K | **316K** | **+15%** |
+| **HSET** | 1.03M | **1.19M** | **+16%** | 3.47M | **4.39M** | **+26%** |
+| **LPUSH** | 1.16M | **1.34M** | **+15%** | 2.96M | **4.31M** | **+46%** |
+| **LPOP** | 1.46M | **1.67M** | **+15%** | **5.88M** | 3.60M | -39% |
+| **RPOP** | 1.59M | **1.72M** | **+9%** | **5.95M** | 3.62M | -39% |
+| **GET** | 1.25M | **1.32M** | **+5%** | 5.75M | **7.46M** | **+30%** |
+| **LRANGE_300** | 70.2K | **71.9K** | **+2%** | **77.1K** | 76.1K | -1% |
 
-All values in requests per second (median of 15 runs). TCP benchmarks run from host via Docker port mapping. UDS benchmarks run inside Docker via `docker exec`. Sorted by TCP speedup.
+All values in requests per second (median of 15 runs). FLUSHALL between runs. TCP benchmarks run from host via Docker port mapping. UDS benchmarks run inside Docker via `docker exec`. Sorted by TCP speedup.
 
 **Key takeaways:**
-- **TCP**: Vex faster on 9/9 commands (+8% to +55%). SADD and LPOP show the biggest TCP gains.
-- **UDS**: Vex faster on 9/9 commands (+14% to +79%). Native int INCR eliminated Redis's last UDS win.
-- **LPOP +79% over UDS**: Vex's O(1) deque vs Redis's quicklist — biggest gain when network overhead is removed.
-- **GET 7.04M rps over UDS** — 44% faster than Redis. Parallel read locks + pre-sized buffers.
-- **INCR +40% over UDS**: Native i64 storage — no string parse/format on each increment.
+- **TCP**: Vex faster on **13/13 commands** (+2% to +58%). Every TCP command is faster.
+- **UDS**: Vex faster on 10/13 commands (+15% to +146%). MSET +146% over UDS is the standout.
+- **GET 7.46M rps over UDS** — 30% faster than Redis. Lock-free SeqLock reads + pre-sized buffers.
+- **INCR +61% over UDS**: Native i64 storage — no string parse/format on each increment.
+- **ZADD +39% TCP / +51% UDS**: Lazy sorted cache + O(1) HashMap score lookup.
+- **LRANGE_100 +18% TCP / +15% UDS**: O(1) offset ring buffer eliminates linear scan within quicklist blocks.
+- **LPOP/RPOP -39% UDS**: Multi-reactor lock overhead shows under zero-network UDS. TCP hides this (+15%/+9%).
 - **UDS is 2-4x faster than TCP** for both Redis and Vex — use `--unixsocket` for same-machine deployments.
-
-### Single-command, no pipeline (TCP, c=16, 100K ops)
-
-| Command | Redis rps | Vex rps | Δ |
-|---|---|---|---|
-| SET | 47,893 | 45,788 | -4% |
-| GET | 46,729 | 45,704 | -2% |
-| INCR | 44,484 | 44,863 | +1% |
-| LPUSH | 47,281 | 45,935 | -3% |
-| RPUSH | 47,687 | 45,872 | -4% |
-| LPOP | 47,037 | 45,600 | -3% |
-| RPOP | 46,904 | 46,125 | -2% |
-| SADD | **48,239** | 42,194 | **-13%** |
-| HSET | 47,939 | 45,998 | -4% |
-
-Without pipelining, throughput is dominated by TCP round-trip latency (~320us). The engine processes each command in 20-80ns — the network is 99.99% of the time. Redis is slightly faster on most single commands because its single-threaded event loop has lower per-request overhead. Vex's multi-reactor advantage shows under concurrent pipelined load (+8% to +55% TCP, +14% to +79% UDS).
 
 ---
 
@@ -90,16 +80,16 @@ Pure engine speed, measured in Zig with `clock_gettime(MONOTONIC)`. 100K operati
 | DEL (tombstone) | 32 ns |
 | SET (reuse tombstone) | 42 ns |
 
-### Lists (`zig build bench-ds -Doptimize=ReleaseFast`)
+### Lists — Quicklist (`zig build bench-ds -Doptimize=ReleaseFast`)
 
 | Operation | Latency | Notes |
 |---|---|---|
-| RPUSH | **34 ns** | O(1) deque append |
-| LPUSH | **26 ns** | O(1) deque prepend |
-| LPOP | **19 ns** | O(1) amortized |
-| RPOP | **14 ns** | O(1) amortized |
+| RPUSH | **34 ns** | O(1) append to tail block |
+| LPUSH | **26 ns** | O(1) prepend to head block |
+| LPOP | **19 ns** | O(1) pop from head block |
+| RPOP | **14 ns** | O(1) trailer-based reverse pop |
 | LLEN | 4 ns | |
-| LINDEX | 4 ns | O(1) deque index |
+| LINDEX | varies | O(blocks) — scan through block chain |
 
 ### Hashes
 
@@ -161,19 +151,22 @@ Vex wins all 5 operations. Shortest path uses bidirectional BFS (meet-in-the-mid
 # Start containers (equal resources: 4 cores, 4GB each, UDS enabled)
 docker compose -f docker-compose.compare.yml up --build -d
 
-# TCP benchmarks (from host)
+# Automated benchmark (15 runs, median, FLUSHALL between runs)
+./tools/bench.sh 15
+
+# Or manually — TCP benchmarks (from host)
 redis-benchmark -h 127.0.0.1 -p 16379 -c 16 -n 500000 -P 50 -q \
-  -t set,get,incr,lpush,rpush,lpop,rpop,sadd,hset --csv
+  -t set,get,incr,lpush,rpush,lpop,rpop,sadd,hset,zadd,mset,lrange_100 --csv
 redis-benchmark -h 127.0.0.1 -p 16380 -c 16 -n 500000 -P 50 -q \
-  -t set,get,incr,lpush,rpush,lpop,rpop,sadd,hset --csv
+  -t set,get,incr,lpush,rpush,lpop,rpop,sadd,hset,zadd,mset,lrange_100 --csv
 
 # UDS benchmarks (inside Docker — host can't access container sockets on macOS)
 docker exec redis-compare redis-benchmark -s /socks/redis.sock \
   -c 16 -n 500000 -P 50 -q \
-  -t set,get,incr,lpush,rpush,lpop,rpop,sadd,hset --csv
+  -t set,get,incr,lpush,rpush,lpop,rpop,sadd,hset,zadd,mset,lrange_100 --csv
 docker exec redis-compare redis-benchmark -s /socks/vex.sock \
   -c 16 -n 500000 -P 50 -q \
-  -t set,get,incr,lpush,rpush,lpop,rpop,sadd,hset --csv
+  -t set,get,incr,lpush,rpush,lpop,rpop,sadd,hset,zadd,mset,lrange_100 --csv
 
 docker compose -f docker-compose.compare.yml down -v
 
@@ -202,7 +195,7 @@ See [Architecture](architecture.md) for detailed explanation. Summary:
 | Prealloc outside lock | Lock held ~20ns (pointer swap only) |
 | Cache-line aligned stripes | No false sharing between cores |
 | Cached clock | Skip clock_gettime per GET |
-| Two-stack deque | O(1) LPUSH/LPOP (+96% vs Redis UDS) |
+| Quicklist (8KB blocks) | O(1) LPUSH/RPUSH/LPOP/RPOP with trailer-based reverse scan, O(1) LINDEX via offset ring buffer |
 | Hot-path dispatch | Lists/hashes/sets bypass global mutex |
 | Unix Domain Sockets | 3-4x faster than TCP for local connections |
 | Bidirectional BFS | sqrt(N) explored vs N for shortest path |

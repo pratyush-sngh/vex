@@ -6,6 +6,7 @@ const Allocator = std.mem.Allocator;
 pub const HashStore = struct {
     hashes: std.StringHashMap(FieldMap),
     allocator: Allocator,
+    map_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
 
     const FieldMap = struct {
         fields: std.StringHashMap([]u8),
@@ -208,18 +209,21 @@ pub const HashStore = struct {
     }
 
     fn getOrCreate(self: *HashStore, key: []const u8) !*FieldMap {
+        if (self.hashes.getPtr(key)) |existing| return existing;
+        _ = std.c.pthread_mutex_lock(&self.map_mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.map_mutex);
+        if (self.hashes.getPtr(key)) |existing| return existing;
         const gop = try self.hashes.getOrPut(key);
-        if (!gop.found_existing) {
-            gop.key_ptr.* = try self.allocator.dupe(u8, key);
-            var fm = FieldMap.init(self.allocator);
-            // Pre-allocate 32 field slots to avoid resize under write lock
-            fm.fields.ensureTotalCapacity(32) catch {};
-            gop.value_ptr.* = fm;
-        }
+        gop.key_ptr.* = try self.allocator.dupe(u8, key);
+        var fm = FieldMap.init(self.allocator);
+        fm.fields.ensureTotalCapacity(32) catch {};
+        gop.value_ptr.* = fm;
         return gop.value_ptr;
     }
 
     fn removeKey(self: *HashStore, key: []const u8) void {
+        _ = std.c.pthread_mutex_lock(&self.map_mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.map_mutex);
         var entry = self.hashes.fetchRemove(key) orelse return;
         entry.value.deinit();
         self.allocator.free(entry.key);

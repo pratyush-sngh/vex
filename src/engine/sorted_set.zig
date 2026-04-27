@@ -6,6 +6,7 @@ const Allocator = std.mem.Allocator;
 pub const SortedSetStore = struct {
     zsets: std.StringHashMap(ZSet),
     allocator: Allocator,
+    map_mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
 
     pub const Entry = struct {
         member: []const u8,
@@ -208,15 +209,22 @@ pub const SortedSetStore = struct {
     }
 
     fn getOrCreate(self: *SortedSetStore, key: []const u8) !*ZSet {
+        // Fast path: key exists — no mutex needed
+        if (self.zsets.getPtr(key)) |existing| return existing;
+        // Slow path: new key — mutex protects HashMap mutation
+        _ = std.c.pthread_mutex_lock(&self.map_mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.map_mutex);
+        // Double-check after acquiring mutex
+        if (self.zsets.getPtr(key)) |existing| return existing;
         const gop = try self.zsets.getOrPut(key);
-        if (!gop.found_existing) {
-            gop.key_ptr.* = try self.allocator.dupe(u8, key);
-            gop.value_ptr.* = ZSet.init(self.allocator);
-        }
+        gop.key_ptr.* = try self.allocator.dupe(u8, key);
+        gop.value_ptr.* = ZSet.init(self.allocator);
         return gop.value_ptr;
     }
 
     fn removeKey(self: *SortedSetStore, key: []const u8) void {
+        _ = std.c.pthread_mutex_lock(&self.map_mutex);
+        defer _ = std.c.pthread_mutex_unlock(&self.map_mutex);
         var entry = self.zsets.fetchRemove(key) orelse return;
         entry.value.deinit();
         self.allocator.free(entry.key);

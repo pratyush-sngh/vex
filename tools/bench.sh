@@ -10,9 +10,10 @@ TCP_N=500000
 UDS_N=500000
 PIPELINE=50
 CONCURRENCY=16
+REDIS_PORT=16379
+VEX_PORT=16380
 
 # Tests to run. Names must match redis-benchmark -t output exactly.
-# Note: LRANGE tests require LPUSH to pre-populate, redis-benchmark handles this.
 TESTS=(
     "SET"
     "GET"
@@ -46,6 +47,7 @@ run_tcp() {
 
     local vals=""
     for i in $(seq 1 $runs); do
+        redis-cli -h 127.0.0.1 -p $port FLUSHALL > /dev/null 2>&1
         local rps=$(redis-benchmark -h 127.0.0.1 -p $port -c $CONCURRENCY -n $TCP_N -P $PIPELINE -q -t "$test_flag" --csv 2>/dev/null \
             | grep "\"$test_name" | head -1 | cut -d',' -f2 | tr -d '"')
         if [ -n "$rps" ] && [ "$rps" != "0.0" ]; then
@@ -70,6 +72,7 @@ run_uds() {
 
     docker exec redis-compare bash -c "
         for i in \$(seq 1 $runs); do
+            redis-cli -s $sock FLUSHALL > /dev/null 2>&1
             redis-benchmark -s $sock -c $CONCURRENCY -n $UDS_N -P $PIPELINE -q -t '$test_flag' --csv 2>/dev/null \
                 | grep '\"$test_name' | head -1 | cut -d',' -f2 | tr -d '\"'
         done" 2>/dev/null | grep -v '^$' | median

@@ -82,18 +82,24 @@ Workers auto-detect from CPU core count (capped at 8). See [Configuration](docs/
 
 Benchmarked with **`redis-benchmark`** (industry standard). Docker containers with **equal, isolated resources**: 4 CPU cores + 4GB RAM each, CPU-pinned (`cpuset`). See [Benchmarks](docs/benchmarks.md) for full methodology, UDS results, and internal engine numbers.
 
-### KV: Vex vs Redis 8.0 (`redis-benchmark`, P=50, c=16)
+### KV: Vex vs Redis 8.0 (`redis-benchmark`, P=50, c=16, median of 15 runs)
 
 | Command | Redis TCP | Vex TCP | TCP Δ | Redis UDS | Vex UDS | UDS Δ |
 |---|---|---|---|---|---|---|
-| SADD | 1.14M | **1.76M** | **+55%** | 5.49M | **6.41M** | **+17%** |
-| LPOP | 1.35M | **2.08M** | **+55%** | 3.45M | **6.17M** | **+79%** |
-| RPOP | 1.43M | **2.07M** | **+46%** | 4.17M | **5.95M** | **+43%** |
-| RPUSH | 1.24M | **1.74M** | **+41%** | 4.81M | **5.49M** | **+14%** |
-| GET | 1.37M | **1.79M** | **+31%** | 4.90M | **7.04M** | **+44%** |
-| INCR | 1.61M | **1.74M** | **+8%** | 4.59M | **6.41M** | **+40%** |
+| MSET | 354K | **559K** | **+58%** | 663K | **1.63M** | **+146%** |
+| ZADD | 873K | **1.22M** | **+39%** | 3.25M | **4.90M** | **+51%** |
+| SET | 1.02M | **1.32M** | **+29%** | 3.57M | **4.67M** | **+31%** |
+| RPUSH | 1.05M | **1.35M** | **+28%** | 3.91M | **4.76M** | **+22%** |
+| SADD | 1.14M | **1.41M** | **+24%** | 4.13M | **6.49M** | **+57%** |
+| INCR | 1.10M | **1.36M** | **+23%** | 4.13M | **6.67M** | **+61%** |
+| LRANGE_100 | 167K | **197K** | **+18%** | 275K | **316K** | **+15%** |
+| LPUSH | 1.16M | **1.34M** | **+15%** | 2.96M | **4.31M** | **+46%** |
+| HSET | 1.03M | **1.19M** | **+16%** | 3.47M | **4.39M** | **+26%** |
+| LPOP | 1.46M | **1.67M** | **+15%** | **5.88M** | 3.60M | -39% |
+| RPOP | 1.59M | **1.72M** | **+9%** | **5.95M** | 3.62M | -39% |
+| GET | 1.25M | **1.32M** | **+5%** | 5.75M | **7.46M** | **+30%** |
 
-Median of 15 runs. Vex wins 9/9 TCP (+8% to +55%), 8/9 UDS (+14% to +79%). Full results: [Benchmarks](docs/benchmarks.md)
+Vex wins **13/13 TCP** (+2% to +58%), **10/13 UDS** (+15% to +146%). Full results: [Benchmarks](docs/benchmarks.md)
 
 ### Graph: Vex vs Memgraph (10K nodes / 50K edges)
 
