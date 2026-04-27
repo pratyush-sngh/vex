@@ -160,15 +160,18 @@ pub const DsStripeLocks = struct {
     /// when we move to a different key.
     pub fn wrlock(self: *DsStripeLocks, key: []const u8, worker_id: u16, last: *u16) void {
         const idx: u16 = @intCast(stripeIndex(key));
-        // Fast path: same stripe as last command — nothing to do
+        // Fast path: same stripe as last command — register compare only, ~0.3ns
         if (idx == last.*) return;
         // Release previous stripe (if any)
         if (last.* != STRIPE_UNOWNED) {
             self.lease[last.*].store(STRIPE_UNOWNED, .release);
         }
-        // Acquire new stripe
-        while (self.lease[idx].cmpxchgWeak(STRIPE_UNOWNED, worker_id, .acquire, .monotonic) != null) {
-            std.atomic.spinLoopHint();
+        // TTAS: spin on cheap load (stays in L1, no cache bouncing), then CAS
+        while (true) {
+            while (self.lease[idx].load(.monotonic) != STRIPE_UNOWNED)
+                std.atomic.spinLoopHint();
+            if (self.lease[idx].cmpxchgWeak(STRIPE_UNOWNED, worker_id, .acquire, .monotonic) == null)
+                break;
         }
         last.* = idx;
     }
