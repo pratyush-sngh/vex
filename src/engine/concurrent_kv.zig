@@ -18,7 +18,6 @@ pub const ConcurrentKV = struct {
 
     /// Cache-line aligned to prevent false sharing between workers.
     /// Uses pthread_rwlock: GETs take read-lock (parallel), SETs take write-lock (exclusive).
-    /// This eliminates read-read contention for read-heavy workloads.
     const Stripe = struct {
         rwlock: std.c.pthread_rwlock_t align(64) = std.mem.zeroes(std.c.pthread_rwlock_t),
         map: std.StringHashMap(Entry),
@@ -57,8 +56,6 @@ pub const ConcurrentKV = struct {
         const init_fn = @extern(*const fn (*std.c.pthread_rwlock_t, ?*const anyopaque) callconv(.c) c_int, .{ .name = "pthread_rwlock_init" });
         for (&self.stripes) |*s| {
             _ = init_fn(&s.rwlock, null);
-            // Pre-allocate 16384 slots per stripe (256 stripes × 16384 = 4M keys before resize).
-            // This prevents HashMap grow during concurrent writes.
             s.map.ensureTotalCapacity(16384) catch {};
         }
     }
@@ -476,7 +473,6 @@ pub const ConcurrentKV = struct {
         _ = std.c.pthread_rwlock_unlock(&s.rwlock);
     }
 
-    /// Write-lock: exclusive access (for SET, DEL, FLUSHDB)
     fn writeLockStripe(s: *Stripe) void {
         _ = std.c.pthread_rwlock_wrlock(&s.rwlock);
     }
