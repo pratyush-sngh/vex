@@ -2116,7 +2116,8 @@ pub const CommandHandler = struct {
         const qa = self.allocator.alloc(f32, dim) catch { try resp.serializeError(w, "out of memory"); return; };
         defer self.allocator.free(qa);
         @memcpy(std.mem.sliceAsBytes(qa), raw_query);
-        const idx = self.graph.vec_indices.get(field) orelse { try resp.serializeError(w, "no vector index for field"); return; };
+        const vi = self.graph.vec_indices orelse { try resp.serializeError(w, "no vector index for field"); return; };
+        const idx = vi.get(field) orelse { try resp.serializeError(w, "no vector index for field"); return; };
         @import("../engine/vector_store.zig").VectorStore.normalize(qa);
         const results = idx.search(qa, k, &self.graph.node_alive) catch { try resp.serializeError(w, "search failed"); return; };
         defer self.allocator.free(results);

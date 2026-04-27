@@ -37,7 +37,8 @@ pub fn ragSearch(
     k: u32,
     opts: RagOptions,
 ) ![]RagResult {
-    const idx = graph.vec_indices.get(field) orelse return error.FieldNotFound;
+    const vi = graph.vec_indices orelse return error.FieldNotFound;
+    const idx = vi.get(field) orelse return error.FieldNotFound;
 
     const normalized = try allocator.alloc(f32, query_vec.len);
     defer allocator.free(normalized);
