@@ -1625,7 +1625,7 @@ pub const CommandHandler = struct {
         var key_buf: [512]u8 = undefined;
         var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeBulkString(w, null); return; };
         defer key_ref.deinit(self.allocator);
-        const rank = self.getSortedSetStore().zrank(key_ref.key, args[2], self.allocator) catch { try resp.serializeBulkString(w, null); return; };
+        const rank = self.getSortedSetStore().zrank(key_ref.key, args[2]);
         if (rank) |r| {
             try resp.serializeInteger(w, @intCast(r));
         } else {
@@ -2504,8 +2504,8 @@ fn namespacedKeyForDb(self: *CommandHandler, db: u8, key: []const u8) ![]u8 {
 }
 
 fn stripDbPrefix(self: *CommandHandler, raw_key: []const u8) ?[]const u8 {
-    const prefix = std.fmt.allocPrint(self.allocator, "db:{d}:", .{self.selected_db.load(.monotonic)}) catch return null;
-    defer self.allocator.free(prefix);
+    var buf: [16]u8 = undefined;
+    const prefix = std.fmt.bufPrint(&buf, "db:{d}:", .{self.selected_db.load(.monotonic)}) catch return null;
     if (!std.mem.startsWith(u8, raw_key, prefix)) return null;
     return raw_key[prefix.len..];
 }
@@ -2515,8 +2515,8 @@ fn graphNamespacedKey(self: *CommandHandler, key: []const u8) ![]u8 {
 }
 
 fn stripGraphDbPrefix(self: *CommandHandler, raw_key: []const u8) ?[]const u8 {
-    const prefix = std.fmt.allocPrint(self.allocator, "gdb:{d}:", .{self.selected_db.load(.monotonic)}) catch return null;
-    defer self.allocator.free(prefix);
+    var buf: [16]u8 = undefined;
+    const prefix = std.fmt.bufPrint(&buf, "gdb:{d}:", .{self.selected_db.load(.monotonic)}) catch return null;
     if (!std.mem.startsWith(u8, raw_key, prefix)) return null;
     return raw_key[prefix.len..];
 }

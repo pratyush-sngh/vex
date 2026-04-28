@@ -246,12 +246,7 @@ pub const ListStore = struct {
     }
 
     pub fn deinit(self: *ListStore) void {
-        var it = self.lists.iterator();
-        while (it.next()) |entry| {
-            var list = entry.value_ptr.*;
-            list.deinit(self.allocator);
-            self.allocator.free(entry.key_ptr.*);
-        }
+        self.flush();
         self.lists.deinit();
     }
 
@@ -263,28 +258,14 @@ pub const ListStore = struct {
         return list.len();
     }
 
-    /// LPUSH with pre-allocated owned values. Same as lpush for flat buffer (just copies data).
-    pub fn lpushOwned(self: *ListStore, key: []const u8, owned: []const []u8) !usize {
-        const list = try self.getOrCreate(key);
-        for (owned) |val| try list.pushHead(val);
-        return list.len();
-    }
-
-    /// RPUSH key value [value ...] — append values, returns new length.
+/// RPUSH key value [value ...] — append values, returns new length.
     pub fn rpush(self: *ListStore, key: []const u8, values: []const []const u8) !usize {
         const list = try self.getOrCreate(key);
         for (values) |val| try list.pushTail(val);
         return list.len();
     }
 
-    /// RPUSH with pre-allocated owned values. Same as rpush for flat buffer.
-    pub fn rpushOwned(self: *ListStore, key: []const u8, owned: []const []u8) !usize {
-        const list = try self.getOrCreate(key);
-        for (owned) |val| try list.pushTail(val);
-        return list.len();
-    }
-
-    /// LPOP key — remove and return the first element. Returns slice into internal buffer.
+/// LPOP key — remove and return the first element. Returns slice into internal buffer.
     /// Caller must NOT free the returned slice (it's not heap-allocated).
     /// Note: empty lists are NOT auto-deleted — the returned slice points into block memory
     /// that would be freed by removeKey. Cleanup happens on next push/pop or DEL/FLUSHALL.
@@ -423,7 +404,7 @@ pub const ListStore = struct {
         return true;
     }
 
-    /// No-op for flat buffer lists. Values are slices into internal buffer, not heap-allocated.
+    /// No-op. Quicklist values are slices into block memory, not heap-allocated.
     pub fn freeVal(_: Allocator, _: []const u8) void {}
 
     fn getOrCreate(self: *ListStore, key: []const u8) !*List {

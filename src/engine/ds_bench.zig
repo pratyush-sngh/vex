@@ -272,7 +272,7 @@ pub fn main(_: std.process.Init) !void {
             const RANK_OPS = 1000;
             const t0 = nowNs();
             for (0..RANK_OPS) |i| {
-                _ = zs.zrank("bench:zset", members[i], allocator) catch continue;
+                _ = zs.zrank("bench:zset", members[i]);
             }
             const ns = nowNs() - t0;
             std.debug.print("  ZRANK:      {d:.1} us/op  ({d} ops)\n", .{ usPerOp(ns, RANK_OPS), RANK_OPS });

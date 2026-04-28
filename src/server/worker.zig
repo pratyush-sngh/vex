@@ -119,17 +119,6 @@ pub const PubSubRegistry = struct {
     }
 };
 
-/// Per-worker buffer pool for small allocations (≤128 bytes).
-/// Uses a fixed-size slab — alloc pops from free list (~2ns), free pushes back (~2ns).
-/// Buffers are all BUF_SIZE bytes (rounded up), so free doesn't need the original size.
-/// Per-worker slab pool using raw C malloc/free. No size tracking issues.
-/// Small values (≤ SLAB_SIZE) are allocated as SLAB_SIZE-byte blocks.
-/// Freed blocks go to a per-worker free list for instant reuse (~2ns).
-/// Cross-worker frees (RPUSH on worker A, LPOP on worker B) go to C free() — safe.
-
-/// Striped atomic spinlocks for data type stores (lists, hashes, sets, sorted sets).
-/// ~10ns uncontended vs ~100-200ns for pthread_rwlock. Critical sections are
-/// 20-80ns (HashMap lookup + value copy), well within spinlock sweet spot.
 pub const DS_STRIPE_COUNT = 256;
 pub const STRIPE_UNOWNED: u16 = 0xFFFF;
 
@@ -150,15 +139,7 @@ pub const DsStripeLocks = struct {
         return @as(usize, std.hash.Wyhash.hash(0, key)) % DS_STRIPE_COUNT;
     }
 
-    pub fn rdlock(self: *DsStripeLocks, key: []const u8, worker_id: u16, last: *u16) void {
-        self.wrlock(key, worker_id, last);
-    }
-
-    /// Acquire lease. If same stripe as last call: ~1ns (no atomic op at all).
-    /// If different stripe: release old, acquire new (~15ns).
-    /// Only holds ONE stripe at a time — other workers unblocked immediately
-    /// when we move to a different key.
-    pub fn wrlock(self: *DsStripeLocks, key: []const u8, worker_id: u16, last: *u16) void {
+    pub fn acquire(self: *DsStripeLocks, key: []const u8, worker_id: u16, last: *u16) void {
         const idx: u16 = @intCast(stripeIndex(key));
         // Fast path: same stripe as last command — register compare only, ~0.3ns
         if (idx == last.*) return;
@@ -176,14 +157,7 @@ pub const DsStripeLocks = struct {
         last.* = idx;
     }
 
-    /// No-op: lease released on next wrlock or releaseLast.
-    pub fn unlock(self: *DsStripeLocks, key: []const u8) void {
-        _ = self;
-        _ = key;
-    }
-
-    /// Release the single held stripe at end of handleRead.
-    pub fn releaseLast(self: *DsStripeLocks, last: *u16) void {
+    pub fn releaseAll(self: *DsStripeLocks, last: *u16) void {
         if (last.* != STRIPE_UNOWNED) {
             self.lease[last.*].store(STRIPE_UNOWNED, .release);
             last.* = STRIPE_UNOWNED;
@@ -245,8 +219,7 @@ const Connection = struct {
     fd: i32,
     selected_db: u8,
     accum: std.array_list.Managed(u8),
-    accum_pos: usize, // FIX #1: head index — avoids memmove on consumeAccum
-    write_buf: std.array_list.Managed(u8),
+    accum_pos: usize,    write_buf: std.array_list.Managed(u8),
     write_offset: usize,
     write_registered: bool,
     authenticated: bool,
@@ -662,18 +635,16 @@ pub const Worker = struct {
         }
 
         // Release the single held stripe lease.
-        if (self.ds_locks) |dsl| dsl.releaseLast(&self.last_stripe);
+        if (self.ds_locks) |dsl| dsl.releaseAll(&self.last_stripe);
     }
 
     fn processOneCommand(self: *Worker, conn: *Connection) bool {
-        const data = conn.accumData(); // FIX #1: uses head index, no copy
-
+        const data = conn.accumData();
         // Fast RESP path: zero-allocation manual parse.
         if (data.len >= 4 and data[0] == '*') {
             if (parseFastResp(data)) |result| {
                 self.dispatchCommand(conn, result.args[0..result.argc]);
-                conn.advanceAccum(result.consumed); // FIX #1: advance, no memmove
-                return true;
+                conn.advanceAccum(result.consumed);                return true;
             }
         }
 
@@ -1743,13 +1714,11 @@ pub const Worker = struct {
                                 owned_buf[i] = self.allocator.dupe(u8, v) catch return false;
                             }
                             const owned = owned_buf[0..fv.len];
-                            dsl.wrlock(ns, self.id, &self.last_stripe);
+                            dsl.acquire(ns, self.id, &self.last_stripe);
                             const added = hs.hsetOwned(ns, owned) catch {
-                                dsl.unlock(ns);
-                                for (owned) |o| self.allocator.free(o);
+                                    for (owned) |o| self.allocator.free(o);
                                 return false;
                             };
-                            dsl.unlock(ns);
                             if (self.aof) |a| a.logCommand(args);
                             self.bumpWatchVersion(conn.selected_db, args[1]);
                             writeIntTo(&conn.write_buf, @intCast(added));
@@ -1760,8 +1729,7 @@ pub const Worker = struct {
                         if (self.hash_store) |hs| {
                             const ns = nsKey(conn.selected_db, args[1]) orelse return false;
                             const dsl = self.ds_locks orelse return false;
-                            dsl.rdlock(ns, self.id, &self.last_stripe);
-                            defer dsl.unlock(ns);
+                            dsl.acquire(ns, self.id, &self.last_stripe);
                             if (hs.hget(ns, args[2])) |val| {
                                 writeBulkTo(&conn.write_buf, val);
                             } else {
@@ -1774,8 +1742,7 @@ pub const Worker = struct {
                         if (self.hash_store) |hs| {
                             const ns = nsKey(conn.selected_db, args[1]) orelse return false;
                             const dsl = self.ds_locks orelse return false;
-                            dsl.rdlock(ns, self.id, &self.last_stripe);
-                            defer dsl.unlock(ns);
+                            dsl.acquire(ns, self.id, &self.last_stripe);
                             writeIntTo(&conn.write_buf, @intCast(hs.hlen(ns)));
                             return true;
                         }
@@ -1786,8 +1753,7 @@ pub const Worker = struct {
                         if (self.list_store) |ls| {
                             const ns = nsKey(conn.selected_db, args[1]) orelse return false;
                             const dsl = self.ds_locks orelse return false;
-                            dsl.rdlock(ns, self.id, &self.last_stripe);
-                            defer dsl.unlock(ns);
+                            dsl.acquire(ns, self.id, &self.last_stripe);
                             writeIntTo(&conn.write_buf, @intCast(ls.llen(ns)));
                             return true;
                         }
@@ -1796,9 +1762,8 @@ pub const Worker = struct {
                         if (self.list_store) |ls| {
                             const ns = nsKey(conn.selected_db, args[1]) orelse return false;
                             const dsl = self.ds_locks orelse return false;
-                            dsl.wrlock(ns, self.id, &self.last_stripe);
+                            dsl.acquire(ns, self.id, &self.last_stripe);
                             const val = ls.lpop(ns);
-                            dsl.unlock(ns);
                             if (val) |v| {
                                 if (self.aof) |a| a.logCommand(args);
                                 writeBulkTo(&conn.write_buf, v);
@@ -1813,9 +1778,8 @@ pub const Worker = struct {
                     if (self.list_store) |ls| {
                         const ns = nsKey(conn.selected_db, args[1]) orelse return false;
                         const dsl = self.ds_locks orelse return false;
-                        dsl.wrlock(ns, self.id, &self.last_stripe);
+                        dsl.acquire(ns, self.id, &self.last_stripe);
                         const val = ls.rpop(ns);
-                        dsl.unlock(ns);
                         if (val) |v| {
                             if (self.aof) |a| a.logCommand(args);
                             writeBulkTo(&conn.write_buf, v);
@@ -1837,13 +1801,11 @@ pub const Worker = struct {
                             owned_buf[i] = self.allocator.dupe(u8, m) catch return false;
                         }
                         const owned = owned_buf[0..members.len];
-                        dsl.wrlock(ns, self.id, &self.last_stripe);
+                        dsl.acquire(ns, self.id, &self.last_stripe);
                         const added = ss.saddOwned(ns, owned) catch {
-                            dsl.unlock(ns);
                             for (owned) |o| self.allocator.free(o);
                             return false;
                         };
-                        dsl.unlock(ns);
                         if (self.aof) |a| a.logCommand(args);
                         self.bumpWatchVersion(conn.selected_db, args[1]);
                         writeIntTo(&conn.write_buf, @intCast(added));
@@ -1855,9 +1817,8 @@ pub const Worker = struct {
                         if (self.sorted_set_store) |zs| {
                             const ns = nsKey(conn.selected_db, args[1]) orelse return false;
                             const dsl = self.ds_locks orelse return false;
-                            dsl.wrlock(ns, self.id, &self.last_stripe);
-                            const added = zs.zadd(ns, args[2..]) catch { dsl.unlock(ns); return false; };
-                            dsl.unlock(ns);
+                            dsl.acquire(ns, self.id, &self.last_stripe);
+                            const added = zs.zadd(ns, args[2..]) catch return false;
                             if (self.aof) |a| a.logCommand(args);
                             self.bumpWatchVersion(conn.selected_db, args[1]);
                             writeIntTo(&conn.write_buf, @intCast(added));
@@ -1872,9 +1833,8 @@ pub const Worker = struct {
                     if (self.list_store) |ls| {
                         const ns = nsKey(conn.selected_db, args[1]) orelse return false;
                         const dsl = self.ds_locks orelse return false;
-                        dsl.wrlock(ns, self.id, &self.last_stripe);
-                        const list_len = ls.lpush(ns, args[2..]) catch { dsl.unlock(ns); return false; };
-                        dsl.unlock(ns);
+                        dsl.acquire(ns, self.id, &self.last_stripe);
+                        const list_len = ls.lpush(ns, args[2..]) catch return false;
                         if (self.aof) |a| a.logCommand(args);
                         self.bumpWatchVersion(conn.selected_db, args[1]);
                         writeIntTo(&conn.write_buf, @intCast(list_len));
@@ -1885,9 +1845,8 @@ pub const Worker = struct {
                     if (self.list_store) |ls| {
                         const ns = nsKey(conn.selected_db, args[1]) orelse return false;
                         const dsl = self.ds_locks orelse return false;
-                        dsl.wrlock(ns, self.id, &self.last_stripe);
-                        const list_len = ls.rpush(ns, args[2..]) catch { dsl.unlock(ns); return false; };
-                        dsl.unlock(ns);
+                        dsl.acquire(ns, self.id, &self.last_stripe);
+                        const list_len = ls.rpush(ns, args[2..]) catch return false;
                         if (self.aof) |a| a.logCommand(args);
                         self.bumpWatchVersion(conn.selected_db, args[1]);
                         writeIntTo(&conn.write_buf, @intCast(list_len));
@@ -1898,8 +1857,7 @@ pub const Worker = struct {
                     if (self.set_store) |ss| {
                         const ns = nsKey(conn.selected_db, args[1]) orelse return false;
                         const dsl = self.ds_locks orelse return false;
-                        dsl.rdlock(ns, self.id, &self.last_stripe);
-                        defer dsl.unlock(ns);
+                        dsl.acquire(ns, self.id, &self.last_stripe);
                         writeIntTo(&conn.write_buf, @intCast(ss.scard(ns)));
                         return true;
                     }
@@ -1908,8 +1866,7 @@ pub const Worker = struct {
                     if (self.sorted_set_store) |zs| {
                         const ns = nsKey(conn.selected_db, args[1]) orelse return false;
                         const dsl = self.ds_locks orelse return false;
-                        dsl.rdlock(ns, self.id, &self.last_stripe);
-                        defer dsl.unlock(ns);
+                        dsl.acquire(ns, self.id, &self.last_stripe);
                         writeIntTo(&conn.write_buf, @intCast(zs.zcard(ns)));
                         return true;
                     }
@@ -2016,7 +1973,7 @@ pub const Worker = struct {
         conn.write_buf.appendSlice("+OK\r\n") catch return;
     }
 
-    /// FIX #2: Direct write attempt — avoids enableWrite/disableWrite syscalls.
+    /// Direct write attempt — avoids enableWrite/disableWrite syscalls.
     /// Most responses fit in the TCP send buffer, so write() succeeds immediately.
     /// Only registers for writable events if EAGAIN (partial write).
     fn directFlush(self: *Worker, conn: *Connection) void {
@@ -2070,7 +2027,7 @@ pub const Worker = struct {
 
 // ─── Utility ─────────────────────────────────────────────────────────
 
-/// FIX #4: Precomputed DB prefix + user key concatenation.
+/// Precomputed DB prefix + user key concatenation.
 /// Uses compile-time prefix table instead of runtime std.fmt.bufPrint.
 fn nsKey(db: u8, user_key: []const u8) ?[]const u8 {
     // db 0 fast path: prefix is "0:" (2 bytes). Use threadlocal buffer.

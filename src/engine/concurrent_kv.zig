@@ -511,14 +511,6 @@ pub const ConcurrentKV = struct {
         return self.cached_now_ms > entry.expires_at;
     }
 
-    /// Remove an expired entry while the stripe is already locked.
-    fn evictLocked(self: *ConcurrentKV, s: *Stripe, key: []const u8) void {
-        const result = s.map.fetchRemove(key);
-        if (result) |kv| {
-            self.allocator.free(kv.key);
-            self.allocator.free(kv.value.value);
-        }
-    }
 };
 
 /// Minimal glob matcher supporting '*' (match any) and '?' (match one).
