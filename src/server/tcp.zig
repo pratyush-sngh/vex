@@ -1035,6 +1035,27 @@ pub const Server = struct {
         const workers = try self.allocator.alloc(Worker, num_workers);
         defer self.allocator.free(workers);
 
+        // Per-worker AOF shards: each worker gets its own AOF file to avoid mutex contention.
+        // Worker 0 uses the main AOF (vex.aof), workers 1..N use vex.aof.shard{i}.
+        var reactor_shard_aofs: ?[]AOF = null;
+        if (self.aof != null and num_workers > 1) {
+            const extra = num_workers - 1;
+            const arr = try self.allocator.alloc(AOF, extra);
+            for (0..extra) |j| {
+                const shard_path = try std.fmt.allocPrint(self.allocator, "{s}.shard{d}", .{ self.aof.?.path, j + 1 });
+                arr[j] = try AOF.init(self.io, shard_path, self.aof.?.snapshot_path);
+                arr[j].prof = self.profile;
+                arr[j].initGroupBuf(self.allocator);
+            }
+            reactor_shard_aofs = arr;
+        }
+        // Init group buf on main AOF too (if not already done)
+        if (self.aof) |a| a.initGroupBuf(self.allocator);
+        defer if (reactor_shard_aofs) |arr| {
+            for (arr) |*a| a.deinit();
+            self.allocator.free(arr);
+        };
+
         for (workers, 0..) |*w, i| {
             w.* = try Worker.init(
                 self.allocator,
@@ -1045,7 +1066,7 @@ pub const Server = struct {
                 &ckv,
                 self.graph,
                 &graph_rwlock,
-                self.aof,
+                if (i == 0) self.aof else if (reactor_shard_aofs) |arr| &arr[i - 1] else self.aof,
                 self.keys_mode,
                 self.profile,
                 self.requirepass,

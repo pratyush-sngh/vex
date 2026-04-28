@@ -1982,19 +1982,12 @@ pub const Worker = struct {
 // ─── Utility ─────────────────────────────────────────────────────────
 
 /// Precomputed DB prefix + user key concatenation.
-/// Uses compile-time prefix table instead of runtime std.fmt.bufPrint.
+/// Uses DB_PREFIXES (same as CommandHandler) for consistency.
 fn nsKey(db: u8, user_key: []const u8) ?[]const u8 {
-    // db 0 fast path: prefix is "0:" (2 bytes). Use threadlocal buffer.
     const S = struct {
-        threadlocal var buf: [512]u8 = .{ '0', ':' } ++ ([_]u8{0} ** 510);
+        threadlocal var buf: [512]u8 = undefined;
     };
     if (db >= 16) return null;
-    if (db == 0) {
-        // Fast path: just copy user_key after "0:" — skip prefix lookup
-        if (2 + user_key.len > S.buf.len) return null;
-        @memcpy(S.buf[2 .. 2 + user_key.len], user_key);
-        return S.buf[0 .. 2 + user_key.len];
-    }
     const prefix = DB_PREFIXES[db];
     const total = prefix.len + user_key.len;
     if (total > S.buf.len) return null;

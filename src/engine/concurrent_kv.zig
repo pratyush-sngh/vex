@@ -82,10 +82,12 @@ pub const ConcurrentKV = struct {
             const owned_val = try self.allocator.dupe(u8, entry.value_ptr.value);
             errdefer self.allocator.free(owned_val);
             if (entry.value_ptr.flags.deleted) continue; // skip tombstones
+            var flags = entry.value_ptr.flags;
+            flags.is_inline = false; // imported values are heap-allocated, not inline
             try s.map.put(owned_key, .{
                 .value = owned_val,
                 .expires_at = entry.value_ptr.expires_at,
-                .flags = entry.value_ptr.flags,
+                .flags = flags,
             });
         }
     }
