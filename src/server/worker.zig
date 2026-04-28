@@ -468,6 +468,10 @@ pub const Worker = struct {
                         self.handleSendCompletion(conn, ev.bytes);
                     }
                     continue;
+                } else if (ev.op == 3) {
+                    // AOF write+fsync completion
+                    if (self.aof) |a| a.asyncFlushComplete(!ev.err);
+                    continue;
                 }
 
                 // op=0: poll-based path (TLS, epoll, kqueue)
@@ -489,8 +493,23 @@ pub const Worker = struct {
                 }
             }
 
-            // AOF group commit: flush buffered commands to file at end of tick
-            if (self.aof) |a| a.flush();
+            // AOF group commit: async via io_uring write+fsync, or sync fallback
+            if (self.aof) |a| {
+                if (self.use_uring_io) {
+                    if (a.prepareAsyncFlush()) |pending| {
+                        if (is_linux) {
+                            self.loop.submitAofWriteFsync(a.getFd(), pending.data, pending.offset) catch {
+                                // io_uring submission failed — fall back to sync
+                                a.asyncFlushComplete(false);
+                                a.flush();
+                            };
+                            self.loop.flushSqes();
+                        }
+                    }
+                } else {
+                    a.flush();
+                }
+            }
         }
     }
 

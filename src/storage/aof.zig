@@ -1,7 +1,10 @@
 const std = @import("std");
 const c = std.c;
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const span = @import("../perf/span.zig");
+
+const is_linux = builtin.os.tag == .linux;
 
 /// Append-Only File for write-ahead logging.
 /// Group commit: logCommand() appends to an in-memory buffer (no I/O),
@@ -18,6 +21,20 @@ pub const AOF = struct {
     /// In-memory group commit buffer (commands accumulated between flushes)
     group_buf: std.array_list.Managed(u8) = undefined,
     group_buf_inited: bool = false,
+    /// Double buffer for async io_uring flush (data being written to disk)
+    flush_buf: std.array_list.Managed(u8) = undefined,
+    flush_buf_inited: bool = false,
+    /// True while io_uring write+fsync is in-flight
+    flush_pending: bool = false,
+    /// Current file offset (avoids seekTo on each flush)
+    file_offset: u64 = 0,
+    /// Bytes written in the current async flush (for file_offset tracking)
+    flush_written_len: u64 = 0,
+    /// Raw fd opened with O_DIRECT for bypassing page cache (Linux only, -1 if unavailable)
+    direct_fd: i32 = -1,
+    /// Page-aligned staging buffer for O_DIRECT writes (512-byte sector alignment)
+    direct_buf: ?[]align(4096) u8 = null,
+    direct_buf_allocator: ?Allocator = null,
 
     pub fn init(io: std.Io, path: []const u8, snapshot_path: []const u8) !AOF {
         const file = try std.Io.Dir.cwd().createFile(io, path, .{
@@ -34,17 +51,47 @@ pub const AOF = struct {
         };
     }
 
+    /// Enable Direct I/O (O_DIRECT) on Linux. Opens a second fd bypassing page cache.
+    /// The direct_fd is used for async io_uring writes; the original file handle stays for sync fallback.
+    pub fn enableDirectIO(self: *AOF, allocator: Allocator) void {
+        if (!is_linux) return;
+        const path_z = allocator.dupeZ(u8, self.path) catch return;
+        defer allocator.free(path_z);
+        const fd = c.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .APPEND = true, .DIRECT = true }, @as(c.mode_t, 0o644));
+        if (fd < 0) return; // O_DIRECT not supported (e.g. tmpfs)
+        self.direct_fd = fd;
+        // Allocate 64KB page-aligned staging buffer
+        const buf = allocator.alignedAlloc(u8, .fromByteUnits(4096), 65536) catch {
+            _ = c.close(fd);
+            self.direct_fd = -1;
+            return;
+        };
+        self.direct_buf = buf;
+        self.direct_buf_allocator = allocator;
+    }
+
     pub fn initGroupBuf(self: *AOF, allocator: Allocator) void {
         if (!self.group_buf_inited) {
             self.group_buf = std.array_list.Managed(u8).init(allocator);
             self.group_buf_inited = true;
         }
+        if (!self.flush_buf_inited) {
+            self.flush_buf = std.array_list.Managed(u8).init(allocator);
+            self.flush_buf_inited = true;
+        }
+        // Initialize file_offset to current file length
+        self.file_offset = self.file.length(self.io) catch 0;
     }
 
     pub fn deinit(self: *AOF) void {
         // Flush any remaining buffered commands
         self.flush();
         if (self.group_buf_inited) self.group_buf.deinit();
+        if (self.flush_buf_inited) self.flush_buf.deinit();
+        if (self.direct_fd >= 0) _ = c.close(self.direct_fd);
+        if (self.direct_buf) |buf| {
+            if (self.direct_buf_allocator) |alloc| alloc.free(buf);
+        }
         self.file.close(self.io);
     }
 
@@ -92,6 +139,64 @@ pub const AOF = struct {
         self.flushBufferToFile() catch {};
         const t1 = std.Io.Clock.Timestamp.now(self.io, .awake);
         if (self.prof) |p| p.recordAofWrite(span.monotonicNs(t0, t1));
+    }
+
+    /// Prepare an async flush: swap group_buf → flush_buf.
+    /// Returns the flush_buf slice and file offset for io_uring submission.
+    /// Returns null if nothing to flush or a flush is already in-flight.
+    pub fn prepareAsyncFlush(self: *AOF) ?struct { data: []const u8, offset: u64 } {
+        _ = c.pthread_mutex_lock(&self.mutex);
+        defer _ = c.pthread_mutex_unlock(&self.mutex);
+
+        if (self.flush_pending) return null;
+        if (!self.group_buf_inited or self.group_buf.items.len == 0) return null;
+
+        const data_len = self.group_buf.items.len;
+
+        // O_DIRECT path: copy to page-aligned buffer, pad to 512-byte sector boundary
+        if (self.direct_fd >= 0) {
+            if (self.direct_buf) |dbuf| {
+                const padded_len = (data_len + 511) & ~@as(usize, 511);
+                if (padded_len <= dbuf.len) {
+                    @memcpy(dbuf[0..data_len], self.group_buf.items);
+                    // Zero-pad remainder of sector
+                    if (padded_len > data_len) {
+                        @memset(dbuf[data_len..padded_len], 0);
+                    }
+                    self.group_buf.clearRetainingCapacity();
+                    self.flush_pending = true;
+                    self.flush_written_len = padded_len;
+                    return .{ .data = dbuf[0..padded_len], .offset = self.file_offset };
+                }
+            }
+        }
+
+        // Non-O_DIRECT path: use flush_buf (no alignment needed)
+        self.flush_buf.clearRetainingCapacity();
+        self.flush_buf.appendSlice(self.group_buf.items) catch return null;
+        self.group_buf.clearRetainingCapacity();
+
+        self.flush_pending = true;
+        self.flush_written_len = self.flush_buf.items.len;
+        return .{ .data = self.flush_buf.items, .offset = self.file_offset };
+    }
+
+    /// Called when io_uring write+fsync CQE completes.
+    pub fn asyncFlushComplete(self: *AOF, success: bool) void {
+        _ = c.pthread_mutex_lock(&self.mutex);
+        defer _ = c.pthread_mutex_unlock(&self.mutex);
+
+        if (success) {
+            self.file_offset += self.flush_written_len;
+        }
+        self.flush_pending = false;
+    }
+
+    /// Returns the raw file descriptor for io_uring operations.
+    /// Prefers O_DIRECT fd if available.
+    pub fn getFd(self: *AOF) i32 {
+        if (self.direct_fd >= 0) return self.direct_fd;
+        return self.file.handle;
     }
 
     fn flushBufferToFile(self: *AOF) !void {
