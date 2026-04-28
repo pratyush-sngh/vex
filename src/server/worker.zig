@@ -1939,28 +1939,29 @@ pub const Worker = struct {
     /// Direct write attempt — avoids enableWrite/disableWrite syscalls.
     /// Most responses fit in the TCP send buffer, so write() succeeds immediately.
     /// Only registers for writable events if EAGAIN (partial write).
+    /// Direct write attempt — avoids enableWrite/disableWrite syscalls.
     fn directFlush(self: *Worker, conn: *Connection) void {
-        // Cork the socket: buffer writes into one TCP segment (uncork sends).
-        // macOS: TCP_NOPUSH (4), Linux: TCP_CORK (3). IPPROTO_TCP = 6.
-        const cork_opt: c_int = if (comptime @import("builtin").os.tag == .linux) 3 else 4;
-        const cork_on: c_int = 1;
-        const cork_off: c_int = 0;
-        if (conn.ssl == null) {
-            _ = std.c.setsockopt(conn.fd, 6, cork_opt, @ptrCast(&cork_on), @sizeOf(c_int));
+        if (conn.ssl != null) {
+            self.directFlushTLS(conn);
+            return;
         }
 
+        // Single send() call — no cork/uncork syscalls.
+        // On Linux, MSG_MORE is available but for a single send of the full
+        // buffer, a plain write() is optimal (kernel coalesces with TCP_NODELAY).
         while (conn.write_offset < conn.write_buf.items.len) {
             const remaining = conn.write_buf.items[conn.write_offset..];
-            const rc = self.connWrite(conn, remaining.ptr, remaining.len);
+            const rc = std.c.write(conn.fd, remaining.ptr, remaining.len);
             if (rc < 0) {
-                // Send buffer full — uncork and register for writable event
-                if (conn.ssl == null) {
-                    _ = std.c.setsockopt(conn.fd, 6, cork_opt, @ptrCast(&cork_off), @sizeOf(c_int));
+                const err = std.c.errno(rc);
+                if (err == .AGAIN) {
+                    if (!conn.write_registered) {
+                        self.loop.enableWrite(conn.fd, @intCast(conn.fd)) catch {};
+                        conn.write_registered = true;
+                    }
+                    return;
                 }
-                if (!conn.write_registered) {
-                    self.loop.enableWrite(conn.fd, @intCast(conn.fd)) catch {};
-                    conn.write_registered = true;
-                }
+                self.closeConn(conn.fd);
                 return;
             }
             if (rc == 0) {
@@ -1970,9 +1971,27 @@ pub const Worker = struct {
             conn.write_offset += @intCast(rc);
         }
 
-        // All data flushed — uncork to send the batched segment
-        if (conn.ssl == null) {
-            _ = std.c.setsockopt(conn.fd, 6, cork_opt, @ptrCast(&cork_off), @sizeOf(c_int));
+        conn.write_buf.clearRetainingCapacity();
+        conn.write_offset = 0;
+        if (conn.write_registered) {
+            self.loop.disableWrite(conn.fd, @intCast(conn.fd)) catch {};
+            conn.write_registered = false;
+        }
+    }
+
+    fn directFlushTLS(self: *Worker, conn: *Connection) void {
+        while (conn.write_offset < conn.write_buf.items.len) {
+            const remaining = conn.write_buf.items[conn.write_offset..];
+            const rc = self.connWrite(conn, remaining.ptr, remaining.len);
+            if (rc < 0) {
+                if (!conn.write_registered) {
+                    self.loop.enableWrite(conn.fd, @intCast(conn.fd)) catch {};
+                    conn.write_registered = true;
+                }
+                return;
+            }
+            if (rc == 0) { self.closeConn(conn.fd); return; }
+            conn.write_offset += @intCast(rc);
         }
         conn.write_buf.clearRetainingCapacity();
         conn.write_offset = 0;
