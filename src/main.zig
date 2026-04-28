@@ -219,6 +219,7 @@ pub fn main(init: std.process.Init) !void {
             return;
         };
         aof_tmp.prof = prof;
+        aof_tmp.initGroupBuf(allocator);
         aof_instance = aof_tmp;
 
         var replay_db = std.atomic.Value(u8).init(0);
@@ -227,9 +228,16 @@ pub fn main(init: std.process.Init) !void {
             log("warning: AOF replay failed: {s}", .{@errorName(err)});
             break :blk @as(u64, 0);
         };
-        if (config.scale_mode == .scaled and config.engine_threads > 1) {
+        // Replay shard AOFs — used by both scaled mode and reactor per-worker shards
+        const shard_count: usize = if (config.scale_mode == .scaled and config.engine_threads > 1)
+            config.engine_threads
+        else if (config.reactor and config.workers > 1)
+            config.workers
+        else
+            1;
+        if (shard_count > 1) {
             var i: usize = 1;
-            while (i < config.engine_threads) : (i += 1) {
+            while (i < shard_count) : (i += 1) {
                 const shard_aof_path = try std.fmt.allocPrint(allocator, "{s}.shard{d}", .{ aof_path, i });
                 defer allocator.free(shard_aof_path);
                 const n = aof_mod.replayFile(io, allocator, shard_aof_path, &replay_handler) catch 0;

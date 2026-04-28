@@ -82,10 +82,12 @@ pub const ConcurrentKV = struct {
             const owned_val = try self.allocator.dupe(u8, entry.value_ptr.value);
             errdefer self.allocator.free(owned_val);
             if (entry.value_ptr.flags.deleted) continue; // skip tombstones
+            var flags = entry.value_ptr.flags;
+            flags.is_inline = false; // imported values are heap-allocated, not inline
             try s.map.put(owned_key, .{
                 .value = owned_val,
                 .expires_at = entry.value_ptr.expires_at,
-                .flags = entry.value_ptr.flags,
+                .flags = flags,
             });
         }
     }
@@ -210,18 +212,19 @@ pub const ConcurrentKV = struct {
             writeUnlockStripe(s);
             return .{ .stale_key = owned_key }; // key not needed for update
         } else {
-            var new_entry = Entry{
+            const gop = s.map.getOrPut(owned_key) catch {
+                writeUnlockStripe(s);
+                return .{ .stale_key = owned_key };
+            };
+            gop.key_ptr.* = owned_key;
+            gop.value_ptr.* = .{
                 .expires_at = expires_at,
                 .flags = .{ .has_ttl = has_ttl, .is_inline = true },
                 .value = undefined,
             };
-            @memcpy(new_entry.inline_buf[0..value.len], value);
-            new_entry.inline_len = @intCast(value.len);
-            new_entry.value = new_entry.inline_buf[0..value.len];
-            s.map.put(owned_key, new_entry) catch {
-                writeUnlockStripe(s);
-                return .{ .stale_key = owned_key };
-            };
+            @memcpy(gop.value_ptr.inline_buf[0..value.len], value);
+            gop.value_ptr.inline_len = @intCast(value.len);
+            gop.value_ptr.value = gop.value_ptr.inline_buf[0..value.len];
             writeUnlockStripe(s);
             return .{ .stale_key = null }; // key owned by map
         }
@@ -268,23 +271,24 @@ pub const ConcurrentKV = struct {
             }
             return .{ .stale_val = old_val, .stale_key = owned_key };
         } else {
-            var new_entry = Entry{
+            const gop = s.map.getOrPut(owned_key) catch {
+                writeUnlockStripe(s);
+                return .{ .stale_val = owned_value, .stale_key = owned_key };
+            };
+            gop.key_ptr.* = owned_key;
+            gop.value_ptr.* = .{
                 .expires_at = expires_at,
                 .flags = .{ .has_ttl = has_ttl },
                 .value = undefined,
             };
             if (owned_value.len <= KVStore.INLINE_BUF_SIZE) {
-                @memcpy(new_entry.inline_buf[0..owned_value.len], owned_value);
-                new_entry.inline_len = @intCast(owned_value.len);
-                new_entry.value = new_entry.inline_buf[0..owned_value.len];
-                new_entry.flags.is_inline = true;
+                @memcpy(gop.value_ptr.inline_buf[0..owned_value.len], owned_value);
+                gop.value_ptr.inline_len = @intCast(owned_value.len);
+                gop.value_ptr.value = gop.value_ptr.inline_buf[0..owned_value.len];
+                gop.value_ptr.flags.is_inline = true;
             } else {
-                new_entry.value = owned_value;
+                gop.value_ptr.value = owned_value;
             }
-            s.map.put(owned_key, new_entry) catch {
-                writeUnlockStripe(s);
-                return .{ .stale_val = owned_value, .stale_key = owned_key };
-            };
             writeUnlockStripe(s);
             if (owned_value.len <= KVStore.INLINE_BUF_SIZE) {
                 return .{ .stale_val = owned_value, .stale_key = null };

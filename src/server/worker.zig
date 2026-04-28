@@ -1448,17 +1448,8 @@ pub const Worker = struct {
             3 => switch (first) {
                 'G' => if (args.len >= 2 and equalsAsciiUpper(cmd, "GET")) {
                     // Ultra-fast GET with SeqLock — lock-free for inline values.
-                    const user_key = args[1];
-                    const db = conn.selected_db;
-                    if (db >= 16) return false;
-                    const prefix = DB_PREFIXES[db];
                     const KVS = @import("../engine/kv.zig").KVStore;
-                    const S = struct { threadlocal var buf: [512]u8 = undefined; };
-                    const total = prefix.len + user_key.len;
-                    if (total > S.buf.len) return false;
-                    @memcpy(S.buf[0..prefix.len], prefix);
-                    @memcpy(S.buf[prefix.len..total], user_key);
-                    const ns_key = S.buf[0..total];
+                    const ns_key = nsKey(conn.selected_db, args[1]) orelse return false;
 
                     const stripe = ckv.getStripePublic(ns_key);
                     const entry_opt = stripe.map.getPtr(ns_key);
@@ -1991,19 +1982,12 @@ pub const Worker = struct {
 // ─── Utility ─────────────────────────────────────────────────────────
 
 /// Precomputed DB prefix + user key concatenation.
-/// Uses compile-time prefix table instead of runtime std.fmt.bufPrint.
+/// Uses DB_PREFIXES (same as CommandHandler) for consistency.
 fn nsKey(db: u8, user_key: []const u8) ?[]const u8 {
-    // db 0 fast path: prefix is "0:" (2 bytes). Use threadlocal buffer.
     const S = struct {
-        threadlocal var buf: [512]u8 = .{ '0', ':' } ++ ([_]u8{0} ** 510);
+        threadlocal var buf: [512]u8 = undefined;
     };
     if (db >= 16) return null;
-    if (db == 0) {
-        // Fast path: just copy user_key after "0:" — skip prefix lookup
-        if (2 + user_key.len > S.buf.len) return null;
-        @memcpy(S.buf[2 .. 2 + user_key.len], user_key);
-        return S.buf[0 .. 2 + user_key.len];
-    }
     const prefix = DB_PREFIXES[db];
     const total = prefix.len + user_key.len;
     if (total > S.buf.len) return null;
