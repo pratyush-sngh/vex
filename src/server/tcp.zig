@@ -1001,13 +1001,6 @@ pub const Server = struct {
         defer ckv.deinit();
         try ckv.importFrom(self.kv);
 
-        // Pool arena for CKV — fast bump allocation for keys/values
-        const PA2 = @import("../engine/pool_arena.zig").PoolArena;
-        var ckv_pool = try PA2.init(self.allocator, .{ .enable_background_refill = true });
-        defer ckv_pool.deinit();
-        try ckv_pool.startRefiller();
-        ckv.setFastAllocator(ckv_pool.allocator());
-
         const PubSubRegistry = @import("worker.zig").PubSubRegistry;
         var pubsub = PubSubRegistry.init(self.allocator);
         defer pubsub.deinit();
@@ -1070,19 +1063,6 @@ pub const Server = struct {
                 &ds_locks,
                 &watch_map,
             );
-        }
-
-        // Init per-worker pool arenas for fast allocation
-        const PA = @import("../engine/pool_arena.zig").PoolArena;
-        var pools: [32]*PA = undefined;
-        for (workers, 0..) |*w, i| {
-            if (i < pools.len) {
-                const p = try self.allocator.create(PA);
-                p.* = try PA.init(self.allocator, .{ .enable_background_refill = false });
-                pools[i] = p;
-                w.pool = p;
-                w.pool_alloc = p.allocator();
-            }
         }
 
         // Spawn worker threads.

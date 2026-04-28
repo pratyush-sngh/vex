@@ -712,7 +712,6 @@ test {
     _ = @import("storage/aof.zig");
     _ = @import("perf/span.zig");
     _ = @import("engine/string_intern.zig");
-    _ = @import("engine/pool_arena.zig");
     _ = @import("engine/property_store.zig");
     _ = @import("command/comptime_dispatch.zig");
     _ = @import("server/tls.zig");

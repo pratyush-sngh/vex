@@ -306,15 +306,11 @@ const Connection = struct {
 
 // ─── Worker ──────────────────────────────────────────────────────────
 
-const PoolArena = @import("../engine/pool_arena.zig").PoolArena;
-
 pub const Worker = struct {
     id: u16,
     loop: EventLoop,
     conns: std.AutoHashMap(i32, *Connection),
     allocator: Allocator,
-    pool: ?*PoolArena,
-    pool_alloc: ?Allocator, // pool arena as std.mem.Allocator
     io: std.Io,
     kv: *KVStore,
     kv_mutex: *std.atomic.Mutex,
@@ -376,8 +372,6 @@ pub const Worker = struct {
             .loop = try EventLoop.init(),
             .conns = std.AutoHashMap(i32, *Connection).init(allocator),
             .allocator = allocator,
-            .pool = null,
-            .pool_alloc = null,
             .io = io,
             .kv = kv,
             .kv_mutex = kv_mutex,
@@ -462,11 +456,6 @@ pub const Worker = struct {
     /// Stripe affinity: after processing a data-store command, check if this
     /// connection should migrate to the worker that owns the stripe.
     /// Processes current command normally (with lock), migration happens after flush.
-    /// Fast allocator: uses pool arena if available, falls back to system.
-    inline fn fastAlloc(self: *Worker) Allocator {
-        return self.pool_alloc orelse self.allocator;
-    }
-
     fn handleRepl(self: *Worker, conn: *Connection, args: []const []const u8) bool {
         if (args.len < 2 or !std.mem.eql(u8, args[0], "_REPL")) return false;
         const real_args = args[1..];

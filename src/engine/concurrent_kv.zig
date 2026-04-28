@@ -11,7 +11,6 @@ const STRIPE_MASK = STRIPE_COUNT - 1;
 pub const ConcurrentKV = struct {
     stripes: [STRIPE_COUNT]Stripe,
     allocator: Allocator,
-    fast_allocator: ?Allocator, // pool arena — used for key/value allocs when available
     io: std.Io,
     cached_now_ms: i64 = 0,
 
@@ -40,7 +39,6 @@ pub const ConcurrentKV = struct {
         var self: ConcurrentKV = .{
             .stripes = undefined,
             .allocator = allocator,
-            .fast_allocator = null,
             .io = io,
         };
         for (&self.stripes) |*s| {
@@ -353,7 +351,7 @@ pub const ConcurrentKV = struct {
     /// Lazy FLUSHALL: swap stripe maps to fresh empty ones, push old entries
     /// to garbage queue for async free. Returns instantly (~500ns for 256 stripes).
     pub fn flushdb(self: *ConcurrentKV) void {
-        const alloc = self.kvAlloc();
+        const alloc = self.allocator;
         for (&self.stripes) |*s| {
             writeLockStripe(s);
             var old_map = s.map;
@@ -441,7 +439,7 @@ pub const ConcurrentKV = struct {
             return new_val;
         }
 
-        const alloc = self.kvAlloc();
+        const alloc = self.allocator;
         const owned_key = alloc.dupe(u8, key) catch {
             writeUnlockStripe(s);
             return error.OutOfMemory;
@@ -476,27 +474,11 @@ pub const ConcurrentKV = struct {
     }
 
     /// Set the fast allocator (pool arena). Call after init, before use.
-    pub fn setFastAllocator(self: *ConcurrentKV, fa: Allocator) void {
-        self.fast_allocator = fa;
-        // Rebuild stripe maps with pool allocator
-        for (&self.stripes) |*s| {
-            if (s.map.count() == 0) {
-                s.map.deinit();
-                s.map = std.StringHashMap(Entry).init(fa);
-                s.map.ensureTotalCapacity(16384) catch {};
-            }
-        }
-    }
-
-    inline fn kvAlloc(self: *ConcurrentKV) Allocator {
-        return self.fast_allocator orelse self.allocator;
-    }
-
     // ── Internal helpers ──
 
     pub fn setInternal(self: *ConcurrentKV, key: []const u8, value: []const u8, expires_at: i64) !void {
         const s = self.getStripe(key);
-        const alloc = self.kvAlloc();
+        const alloc = self.allocator;
         writeLockStripe(s);
         defer writeUnlockStripe(s);
 
