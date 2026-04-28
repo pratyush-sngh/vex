@@ -1521,42 +1521,21 @@ pub const CommandHandler = struct {
     }
 
     fn cmdSunion(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
-        if (args.len < 2) { try resp.serializeError(w, "wrong number of arguments for 'SUNION'"); return; }
-        // Namespace all keys
-        var ns_keys = std.array_list.Managed([]const u8).init(self.allocator);
-        defer {
-            for (ns_keys.items) |k| self.allocator.free(@constCast(k));
-            ns_keys.deinit();
-        }
-        for (args[1..]) |user_key| {
-            const nk = namespacedKey(self, user_key) catch continue;
-            ns_keys.append(nk) catch { self.allocator.free(nk); };
-        }
-        const result = self.getSetStore().sunion(ns_keys.items, self.allocator) catch { try resp.serializeArrayHeader(w, 0); return; };
-        defer if (result.len > 0) self.allocator.free(result);
-        try resp.serializeArrayHeader(w, result.len);
-        for (result) |m| try resp.serializeBulkString(w, m);
+        return self.cmdSetOp(args, w, .sunion, "SUNION");
     }
 
     fn cmdSinter(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
-        if (args.len < 2) { try resp.serializeError(w, "wrong number of arguments for 'SINTER'"); return; }
-        var ns_keys = std.array_list.Managed([]const u8).init(self.allocator);
-        defer {
-            for (ns_keys.items) |k| self.allocator.free(@constCast(k));
-            ns_keys.deinit();
-        }
-        for (args[1..]) |user_key| {
-            const nk = namespacedKey(self, user_key) catch continue;
-            ns_keys.append(nk) catch { self.allocator.free(nk); };
-        }
-        const result = self.getSetStore().sinter(ns_keys.items, self.allocator) catch { try resp.serializeArrayHeader(w, 0); return; };
-        defer if (result.len > 0) self.allocator.free(result);
-        try resp.serializeArrayHeader(w, result.len);
-        for (result) |m| try resp.serializeBulkString(w, m);
+        return self.cmdSetOp(args, w, .sinter, "SINTER");
     }
 
     fn cmdSdiff(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
-        if (args.len < 2) { try resp.serializeError(w, "wrong number of arguments for 'SDIFF'"); return; }
+        return self.cmdSetOp(args, w, .sdiff, "SDIFF");
+    }
+
+    const SetOp = enum { sunion, sinter, sdiff };
+
+    fn cmdSetOp(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer, comptime op: SetOp, comptime name: []const u8) !void {
+        if (args.len < 2) { try resp.serializeError(w, "wrong number of arguments for '" ++ name ++ "'"); return; }
         var ns_keys = std.array_list.Managed([]const u8).init(self.allocator);
         defer {
             for (ns_keys.items) |k| self.allocator.free(@constCast(k));
@@ -1566,7 +1545,12 @@ pub const CommandHandler = struct {
             const nk = namespacedKey(self, user_key) catch continue;
             ns_keys.append(nk) catch { self.allocator.free(nk); };
         }
-        const result = self.getSetStore().sdiff(ns_keys.items, self.allocator) catch { try resp.serializeArrayHeader(w, 0); return; };
+        const ss = self.getSetStore();
+        const result = switch (op) {
+            .sunion => ss.sunion(ns_keys.items, self.allocator),
+            .sinter => ss.sinter(ns_keys.items, self.allocator),
+            .sdiff => ss.sdiff(ns_keys.items, self.allocator),
+        } catch { try resp.serializeArrayHeader(w, 0); return; };
         defer if (result.len > 0) self.allocator.free(result);
         try resp.serializeArrayHeader(w, result.len);
         for (result) |m| try resp.serializeBulkString(w, m);
@@ -2484,15 +2468,19 @@ fn namespacedKey(self: *CommandHandler, key: []const u8) ![]u8 {
     return std.fmt.allocPrint(self.allocator, "db:{d}:{s}", .{ self.selected_db.load(.monotonic), key });
 }
 
+const db_prefix = @import("../db_prefix.zig");
+
 fn namespacedKeyRef(self: *CommandHandler, key: []const u8, stack_buf: []u8) !NamespacedKeyRef {
     const db = self.selected_db.load(.monotonic);
-    const prefix = std.fmt.bufPrint(stack_buf, "db:{d}:", .{db}) catch {
+    if (db >= db_prefix.MAX_DATABASES) {
         const owned = try namespacedKey(self, key);
         return .{ .key = owned, .owned = owned };
-    };
+    }
+    const prefix = db_prefix.DB_PREFIXES[db];
     const total_len = prefix.len + key.len;
     if (total_len <= stack_buf.len) {
-        std.mem.copyForwards(u8, stack_buf[prefix.len .. prefix.len + key.len], key);
+        @memcpy(stack_buf[0..prefix.len], prefix);
+        @memcpy(stack_buf[prefix.len..total_len], key);
         return .{ .key = stack_buf[0..total_len] };
     }
     const owned = try namespacedKey(self, key);
@@ -2500,12 +2488,20 @@ fn namespacedKeyRef(self: *CommandHandler, key: []const u8, stack_buf: []u8) !Na
 }
 
 fn namespacedKeyForDb(self: *CommandHandler, db: u8, key: []const u8) ![]u8 {
+    if (db < db_prefix.MAX_DATABASES) {
+        const prefix = db_prefix.DB_PREFIXES[db];
+        const result = try self.allocator.alloc(u8, prefix.len + key.len);
+        @memcpy(result[0..prefix.len], prefix);
+        @memcpy(result[prefix.len..], key);
+        return result;
+    }
     return std.fmt.allocPrint(self.allocator, "db:{d}:{s}", .{ db, key });
 }
 
 fn stripDbPrefix(self: *CommandHandler, raw_key: []const u8) ?[]const u8 {
-    var buf: [16]u8 = undefined;
-    const prefix = std.fmt.bufPrint(&buf, "db:{d}:", .{self.selected_db.load(.monotonic)}) catch return null;
+    const db = self.selected_db.load(.monotonic);
+    if (db >= db_prefix.MAX_DATABASES) return null;
+    const prefix = db_prefix.DB_PREFIXES[db];
     if (!std.mem.startsWith(u8, raw_key, prefix)) return null;
     return raw_key[prefix.len..];
 }
@@ -2515,8 +2511,9 @@ fn graphNamespacedKey(self: *CommandHandler, key: []const u8) ![]u8 {
 }
 
 fn stripGraphDbPrefix(self: *CommandHandler, raw_key: []const u8) ?[]const u8 {
-    var buf: [16]u8 = undefined;
-    const prefix = std.fmt.bufPrint(&buf, "gdb:{d}:", .{self.selected_db.load(.monotonic)}) catch return null;
+    const db = self.selected_db.load(.monotonic);
+    if (db >= db_prefix.MAX_DATABASES) return null;
+    const prefix = db_prefix.GRAPH_DB_PREFIXES[db];
     if (!std.mem.startsWith(u8, raw_key, prefix)) return null;
     return raw_key[prefix.len..];
 }

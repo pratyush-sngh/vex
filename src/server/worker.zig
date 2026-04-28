@@ -22,15 +22,8 @@ const SortedSetStore = @import("../engine/sorted_set.zig").SortedSetStore;
 const READ_BUF_SIZE = 64 * 1024;
 const MAX_NEW_FDS = 256;
 
-// ─── Precomputed DB prefixes (fix #4) ───────────────────────────────
-// Avoids std.fmt.bufPrint("db:{d}:") per command (~20ns saved per op)
-const DB_PREFIXES = blk: {
-    var prefixes: [16][]const u8 = undefined;
-    for (0..16) |i| {
-        prefixes[i] = std.fmt.comptimePrint("db:{d}:", .{i});
-    }
-    break :blk prefixes;
-};
+const db_prefix = @import("../db_prefix.zig");
+const DB_PREFIXES = db_prefix.DB_PREFIXES;
 
 // ─── Connection ──────────────────────────────────────────────────────
 
@@ -463,6 +456,28 @@ pub const Worker = struct {
     /// Stripe affinity: after processing a data-store command, check if this
     /// connection should migrate to the worker that owns the stripe.
     /// Processes current command normally (with lock), migration happens after flush.
+    fn handleRepl(self: *Worker, conn: *Connection, args: []const []const u8) bool {
+        if (args.len < 2 or !std.mem.eql(u8, args[0], "_REPL")) return false;
+        const real_args = args[1..];
+        if (self.ckv) |ckv| {
+            if (self.executeHotFast(conn, real_args, ckv)) return true;
+        }
+        self.executeCommand(conn, real_args);
+        return true;
+    }
+
+    fn tryForwardToLeader(self: *Worker, conn: *Connection, args: []const []const u8) bool {
+        const rf = self.repl_follower orelse return false;
+        if (rf.promoted.load(.acquire) or !replication.isWriteCommand(args)) return false;
+        const resp_bytes = rf.forwardWrite(args) catch {
+            conn.write_buf.appendSlice("-ERR leader unavailable\r\n") catch {};
+            return true;
+        };
+        defer self.allocator.free(resp_bytes);
+        conn.write_buf.appendSlice(resp_bytes) catch {};
+        return true;
+    }
+
     // ── Internal helpers ─────────────────────────────────────────────
 
     fn acceptQueuedFds(self: *Worker) void {
@@ -692,28 +707,8 @@ pub const Worker = struct {
         // ── Fast path: common case (authenticated, no pubsub, no transaction) ──
         // Skips ~15 branch comparisons for the hot path.
         if (conn.authenticated and !conn.pubsub_mode and conn.tx_queue == null) {
-            // Check for _REPL marker
-            if (args.len >= 2 and std.mem.eql(u8, args[0], "_REPL")) {
-                const real_args = args[1..];
-                if (self.ckv) |ckv| {
-                    if (self.executeHotFast(conn, real_args, ckv)) return;
-                }
-                self.executeCommand(conn, real_args);
-                return;
-            }
-
-            // Follower write forwarding
-            if (self.repl_follower) |rf| {
-                if (!rf.promoted.load(.acquire) and replication.isWriteCommand(args)) {
-                    const resp_bytes = rf.forwardWrite(args) catch {
-                        conn.write_buf.appendSlice("-ERR leader unavailable\r\n") catch {};
-                        return;
-                    };
-                    defer self.allocator.free(resp_bytes);
-                    conn.write_buf.appendSlice(resp_bytes) catch {};
-                    return;
-                }
-            }
+            if (self.handleRepl(conn, args)) return;
+            if (self.tryForwardToLeader(conn, args)) return;
 
             // Hot path engine dispatch
             if (self.ckv) |ckv| {
@@ -948,31 +943,8 @@ pub const Worker = struct {
             }
         }
 
-        // ── Replication replay marker: _REPL prefix means this is a replayed
-        // command. Execute locally, skip forwarding AND broadcasting.
-        if (args.len >= 2 and std.mem.eql(u8, args[0], "_REPL")) {
-            const real_args = args[1..];
-            // Execute directly — bypass forwarding and broadcasting
-            if (self.ckv) |ckv| {
-                if (self.executeHotFast(conn, real_args, ckv)) return;
-            }
-            self.executeCommand(conn, real_args);
-            return;
-        }
-
-        // ── Follower write forwarding: send writes to leader ──
-        // If this follower has been promoted to leader, skip forwarding and execute locally.
-        if (self.repl_follower) |rf| {
-            if (!rf.promoted.load(.acquire) and replication.isWriteCommand(args)) {
-                const resp_bytes = rf.forwardWrite(args) catch {
-                    conn.write_buf.appendSlice("-ERR leader unavailable\r\n") catch {};
-                    return;
-                };
-                defer self.allocator.free(resp_bytes);
-                conn.write_buf.appendSlice(resp_bytes) catch {};
-                return;
-            }
-        }
+        if (self.handleRepl(conn, args)) return;
+        if (self.tryForwardToLeader(conn, args)) return;
 
         if (self.ckv) |ckv| {
             if (self.executeHotFast(conn, args, ckv)) {
