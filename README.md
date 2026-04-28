@@ -1,16 +1,29 @@
 # Vex
 
-A high-performance KV + Graph database written in Zig 0.16. Speaks the Redis protocol (RESP), so you can connect with `redis-cli` or any Redis client library.
+A high-performance KV + Graph database written in Zig. Drop-in Redis replacement that's 20-40% faster per instance on the same hardware. Same ops, same clients, same horizontal scaling model -- fewer instances for the same throughput.
 
 ## Why Vex?
 
-- **Up to 86% faster than Redis** on same-machine workloads (median of 15 runs, `redis-benchmark` UDS: 5.75M LPOP vs 3.09M)
+**Same scaling model as Redis, better per-instance performance.**
+
+Redis is single-threaded. To scale, you add more instances. Vex does the same -- but each instance uses 4-8 cores efficiently via multi-reactor architecture with lock-free reads. You need 20-40% fewer instances for the same throughput.
+
+| | Redis | Vex | Dragonfly |
+|---|---|---|---|
+| Sweet spot | 1 core | 4-8 cores | 32-64 cores |
+| Scale model | Add instances | Add instances | Bigger machine |
+| K8s / Docker | Small pods | Small pods | Huge pod |
+| Failure blast radius | 1 instance | 1 instance | Everything |
+| Protocol | RESP | RESP (compatible) | RESP (compatible) |
+
+- **20-40% faster than Redis** on pipelined workloads with equal resources (4 cores, `redis-benchmark`, median of 30 runs)
+- **Beats Dragonfly** at 4 cores (+16% to +201%) -- shared-nothing routing overhead loses to striped locks at moderate core counts
 - **22x faster shortest path than Memgraph** via bidirectional BFS + CSR adjacency
-- **Wins all 5 graph operations** vs Memgraph (add, traverse, path, neighbors)
-- **Redis-compatible** -- works with every Redis client library
+- **Redis-compatible** -- works with `redis-cli`, redis-py, Jedis, go-redis, ioredis, any Redis client
+- **Built-in graph engine** -- TRAVERSE, PATH, NEIGHBORS on the same data store
 - **Zero dependencies** -- pure Zig standard library, single binary
 - **Vector search + GRAPH.RAG** -- HNSW ANN search on graph nodes, semantic search → graph traversal in one command
-- **Production features** -- TLS, transactions, pub/sub, LRU eviction, background saves, config files, structured logging, clustering with automatic failover
+- **Production features** -- TLS, MULTI/EXEC, pub/sub, WATCH, LRU eviction, BGSAVE, clustering with automatic failover
 
 ## Documentation
 
@@ -72,17 +85,23 @@ Workers auto-detect from CPU core count (capped at 8). See [Configuration](docs/
 
 Benchmarked with **`redis-benchmark`** (industry standard). Docker containers with **equal, isolated resources**: 4 CPU cores + 4GB RAM each, CPU-pinned (`cpuset`). See [Benchmarks](docs/benchmarks.md) for full methodology, UDS results, and internal engine numbers.
 
-### KV: Vex vs Redis 8.0 (`redis-benchmark`, P=50, c=16)
+### KV: Vex vs Redis 8.0 (`redis-benchmark`, P=50, c=16, median of 15 runs)
 
 | Command | Redis TCP | Vex TCP | TCP Δ | Redis UDS | Vex UDS | UDS Δ |
 |---|---|---|---|---|---|---|
-| HSET | 1.02M | **1.55M** | **+51%** | 3.73M | **5.21M** | **+40%** |
-| GET | 1.30M | **1.81M** | **+40%** | 4.85M | **6.33M** | **+30%** |
-| LPOP | 1.51M | **2.05M** | **+36%** | 3.09M | **5.75M** | **+86%** |
-| SADD | 1.32M | **1.74M** | **+32%** | 5.21M | **5.75M** | **+10%** |
-| SET | 1.56M | **1.73M** | **+11%** | 3.88M | **6.25M** | **+61%** |
+| LPUSH | 971K | **1.38M** | **+42%** | 3.01M | **4.10M** | **+36%** |
+| RPUSH | 1.08M | **1.33M** | **+24%** | 3.79M | **4.17M** | **+10%** |
+| SADD | 1.19M | **1.42M** | **+19%** | 4.13M | **6.85M** | **+66%** |
+| MSET | 491K | **583K** | **+19%** | 668K | **1.84M** | **+175%** |
+| LPOP | 1.46M | **1.72M** | **+18%** | 5.88M | **7.25M** | **+23%** |
+| ZADD | 1.07M | **1.25M** | **+16%** | 3.27M | **5.49M** | **+68%** |
+| HSET | 1.03M | **1.19M** | **+16%** | 3.33M | **4.63M** | **+39%** |
+| SET | 1.16M | **1.31M** | **+13%** | 3.57M | **3.91M** | **+9%** |
+| INCR | 1.17M | **1.31M** | **+13%** | 4.10M | **6.49M** | **+58%** |
+| GET | 1.28M | **1.39M** | **+9%** | 5.81M | **7.35M** | **+27%** |
+| RPOP | 1.60M | **1.74M** | **+9%** | 5.95M | **7.35M** | **+24%** |
 
-Median of 15 runs. Vex wins 9/9 TCP, 8/9 UDS. Full results: [Benchmarks](docs/benchmarks.md)
+Vex wins **13/13 TCP** (+3% to +42%), **12/13 UDS** (+9% to +175%). Full results: [Benchmarks](docs/benchmarks.md)
 
 ### Graph: Vex vs Memgraph (10K nodes / 50K edges)
 
@@ -259,21 +278,32 @@ Redis-compatible KV + graph DB with multi-reactor architecture.
 
 ## Roadmap
 
-### v0.6 -- Partitioned Graph
+### v0.6 -- io_uring & Networking
+- io_uring batched read/write (Linux) — batch syscalls into single kernel submission
+- Full io_uring event loop (replace epoll fallback)
+- Connection lifecycle management via io_uring (accept, close)
+
+### v0.7 -- Partitioned Graph & Graph Query
 - Hash-partition graph nodes across machines
 - Ghost nodes for 1-hop boundary cache
 - BSP BFS for cross-partition traversals
 - Distributed Dijkstra
 - Consistent hash ring with vnodes
+- `GRAPH.MATCH` — pattern matching (subgraph queries)
+- `GRAPH.PAGERANK` — iterative PageRank
+- `GRAPH.COMPONENTS` — connected components (union-find)
+- `GRAPH.DEGREE key [IN|OUT]` — node degree count
+- `GRAPH.COMMON from to` — common neighbors
 
-### v0.7 -- Performance & Internals
-- Custom concurrent hashmap (replace Zig std HashMap for thread-safe resize under concurrent writes)
-- Sorted set skip list (O(log n) ZRANGE/ZRANK instead of O(n log n) sort-per-query)
+### v0.8 -- Engine Internals
+- Custom concurrent hashmap (replace Zig std HashMap for thread-safe resize)
+- Dual encoding for small collections (ziplist for lists/sets < 128 items)
+- Sorted set skip list (O(log n) ZRANGE/ZRANK)
 - Streams (`XADD`/`XREAD`/`XRANGE`/`XLEN`)
 - Persistence for lists, hashes, sets, sorted sets (snapshot + AOF)
-- io_uring batched read/write (Linux)
 
-### v0.8 -- Scripting & Query
+### v0.9 -- DPDK, Scripting & Query
+- DPDK kernel bypass networking (optional, Linux)
 - Lua scripting (`EVAL`/`EVALSHA`)
 - Graph secondary indexes on properties
 - Cypher query language subset

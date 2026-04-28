@@ -1,0 +1,42 @@
+services:
+  redis:
+    image: redis:8.0.3
+    container_name: redis-bench
+    command: ["redis-server", "--appendonly", "no", "--save", "", "--unixsocket", "/socks/redis.sock", "--unixsocketperm", "777"]
+    ports:
+      - "16379:6379"
+    volumes:
+      - /tmp/vex-socks:/socks
+    cpuset: "0-3"
+    mem_limit: 4g
+    memswap_limit: 4g
+
+  dragonfly:
+    image: docker.dragonflydb.io/dragonflydb/dragonfly
+    container_name: dragonfly-bench
+    command: ["--logtostderr", "--proactor_threads", "4"]
+    ports:
+      - "16381:6379"
+    volumes:
+      - /tmp/vex-socks:/socks
+    cpuset: "4-7"
+    mem_limit: 4g
+    memswap_limit: 4g
+
+  vex:
+    build:
+      context: .
+      dockerfile: Dockerfile.vex
+    container_name: vex-bench
+    command: ["--port", "6380", "--data-dir", "/data", "--no-persistence", "--reactor", "--workers", "4", "--unixsocket", "/socks/vex.sock"]
+    ports:
+      - "16380:6380"
+    volumes:
+      - vex_data:/data
+      - /tmp/vex-socks:/socks
+    cpuset: "8-11"
+    mem_limit: 4g
+    memswap_limit: 4g
+
+volumes:
+  vex_data:

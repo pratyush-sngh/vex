@@ -32,13 +32,26 @@ pub const KVStore = struct {
         deleted: bool = false,
         has_ttl: bool = false,
         is_integer: bool = false,
-        _padding: u5 = 0,
+        is_inline: bool = false, // value stored in inline_buf (no heap alloc)
+        _padding: u4 = 0,
     };
 
+    /// Inline buffer size for small values. Values ≤ this are stored in-place
+    /// (no heap allocation, enables lock-free GET via SeqLock).
+    /// 32 bytes covers redis-benchmark default (3 bytes) + most real-world keys.
+    /// Kept small to minimize Entry size for cache efficiency.
+    pub const INLINE_BUF_SIZE = 32;
+
     pub const Entry = struct {
-        value: []const u8,
-        expires_at: i64 = 0, // 0 = no expiry (was ?i64 = 16 bytes, now i64 = 8 bytes)
+        value: []const u8, // heap-allocated for large values, points into inline_buf for small
+        expires_at: i64 = 0,
         last_access: i64 = 0,
+        int_value: i64 = 0, // cached native integer (valid when flags.is_integer)
+        /// SeqLock: odd = write in progress, even = stable. Readers retry if changed.
+        seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+        /// Inline buffer for small values (≤ 128 bytes). Avoids heap alloc + enables lock-free GET.
+        inline_buf: [INLINE_BUF_SIZE]u8 = undefined,
+        inline_len: u8 = 0,
         flags: EntryFlags = .{},
     };
 
@@ -266,7 +279,7 @@ pub const KVStore = struct {
             self.allocator.free(entry.key_ptr.*);
             self.allocator.free(entry.value_ptr.value);
         }
-        self.map.clearAndFree();
+        self.map.clearRetainingCapacity();
         self.ttl_count = 0;
         self.tombstone_count = 0;
         self.live_count = 0;

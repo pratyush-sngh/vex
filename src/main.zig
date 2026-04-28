@@ -728,4 +728,5 @@ test {
     _ = @import("engine/vector_store.zig");
     _ = @import("engine/hnsw.zig");
     _ = @import("engine/rag.zig");
+    _ = @import("engine/lockfree_map.zig");
 }

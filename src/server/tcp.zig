@@ -1005,19 +1005,27 @@ pub const Server = struct {
         var pubsub = PubSubRegistry.init(self.allocator);
         defer pubsub.deinit();
 
-        const LS = @import("../engine/list.zig").ListStore;
-        const HS = @import("../engine/hash.zig").HashStore;
         const WM = @import("worker.zig").WatchMap;
-        var list_store = LS.init(self.allocator);
+        const ListStore = @import("../engine/list.zig").ListStore;
+        const HashStore = @import("../engine/hash.zig").HashStore;
+        const SetStore = @import("../engine/set.zig").SetStore;
+        const SortedSetStore = @import("../engine/sorted_set.zig").SortedSetStore;
+        var list_store = ListStore.init(self.allocator);
         defer list_store.deinit();
-        var hash_store = HS.init(self.allocator);
+        var hash_store = HashStore.init(self.allocator);
         defer hash_store.deinit();
-        const SS = @import("../engine/set.zig").SetStore;
-        const ZS = @import("../engine/sorted_set.zig").SortedSetStore;
-        var set_store = SS.init(self.allocator);
+        var set_store = SetStore.init(self.allocator);
         defer set_store.deinit();
-        var sorted_set_store = ZS.init(self.allocator);
+        var sorted_set_store = SortedSetStore.init(self.allocator);
         defer sorted_set_store.deinit();
+        // Explicit pthread_mutex_init — PTHREAD_MUTEX_INITIALIZER may not survive struct copy on macOS
+        {
+            const mutex_init_fn = @extern(*const fn (*std.c.pthread_mutex_t, ?*const anyopaque) callconv(.c) c_int, .{ .name = "pthread_mutex_init" });
+            _ = mutex_init_fn(&list_store.map_mutex, null);
+            _ = mutex_init_fn(&hash_store.map_mutex, null);
+            _ = mutex_init_fn(&set_store.map_mutex, null);
+            _ = mutex_init_fn(&sorted_set_store.map_mutex, null);
+        }
         const DsStripeLocks = @import("worker.zig").DsStripeLocks;
         var ds_locks: DsStripeLocks = undefined;
         ds_locks.init();
@@ -1113,6 +1121,12 @@ pub const Server = struct {
             // TCP_NODELAY for low latency.
             const yes: c_int = 1;
             _ = std.c.setsockopt(fd, 6, 1, @ptrCast(&yes), @sizeOf(c_int));
+
+            // Larger socket buffers — more data per syscall, fewer wakeups.
+            const sndbuf: c_int = 256 * 1024; // 256KB send buffer
+            const rcvbuf: c_int = 256 * 1024; // 256KB receive buffer
+            _ = std.c.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.SNDBUF, @ptrCast(&sndbuf), @sizeOf(c_int));
+            _ = std.c.setsockopt(fd, std.c.SOL.SOCKET, std.c.SO.RCVBUF, @ptrCast(&rcvbuf), @sizeOf(c_int));
 
             // Set non-blocking.
             _ = std.c.fcntl(fd, std.c.F.SETFL, @as(c_int, @bitCast(std.c.O{ .NONBLOCK = true })));
