@@ -1065,6 +1065,19 @@ pub const Server = struct {
             );
         }
 
+        // Init per-worker pool arenas for fast allocation
+        const PA = @import("../engine/pool_arena.zig").PoolArena;
+        var pools: [32]*PA = undefined;
+        for (workers, 0..) |*w, i| {
+            if (i < pools.len) {
+                const p = try self.allocator.create(PA);
+                p.* = try PA.init(self.allocator, .{ .enable_background_refill = false });
+                pools[i] = p;
+                w.pool = p;
+                w.pool_alloc = p.allocator();
+            }
+        }
+
         // Spawn worker threads.
         for (workers) |*w| {
             const t = try std.Thread.spawn(.{}, Worker.run, .{w});
@@ -1159,12 +1172,16 @@ fn udsAcceptLoop(ctx: *UdsAcceptCtx) void {
     const path_len = @min(ctx.path.len, addr.path.len - 1);
     for (0..path_len) |i| addr.path[i] = @intCast(ctx.path[i]);
 
-    // Remove stale socket file
+    // Remove stale socket file before binding
     const path_z: [*:0]const u8 = @ptrCast(&addr.path);
     _ = std.c.unlink(path_z);
 
-    // Bind
-    if (std.c.bind(sock, @ptrCast(&addr), @sizeOf(std.c.sockaddr.un)) < 0) return;
+    // Bind — retry once after unlink
+    if (std.c.bind(sock, @ptrCast(&addr), @sizeOf(std.c.sockaddr.un)) < 0) {
+        // Second attempt: force remove and retry
+        _ = std.c.unlink(path_z);
+        if (std.c.bind(sock, @ptrCast(&addr), @sizeOf(std.c.sockaddr.un)) < 0) return;
+    }
 
     // chmod 777 so any user can connect
     const path_z_buf = @as([*:0]const u8, @ptrCast(&addr.path));

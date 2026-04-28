@@ -478,32 +478,51 @@ pub const ConcurrentKV = struct {
 
     // ── Internal helpers ──
 
-    fn setInternal(self: *ConcurrentKV, key: []const u8, value: []const u8, expires_at: i64) !void {
+    pub fn setInternal(self: *ConcurrentKV, key: []const u8, value: []const u8, expires_at: i64) !void {
         const s = self.getStripe(key);
         writeLockStripe(s);
         defer writeUnlockStripe(s);
 
-        const owned_value = try self.allocator.dupe(u8, value);
-        errdefer self.allocator.free(owned_value);
-
         const has_ttl = expires_at != 0;
         const now = self.cached_now_ms;
+        const is_inline = value.len <= KVStore.INLINE_BUF_SIZE;
+
         const result = s.map.getPtr(key);
         if (result) |existing| {
-            self.allocator.free(existing.value);
-            existing.value = owned_value;
+            _ = existing.seq.fetchAdd(1, .release);
+            if (is_inline) {
+                @memcpy(existing.inline_buf[0..value.len], value);
+                existing.inline_len = @intCast(value.len);
+                existing.value = existing.inline_buf[0..value.len];
+                existing.flags = .{ .has_ttl = has_ttl, .is_inline = true };
+            } else {
+                if (!existing.flags.is_inline and existing.value.len > 0)
+                    self.allocator.free(existing.value);
+                existing.value = try self.allocator.dupe(u8, value);
+                existing.flags = .{ .has_ttl = has_ttl };
+            }
             existing.expires_at = expires_at;
             existing.last_access = now;
-            existing.flags = .{ .has_ttl = has_ttl };
+            existing.flags.is_integer = false;
+            _ = existing.seq.fetchAdd(1, .release);
         } else {
             const owned_key = try self.allocator.dupe(u8, key);
             errdefer self.allocator.free(owned_key);
-            try s.map.put(owned_key, .{
-                .value = owned_value,
+            var new_entry = Entry{
                 .expires_at = expires_at,
                 .last_access = now,
                 .flags = .{ .has_ttl = has_ttl },
-            });
+                .value = undefined,
+            };
+            if (is_inline) {
+                @memcpy(new_entry.inline_buf[0..value.len], value);
+                new_entry.inline_len = @intCast(value.len);
+                new_entry.value = new_entry.inline_buf[0..value.len];
+                new_entry.flags.is_inline = true;
+            } else {
+                new_entry.value = try self.allocator.dupe(u8, value);
+            }
+            try s.map.put(owned_key, new_entry);
         }
     }
 

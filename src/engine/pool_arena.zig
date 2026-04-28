@@ -308,6 +308,40 @@ pub const PoolArena = struct {
         retired_arenas: u32,
         free_list_blocks: u32,
     };
+
+    /// Returns a std.mem.Allocator backed by this pool arena.
+    /// 8-byte header before each allocation stores block_size for free().
+    pub fn allocator(self: *Self) Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &vtable,
+        };
+    }
+
+    const HEADER_SIZE_ALLOC = 8;
+
+    const vtable = Allocator.VTable{
+        .alloc = poolAlloc,
+        .resize = Allocator.noResize,
+        .free = poolFree,
+        .remap = Allocator.noRemap,
+    };
+
+    fn poolAlloc(ctx: *anyopaque, len: usize, _: std.mem.Alignment, _: usize) ?[*]u8 {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        const total = len + HEADER_SIZE_ALLOC;
+        const a = self.alloc(total) catch return null;
+        const header: *align(1) u32 = @ptrCast(a.buf.ptr);
+        header.* = a.block_size;
+        return a.buf.ptr + HEADER_SIZE_ALLOC;
+    }
+
+    fn poolFree(ctx: *anyopaque, buf: []u8, _: std.mem.Alignment, _: usize) void {
+        const self: *Self = @ptrCast(@alignCast(ctx));
+        const real_ptr = buf.ptr - HEADER_SIZE_ALLOC;
+        const header: *align(1) const u32 = @ptrCast(real_ptr);
+        self.release(real_ptr, header.*);
+    }
 };
 
 // ─── Tests ────────────────────────────────────────────────────────────

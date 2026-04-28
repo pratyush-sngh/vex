@@ -306,11 +306,15 @@ const Connection = struct {
 
 // ─── Worker ──────────────────────────────────────────────────────────
 
+const PoolArena = @import("../engine/pool_arena.zig").PoolArena;
+
 pub const Worker = struct {
     id: u16,
     loop: EventLoop,
     conns: std.AutoHashMap(i32, *Connection),
     allocator: Allocator,
+    pool: ?*PoolArena,
+    pool_alloc: ?Allocator, // pool arena as std.mem.Allocator
     io: std.Io,
     kv: *KVStore,
     kv_mutex: *std.atomic.Mutex,
@@ -372,6 +376,8 @@ pub const Worker = struct {
             .loop = try EventLoop.init(),
             .conns = std.AutoHashMap(i32, *Connection).init(allocator),
             .allocator = allocator,
+            .pool = null,
+            .pool_alloc = null,
             .io = io,
             .kv = kv,
             .kv_mutex = kv_mutex,
@@ -456,6 +462,11 @@ pub const Worker = struct {
     /// Stripe affinity: after processing a data-store command, check if this
     /// connection should migrate to the worker that owns the stripe.
     /// Processes current command normally (with lock), migration happens after flush.
+    /// Fast allocator: uses pool arena if available, falls back to system.
+    inline fn fastAlloc(self: *Worker) Allocator {
+        return self.pool_alloc orelse self.allocator;
+    }
+
     fn handleRepl(self: *Worker, conn: *Connection, args: []const []const u8) bool {
         if (args.len < 2 or !std.mem.eql(u8, args[0], "_REPL")) return false;
         const real_args = args[1..];
@@ -1583,22 +1594,8 @@ pub const Worker = struct {
                         }
                     }
 
-                    // Fallback: new key or large value — use write lock
-                    const key_copy = self.allocator.dupe(u8, ns_key) catch return false;
-                    const KVS2 = @import("../engine/kv.zig").KVStore;
-                    if (value.len <= KVS2.INLINE_BUF_SIZE) {
-                        // Inline: no value allocation needed — copy directly from args
-                        const stale = ckv.setInline(ns_key, key_copy, value, expires);
-                        if (stale.stale_key) |k| self.allocator.free(k);
-                    } else {
-                        const val_copy = self.allocator.dupe(u8, value) catch {
-                            self.allocator.free(key_copy);
-                            return false;
-                        };
-                        const stale = ckv.setPrealloc(ns_key, key_copy, val_copy, expires);
-                        if (stale.stale_val) |v| self.allocator.free(v);
-                        if (stale.stale_key) |k| self.allocator.free(k);
-                    }
+                    // CKV allocates internally — no ownership transfer
+                    ckv.setInternal(ns_key, value, expires) catch return false;
                     if (self.aof) |a| a.logCommand(args);
                     self.bumpWatchVersion(conn.selected_db, args[1]);
                     conn.write_buf.appendSlice(ct.resp_ok) catch {};
@@ -1685,7 +1682,6 @@ pub const Worker = struct {
                         if (self.hash_store) |hs| {
                             const ns = nsKey(conn.selected_db, args[1]) orelse return false;
                             const dsl = self.ds_locks orelse return false;
-                            // Pre-alloc field+value pairs OUTSIDE the lock
                             const fv = args[2..];
                             var owned_buf: [32][]u8 = undefined;
                             if (fv.len > owned_buf.len) return false;
@@ -1772,7 +1768,6 @@ pub const Worker = struct {
                     if (self.set_store) |ss| {
                         const ns = nsKey(conn.selected_db, args[1]) orelse return false;
                         const dsl = self.ds_locks orelse return false;
-                        // Pre-alloc members OUTSIDE the lock
                         const members = args[2..];
                         var owned_buf: [16][]u8 = undefined;
                         if (members.len > owned_buf.len) return false;
