@@ -773,6 +773,321 @@ fn reconstructWeightedPath(
     return PathResult{ .nodes = try path.toOwnedSlice(), .total_weight = total };
 }
 
+// ─── Impact Analysis ─────────────────────────────────────────────────
+
+pub const ImpactOptions = struct {
+    max_depth: u32 = 10,
+    edge_type_filters: ?[]const []const u8 = null,
+    node_type_filters: ?[]const []const u8 = null,
+};
+
+pub const ImpactResult = struct {
+    type_name: []const u8,
+    count: u32,
+};
+
+/// BFS downstream impact analysis: count affected nodes grouped by type.
+pub fn impact(
+    g: *const GraphEngine,
+    allocator: Allocator,
+    start_key: []const u8,
+    opts: ImpactOptions,
+) ![]ImpactResult {
+    const start_id = g.resolveKey(start_key) orelse return error.NodeNotFound;
+    const node_cap = g.node_keys.items.len;
+
+    var visited = try std.DynamicBitSet.initEmpty(allocator, node_cap);
+    defer visited.deinit();
+    var frontier_a = try std.DynamicBitSet.initEmpty(allocator, node_cap);
+    defer frontier_a.deinit();
+    var frontier_b = try std.DynamicBitSet.initEmpty(allocator, node_cap);
+    defer frontier_b.deinit();
+
+    // Resolve edge type filters to bitmask
+    var edge_type_mask: TypeMask = 0;
+    if (opts.edge_type_filters) |filters| {
+        for (filters) |f| {
+            if (g.type_intern.find(f)) |id| edge_type_mask |= StringIntern.mask(id);
+        }
+        if (edge_type_mask == 0) {
+            const empty = try allocator.alloc(ImpactResult, 0);
+            return empty;
+        }
+    }
+
+    // Resolve node type filters
+    var node_type_set: u64 = 0;
+    var has_node_filter = false;
+    if (opts.node_type_filters) |filters| {
+        has_node_filter = true;
+        for (filters) |f| {
+            if (g.type_intern.find(f)) |id| {
+                if (id < 64) node_type_set |= @as(u64, 1) << @intCast(id);
+            }
+        }
+    }
+
+    visited.set(start_id);
+    frontier_a.set(start_id);
+
+    const csrs = getCSRSlice(g, .outgoing);
+    const all_alive = g.all_base_edges_alive;
+    const has_delta = g.delta_edges.items.len > 0;
+
+    // Count by type_id (max 64 interned types)
+    var counts: [64]u32 = [_]u32{0} ** 64;
+    var total: u32 = 0;
+
+    var current = &frontier_a;
+    var next = &frontier_b;
+    var depth: u32 = 0;
+
+    while (depth < opts.max_depth) {
+        next.setRangeValue(.{ .start = 0, .end = node_cap }, false);
+        var any_in_next = false;
+
+        var iter = current.iterator(.{});
+        while (iter.next()) |node_id_usize| {
+            const node_id: NodeId = @intCast(node_id_usize);
+
+            // Early exit: skip node if it has no outgoing edges of the filtered type
+            if (edge_type_mask != 0) {
+                if (g.node_out_type_mask.items[node_id] & edge_type_mask == 0) continue;
+            }
+
+            for (csrs) |csr| {
+                const targets = csr.neighbors(node_id);
+                if (targets.len == 0) continue;
+
+                if (all_alive and edge_type_mask == 0) {
+                    for (targets) |nid| {
+                        if (!g.node_alive.isSet(nid)) continue;
+                        if (visited.isSet(nid)) continue;
+                        visited.set(nid);
+                        next.set(nid);
+                        any_in_next = true;
+                        const ntid = g.node_type_id.items[nid];
+                        if (!has_node_filter or (ntid < 64 and (node_type_set & (@as(u64, 1) << @intCast(ntid))) != 0)) {
+                            counts[ntid] += 1;
+                            total += 1;
+                        }
+                    }
+                } else {
+                    const edge_indices = csr.edgeIndices(node_id);
+                    for (targets, edge_indices) |nid, eidx| {
+                        if (!g.edge_alive.isSet(eidx)) continue;
+                        if (!g.node_alive.isSet(nid)) continue;
+                        if (visited.isSet(nid)) continue;
+                        if (edge_type_mask != 0) {
+                            const emask = StringIntern.mask(g.edge_type_id.items[eidx]);
+                            if (edge_type_mask & emask == 0) continue;
+                        }
+                        visited.set(nid);
+                        next.set(nid);
+                        any_in_next = true;
+                        const ntid = g.node_type_id.items[nid];
+                        if (!has_node_filter or (ntid < 64 and (node_type_set & (@as(u64, 1) << @intCast(ntid))) != 0)) {
+                            counts[ntid] += 1;
+                            total += 1;
+                        }
+                    }
+                }
+            }
+
+            if (has_delta) {
+                for (g.delta_edges.items) |de| {
+                    if (de.from != node_id) continue;
+                    if (!g.edge_alive.isSet(de.eidx)) continue;
+                    const nid = de.to;
+                    if (!g.node_alive.isSet(nid)) continue;
+                    if (visited.isSet(nid)) continue;
+                    if (edge_type_mask != 0) {
+                        const emask = StringIntern.mask(g.edge_type_id.items[de.eidx]);
+                        if (edge_type_mask & emask == 0) continue;
+                    }
+                    visited.set(nid);
+                    next.set(nid);
+                    any_in_next = true;
+                    const ntid = g.node_type_id.items[nid];
+                    if (!has_node_filter or (ntid < 64 and (node_type_set & (@as(u64, 1) << @intCast(ntid))) != 0)) {
+                        counts[ntid] += 1;
+                        total += 1;
+                    }
+                }
+            }
+        }
+
+        if (!any_in_next) break;
+        depth += 1;
+        const tmp = current;
+        current = next;
+        next = tmp;
+    }
+
+    // Build result array
+    var result = std.array_list.Managed(ImpactResult).init(allocator);
+    errdefer result.deinit();
+
+    // First entry is always "total"
+    try result.append(.{ .type_name = "total", .count = total });
+
+    const type_count = g.type_intern.count();
+    for (0..type_count) |ti| {
+        if (counts[ti] > 0) {
+            try result.append(.{ .type_name = g.type_intern.resolve(@intCast(ti)), .count = counts[ti] });
+        }
+    }
+
+    return result.toOwnedSlice();
+}
+
+// ─── Find Paths ──────────────────────────────────────────────────────
+
+pub const FindPathsOptions = struct {
+    max_depth: u32 = 10,
+    limit: u32 = 100,
+    edge_type_filters: ?[]const []const u8 = null,
+};
+
+/// DFS to find all paths from start to any node whose type matches target_type.
+/// Returns array of paths, each path is a slice of NodeIds.
+pub fn findPaths(
+    g: *const GraphEngine,
+    allocator: Allocator,
+    start_key: []const u8,
+    target_type: []const u8,
+    opts: FindPathsOptions,
+) ![][]NodeId {
+    const start_id = g.resolveKey(start_key) orelse return error.NodeNotFound;
+    const target_type_id = g.type_intern.find(target_type) orelse {
+        const empty = try allocator.alloc([]NodeId, 0);
+        return empty;
+    };
+
+    var edge_type_mask: TypeMask = 0;
+    if (opts.edge_type_filters) |filters| {
+        for (filters) |f| {
+            if (g.type_intern.find(f)) |id| edge_type_mask |= StringIntern.mask(id);
+        }
+        if (edge_type_mask == 0) {
+            const empty = try allocator.alloc([]NodeId, 0);
+            return empty;
+        }
+    }
+
+    var results = std.array_list.Managed([]NodeId).init(allocator);
+    errdefer {
+        for (results.items) |p| allocator.free(p);
+        results.deinit();
+    }
+
+    // DFS stack: (node_id, depth)
+    const StackEntry = struct { node_id: NodeId, depth: u32 };
+    var stack = std.array_list.Managed(StackEntry).init(allocator);
+    defer stack.deinit();
+
+    // Path tracking: current path from start
+    var path = std.array_list.Managed(NodeId).init(allocator);
+    defer path.deinit();
+
+    // On-path set to avoid cycles within a single path
+    const node_cap = g.node_keys.items.len;
+    var on_path = try std.DynamicBitSet.initEmpty(allocator, node_cap);
+    defer on_path.deinit();
+
+    try stack.append(.{ .node_id = start_id, .depth = 0 });
+
+    const csrs = getCSRSlice(g, .outgoing);
+    const all_alive = g.all_base_edges_alive;
+    const has_delta = g.delta_edges.items.len > 0;
+
+    var child_buf = std.array_list.Managed(NodeId).init(allocator);
+    defer child_buf.deinit();
+
+    while (stack.items.len > 0) {
+        const entry = stack.pop().?;
+
+        // Trim path back to this depth
+        while (path.items.len > entry.depth) {
+            const removed = path.pop().?;
+            on_path.unset(removed);
+        }
+        try path.append(entry.node_id);
+        on_path.set(entry.node_id);
+
+        // Check if we reached target type (not start node)
+        if (entry.node_id != start_id and g.node_type_id.items[entry.node_id] == target_type_id) {
+            const found_path = try allocator.dupe(NodeId, path.items);
+            try results.append(found_path);
+            if (results.items.len >= opts.limit) break;
+            _ = path.pop().?;
+            on_path.unset(entry.node_id);
+            continue;
+        }
+
+        if (entry.depth >= opts.max_depth) {
+            _ = path.pop().?;
+            on_path.unset(entry.node_id);
+            continue;
+        }
+
+        // Expand neighbors (push in reverse so first neighbor is explored first)
+        child_buf.clearRetainingCapacity();
+
+        for (csrs) |csr| {
+            const targets = csr.neighbors(entry.node_id);
+            if (all_alive and edge_type_mask == 0) {
+                for (targets) |nid| {
+                    if (!g.node_alive.isSet(nid)) continue;
+                    if (on_path.isSet(nid)) continue;
+                    try child_buf.append(nid);
+                }
+            } else {
+                const edge_indices = csr.edgeIndices(entry.node_id);
+                for (targets, edge_indices) |nid, eidx| {
+                    if (!g.edge_alive.isSet(eidx)) continue;
+                    if (!g.node_alive.isSet(nid)) continue;
+                    if (on_path.isSet(nid)) continue;
+                    if (edge_type_mask != 0) {
+                        const emask = StringIntern.mask(g.edge_type_id.items[eidx]);
+                        if (edge_type_mask & emask == 0) continue;
+                    }
+                    try child_buf.append(nid);
+                }
+            }
+        }
+
+        if (has_delta) {
+            for (g.delta_edges.items) |de| {
+                if (de.from != entry.node_id) continue;
+                if (!g.edge_alive.isSet(de.eidx)) continue;
+                if (!g.node_alive.isSet(de.to)) continue;
+                if (on_path.isSet(de.to)) continue;
+                if (edge_type_mask != 0) {
+                    const emask = StringIntern.mask(g.edge_type_id.items[de.eidx]);
+                    if (edge_type_mask & emask == 0) continue;
+                }
+                try child_buf.append(de.to);
+            }
+        }
+
+        if (child_buf.items.len == 0) {
+            _ = path.pop().?;
+            on_path.unset(entry.node_id);
+            continue;
+        }
+
+        // Push children in reverse so first child is on top
+        var ci: usize = child_buf.items.len;
+        while (ci > 0) {
+            ci -= 1;
+            try stack.append(.{ .node_id = child_buf.items[ci], .depth = entry.depth + 1 });
+        }
+    }
+
+    return results.toOwnedSlice();
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────
 
 test "traverse BFS outgoing" {
@@ -920,4 +1235,81 @@ test "shortest path via delta" {
     var result = try shortestPath(&g, std.testing.allocator, "a", "b", 10);
     defer result.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 2), result.nodes.len);
+}
+
+test "impact analysis counts by type" {
+    var g = GraphEngine.init(std.testing.allocator);
+    defer g.deinit();
+
+    _ = try g.addNode("root", "service");
+    _ = try g.addNode("a", "service");
+    _ = try g.addNode("b", "database");
+    _ = try g.addNode("c", "service");
+    _ = try g.addEdge("root", "a", "depends_on", 1.0);
+    _ = try g.addEdge("root", "b", "depends_on", 1.0);
+    _ = try g.addEdge("a", "c", "depends_on", 1.0);
+    try g.compact();
+
+    const results = try impact(&g, std.testing.allocator, "root", .{});
+    defer std.testing.allocator.free(results);
+
+    // Should have "total" + type entries
+    try std.testing.expect(results.len >= 2);
+    try std.testing.expectEqualStrings("total", results[0].type_name);
+    try std.testing.expectEqual(@as(u32, 3), results[0].count);
+}
+
+test "impact with edge type filter" {
+    var g = GraphEngine.init(std.testing.allocator);
+    defer g.deinit();
+
+    _ = try g.addNode("root", "service");
+    _ = try g.addNode("a", "service");
+    _ = try g.addNode("b", "database");
+    _ = try g.addEdge("root", "a", "depends_on", 1.0);
+    _ = try g.addEdge("root", "b", "owns", 1.0);
+    try g.compact();
+
+    const filters = [_][]const u8{"depends_on"};
+    const results = try impact(&g, std.testing.allocator, "root", .{ .edge_type_filters = &filters });
+    defer std.testing.allocator.free(results);
+
+    try std.testing.expectEqualStrings("total", results[0].type_name);
+    try std.testing.expectEqual(@as(u32, 1), results[0].count);
+}
+
+test "findPaths finds paths to target type" {
+    var g = GraphEngine.init(std.testing.allocator);
+    defer g.deinit();
+
+    _ = try g.addNode("start", "service");
+    _ = try g.addNode("mid", "service");
+    _ = try g.addNode("end", "deployment");
+    _ = try g.addEdge("start", "mid", "depends_on", 1.0);
+    _ = try g.addEdge("mid", "end", "deploys_to", 1.0);
+    try g.compact();
+
+    const paths = try findPaths(&g, std.testing.allocator, "start", "deployment", .{});
+    defer {
+        for (paths) |p| std.testing.allocator.free(p);
+        std.testing.allocator.free(paths);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), paths.len);
+    try std.testing.expectEqual(@as(usize, 3), paths[0].len);
+}
+
+test "findPaths no match returns empty" {
+    var g = GraphEngine.init(std.testing.allocator);
+    defer g.deinit();
+
+    _ = try g.addNode("a", "service");
+    _ = try g.addNode("b", "service");
+    _ = try g.addEdge("a", "b", "link", 1.0);
+    try g.compact();
+
+    const paths = try findPaths(&g, std.testing.allocator, "a", "nonexistent", .{});
+    defer std.testing.allocator.free(paths);
+
+    try std.testing.expectEqual(@as(usize, 0), paths.len);
 }
