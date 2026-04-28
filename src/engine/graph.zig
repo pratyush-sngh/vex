@@ -362,26 +362,29 @@ pub const GraphEngine = struct {
 
     /// Create node if it doesn't exist, return existing ID if it does.
     pub fn upsertNode(self: *GraphEngine, key: []const u8, node_type: []const u8) !NodeId {
-        if (self.key_to_id.get(key)) |id| {
-            if (self.node_alive.isSet(id)) return id;
-        }
+        if (self.resolveKey(key)) |id| return id;
         return self.addNode(key, node_type);
     }
 
     /// Find an existing live edge matching (from_key, to_key, edge_type).
+    /// Uses CSR outgoing adjacency + delta scan (O(degree) instead of O(E)).
     pub fn findEdge(self: *const GraphEngine, from_key: []const u8, to_key: []const u8, edge_type: []const u8) ?EdgeId {
         const from_id = self.resolveKey(from_key) orelse return null;
         const to_id = self.resolveKey(to_key) orelse return null;
         const type_id = self.type_intern.find(edge_type) orelse return null;
 
-        for (0..self.edge_from.items.len) |eidx| {
-            if (!self.edge_alive.isSet(eidx)) continue;
-            if (self.edge_from.items[eidx] == from_id and
-                self.edge_to.items[eidx] == to_id and
-                self.edge_type_id.items[eidx] == type_id)
-            {
+        // Check base CSR outgoing edges
+        const targets = self.base_out.neighbors(from_id);
+        const eidxs = self.base_out.edgeIndices(from_id);
+        for (targets, eidxs) |nid, eidx| {
+            if (nid == to_id and self.edge_alive.isSet(eidx) and self.edge_type_id.items[eidx] == type_id)
                 return @intCast(eidx);
-            }
+        }
+        // Check delta edges
+        for (self.delta_edges.items) |de| {
+            if (de.from == from_id and self.edge_to.items[de.eidx] == to_id and
+                self.edge_alive.isSet(de.eidx) and self.edge_type_id.items[de.eidx] == type_id)
+                return @intCast(de.eidx);
         }
         return null;
     }

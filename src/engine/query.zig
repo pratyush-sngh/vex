@@ -853,29 +853,39 @@ pub fn impact(
             for (csrs) |csr| {
                 const targets = csr.neighbors(node_id);
                 if (targets.len == 0) continue;
-                const edge_indices = if (!all_alive or edge_type_mask != 0) csr.edgeIndices(node_id) else &.{};
 
-                for (targets, 0..) |nid, ti| {
-                    if (!g.node_alive.isSet(nid)) continue;
-                    if (visited.isSet(nid)) continue;
-                    if (!all_alive or edge_type_mask != 0) {
-                        if (ti >= edge_indices.len) continue;
-                        const eidx = edge_indices[ti];
+                if (all_alive and edge_type_mask == 0) {
+                    for (targets) |nid| {
+                        if (!g.node_alive.isSet(nid)) continue;
+                        if (visited.isSet(nid)) continue;
+                        visited.set(nid);
+                        next.set(nid);
+                        any_in_next = true;
+                        const ntid = g.node_type_id.items[nid];
+                        if (!has_node_filter or (ntid < 64 and (node_type_set & (@as(u64, 1) << @intCast(ntid))) != 0)) {
+                            counts[ntid] += 1;
+                            total += 1;
+                        }
+                    }
+                } else {
+                    const edge_indices = csr.edgeIndices(node_id);
+                    for (targets, edge_indices) |nid, eidx| {
                         if (!g.edge_alive.isSet(eidx)) continue;
+                        if (!g.node_alive.isSet(nid)) continue;
+                        if (visited.isSet(nid)) continue;
                         if (edge_type_mask != 0) {
                             const emask = StringIntern.mask(g.edge_type_id.items[eidx]);
                             if (edge_type_mask & emask == 0) continue;
                         }
+                        visited.set(nid);
+                        next.set(nid);
+                        any_in_next = true;
+                        const ntid = g.node_type_id.items[nid];
+                        if (!has_node_filter or (ntid < 64 and (node_type_set & (@as(u64, 1) << @intCast(ntid))) != 0)) {
+                            counts[ntid] += 1;
+                            total += 1;
+                        }
                     }
-                    const ntid = g.node_type_id.items[nid];
-                    if (has_node_filter) {
-                        if (ntid >= 64 or (node_type_set & (@as(u64, 1) << @intCast(ntid))) == 0) continue;
-                    }
-                    visited.set(nid);
-                    next.set(nid);
-                    any_in_next = true;
-                    counts[ntid] += 1;
-                    total += 1;
                 }
             }
 
@@ -890,15 +900,14 @@ pub fn impact(
                         const emask = StringIntern.mask(g.edge_type_id.items[de.eidx]);
                         if (edge_type_mask & emask == 0) continue;
                     }
-                    const ntid = g.node_type_id.items[nid];
-                    if (has_node_filter) {
-                        if (ntid >= 64 or (node_type_set & (@as(u64, 1) << @intCast(ntid))) == 0) continue;
-                    }
                     visited.set(nid);
                     next.set(nid);
                     any_in_next = true;
-                    counts[ntid] += 1;
-                    total += 1;
+                    const ntid = g.node_type_id.items[nid];
+                    if (!has_node_filter or (ntid < 64 and (node_type_set & (@as(u64, 1) << @intCast(ntid))) != 0)) {
+                        counts[ntid] += 1;
+                        total += 1;
+                    }
                 }
             }
         }
@@ -984,7 +993,11 @@ pub fn findPaths(
     try stack.append(.{ .node_id = start_id, .depth = 0 });
 
     const csrs = getCSRSlice(g, .outgoing);
+    const all_alive = g.all_base_edges_alive;
     const has_delta = g.delta_edges.items.len > 0;
+
+    var child_buf = std.array_list.Managed(NodeId).init(allocator);
+    defer child_buf.deinit();
 
     while (stack.items.len > 0) {
         const entry = stack.pop().?;
@@ -1014,21 +1027,28 @@ pub fn findPaths(
         }
 
         // Expand neighbors (push in reverse so first neighbor is explored first)
-        var child_buf = std.array_list.Managed(NodeId).init(allocator);
-        defer child_buf.deinit();
+        child_buf.clearRetainingCapacity();
 
         for (csrs) |csr| {
             const targets = csr.neighbors(entry.node_id);
-            const edge_indices = csr.edgeIndices(entry.node_id);
-            for (targets, edge_indices) |nid, eidx| {
-                if (!g.edge_alive.isSet(eidx)) continue;
-                if (!g.node_alive.isSet(nid)) continue;
-                if (on_path.isSet(nid)) continue;
-                if (edge_type_mask != 0) {
-                    const emask = StringIntern.mask(g.edge_type_id.items[eidx]);
-                    if (edge_type_mask & emask == 0) continue;
+            if (all_alive and edge_type_mask == 0) {
+                for (targets) |nid| {
+                    if (!g.node_alive.isSet(nid)) continue;
+                    if (on_path.isSet(nid)) continue;
+                    try child_buf.append(nid);
                 }
-                try child_buf.append(nid);
+            } else {
+                const edge_indices = csr.edgeIndices(entry.node_id);
+                for (targets, edge_indices) |nid, eidx| {
+                    if (!g.edge_alive.isSet(eidx)) continue;
+                    if (!g.node_alive.isSet(nid)) continue;
+                    if (on_path.isSet(nid)) continue;
+                    if (edge_type_mask != 0) {
+                        const emask = StringIntern.mask(g.edge_type_id.items[eidx]);
+                        if (edge_type_mask & emask == 0) continue;
+                    }
+                    try child_buf.append(nid);
+                }
             }
         }
 

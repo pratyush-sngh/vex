@@ -2236,15 +2236,8 @@ pub const CommandHandler = struct {
                     const nk = graphNamespacedKey(self, id_str.?) catch continue;
                     defer self.allocator.free(nk);
                     _ = self.graph.upsertNode(nk, type_str.?) catch continue;
-                    // Apply metadata
                     if (obj.get("metadata")) |meta_val| {
-                        if (meta_val == .object) {
-                            var meta_iter = meta_val.object.iterator();
-                            while (meta_iter.next()) |entry| {
-                                const val_str = if (entry.value_ptr.* == .string) entry.value_ptr.*.string else continue;
-                                self.graph.setNodeProperty(nk, entry.key_ptr.*, val_str) catch continue;
-                            }
-                        }
+                        if (meta_val == .object) self.applyNodeMetadataFromObject(nk, meta_val.object);
                     }
                 }
             }
@@ -2269,15 +2262,8 @@ pub const CommandHandler = struct {
                     _ = self.graph.upsertNode(to, "unknown") catch continue;
                     // Upsert edge
                     const eid = self.graph.findEdge(from, to, etype_str.?) orelse (self.graph.addEdge(from, to, etype_str.?, 1.0) catch continue);
-                    // Apply edge metadata
                     if (obj.get("metadata")) |meta_val| {
-                        if (meta_val == .object) {
-                            var meta_iter = meta_val.object.iterator();
-                            while (meta_iter.next()) |entry| {
-                                const val_str = if (entry.value_ptr.* == .string) entry.value_ptr.*.string else continue;
-                                self.graph.setEdgeProperty(eid, entry.key_ptr.*, val_str) catch continue;
-                            }
-                        }
+                        if (meta_val == .object) self.applyEdgeMetadataFromObject(eid, meta_val.object);
                     }
                 }
             }
@@ -2307,11 +2293,14 @@ pub const CommandHandler = struct {
         defer self.allocator.free(ids);
         try resp.serializeArrayHeader(w, ids.len);
         for (ids) |nid| {
+            try resp.serializeArrayHeader(w, 2);
             const node = self.graph.getNodeById(nid);
             if (node) |n| {
-                try resp.serializeArrayHeader(w, 2);
                 try resp.serializeBulkString(w, stripGraphDbPrefix(self, n.key) orelse n.key);
                 try resp.serializeBulkString(w, n.node_type);
+            } else {
+                try resp.serializeBulkString(w, null);
+                try resp.serializeBulkString(w, null);
             }
         }
     }
@@ -2427,27 +2416,35 @@ pub const CommandHandler = struct {
         }
     }
 
-    // ── JSON metadata helper ────────────────────────────────────────────
+    // ── JSON metadata helpers ───────────────────────────────────────────
 
     fn applyJsonMetadataToNode(self: *CommandHandler, key: []const u8, json_str: []const u8) !void {
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, json_str, .{}) catch return error.InvalidJSON;
         defer parsed.deinit();
         if (parsed.value != .object) return error.InvalidJSON;
-        var iter = parsed.value.object.iterator();
-        while (iter.next()) |entry| {
-            const val_str = if (entry.value_ptr.* == .string) entry.value_ptr.*.string else continue;
-            try self.graph.setNodeProperty(key, entry.key_ptr.*, val_str);
-        }
+        self.applyNodeMetadataFromObject(key, parsed.value.object);
     }
 
     fn applyJsonMetadataToEdge(self: *CommandHandler, eid: graph_mod.EdgeId, json_str: []const u8) !void {
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, json_str, .{}) catch return error.InvalidJSON;
         defer parsed.deinit();
         if (parsed.value != .object) return error.InvalidJSON;
-        var iter = parsed.value.object.iterator();
+        self.applyEdgeMetadataFromObject(eid, parsed.value.object);
+    }
+
+    fn applyNodeMetadataFromObject(self: *CommandHandler, key: []const u8, obj: std.json.ObjectMap) void {
+        var iter = obj.iterator();
         while (iter.next()) |entry| {
             const val_str = if (entry.value_ptr.* == .string) entry.value_ptr.*.string else continue;
-            try self.graph.setEdgeProperty(eid, entry.key_ptr.*, val_str);
+            self.graph.setNodeProperty(key, entry.key_ptr.*, val_str) catch continue;
+        }
+    }
+
+    fn applyEdgeMetadataFromObject(self: *CommandHandler, eid: graph_mod.EdgeId, obj: std.json.ObjectMap) void {
+        var iter = obj.iterator();
+        while (iter.next()) |entry| {
+            const val_str = if (entry.value_ptr.* == .string) entry.value_ptr.*.string else continue;
+            self.graph.setEdgeProperty(eid, entry.key_ptr.*, val_str) catch continue;
         }
     }
 
