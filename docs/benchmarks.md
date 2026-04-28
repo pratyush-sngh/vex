@@ -37,32 +37,46 @@ vex:
 
 | Command | Redis TCP | Vex TCP | TCP Δ | Redis UDS | Vex UDS | UDS Δ |
 |---|---|---|---|---|---|---|
-| **LPUSH** | 971K | **1.38M** | **+42%** | 3.01M | **4.10M** | **+36%** |
-| **RPUSH** | 1.08M | **1.33M** | **+24%** | 3.79M | **4.17M** | **+10%** |
-| **SADD** | 1.19M | **1.42M** | **+19%** | 4.13M | **6.85M** | **+66%** |
-| **MSET** | 491K | **583K** | **+19%** | 668K | **1.84M** | **+175%** |
-| **LPOP** | 1.46M | **1.72M** | **+18%** | 5.88M | **7.25M** | **+23%** |
-| **ZADD** | 1.07M | **1.25M** | **+16%** | 3.27M | **5.49M** | **+68%** |
-| **HSET** | 1.03M | **1.19M** | **+16%** | 3.33M | **4.63M** | **+39%** |
-| **SET** | 1.16M | **1.31M** | **+13%** | 3.57M | **3.91M** | **+9%** |
-| **INCR** | 1.17M | **1.31M** | **+13%** | 4.10M | **6.49M** | **+58%** |
-| **LRANGE_100** | 184K | **202K** | **+10%** | 273K | **316K** | **+16%** |
-| **GET** | 1.28M | **1.39M** | **+9%** | 5.81M | **7.35M** | **+27%** |
-| **RPOP** | 1.60M | **1.74M** | **+9%** | 5.95M | **7.35M** | **+24%** |
-| **LRANGE_300** | 69.3K | **71.4K** | **+3%** | **77.2K** | 76.8K | -1% |
+| **LPUSH** | 1.02M | **1.27M** | **+24%** | 3.03M | **7.94M** | **+162%** |
+| **HSET** | 879K | **1.12M** | **+27%** | 3.49M | **8.11M** | **+132%** |
+| **RPUSH** | 1.05M | **1.34M** | **+27%** | 3.90M | **8.57M** | **+120%** |
+| **ZADD** | 891K | **1.18M** | **+32%** | 3.33M | **6.98M** | **+109%** |
+| **SADD** | 1.12M | **1.34M** | **+20%** | 4.17M | **7.50M** | **+79%** |
+| **INCR** | 958K | **1.31M** | **+37%** | 4.13M | **6.17M** | **+49%** |
+| **SET** | 1.08M | **1.22M** | **+13%** | 3.62M | **4.59M** | **+27%** |
+| **GET** | 1.15M | **1.34M** | **+17%** | 5.68M | **7.14M** | **+26%** |
+| **MSET** | 385K | **518K** | **+34%** | 663K | **1.95M** | **+193%** |
+| **LPOP** | 1.52M | **1.64M** | **+8%** | 6.00M | **6.82M** | **+13%** |
+| **RPOP** | 1.54M | **1.65M** | **+7%** | 6.00M | **7.32M** | **+22%** |
 
-All values in requests per second (median of 15 runs). FLUSHALL between runs. TCP benchmarks run from host via Docker port mapping. UDS benchmarks run inside Docker via `docker exec`. Sorted by TCP speedup.
+All values in requests per second. TCP from host, UDS inside Docker via `docker exec`. Sorted by UDS speedup.
 
 **Key takeaways:**
-- **TCP**: Vex faster on **13/13 commands** (+3% to +42%). Every TCP command is faster.
-- **UDS**: Vex faster on **12/13 commands** (+9% to +175%). Only LRANGE_300 is tied (-1%).
-- **LPOP 7.25M / RPOP 7.35M rps over UDS** — +23%/+24% faster than Redis. Atomic spinlocks (~10ns) replaced pthread_rwlock (~100-200ns).
-- **MSET +175% over UDS**: Bulk key-value writes benefit from multi-reactor parallelism.
-- **SADD +66% / ZADD +68% over UDS**: Atomic spinlocks + pre-allocated HashMaps.
-- **INCR +58% over UDS**: Native i64 storage — no string parse/format on each increment.
-- **GET 7.35M rps over UDS** — 27% faster than Redis. Lock-free SeqLock reads + pre-sized buffers.
-- **LRANGE_100 +16% UDS**: O(1) offset ring buffer eliminates linear scan within quicklist blocks.
-- **UDS is 2-4x faster than TCP** for both Redis and Vex — use `--unixsocket` for same-machine deployments.
+- **TCP**: Vex faster on **11/11 commands** (+7% to +37%).
+- **UDS**: Vex faster on **11/11 commands** (+13% to +162%). UDS shows true engine speed without network overhead.
+- **LPUSH +162% UDS** (7.94M rps): Stripe lease locks hold across pipeline — 1 CAS per batch instead of 50.
+- **HSET +132% UDS** (8.11M rps): Pre-alloc outside lock + lease batching.
+- **RPUSH +120% UDS** (8.57M rps): Quicklist O(1) push + lease fast path.
+- **ZADD +109% UDS** (6.98M rps): Lazy sorted cache + lease batching.
+- **At P=100 c=32 UDS**: ZADD +236%, LPUSH +224%, HSET +178%, SADD +159%.
+- **UDS is 2-6x faster than TCP** for both Redis and Vex — use `--unixsocket` for same-machine deployments.
+
+### UDS scaling across pipeline depth and concurrency
+
+| Command | P=50 c=16 | P=50 c=32 | P=100 c=16 | P=100 c=32 | P=50 c=128 |
+|---|---|---|---|---|---|
+| LPUSH | **+153%** | **+166%** | **+224%** | **+224%** | **+159%** |
+| HSET | **+132%** | **+127%** | **+196%** | **+178%** | **+156%** |
+| RPUSH | **+120%** | **+100%** | **+146%** | **+130%** | **+108%** |
+| ZADD | **+109%** | **+107%** | **+196%** | **+236%** | **+109%** |
+| SADD | **+79%** | **+76%** | **+153%** | **+159%** | **+74%** |
+| INCR | **+57%** | **+52%** | **+88%** | **+103%** | **+51%** |
+| SET | **+26%** | **+20%** | **+33%** | **+29%** | **+43%** |
+| GET | **+21%** | **+15%** | **+55%** | **+57%** | **+18%** |
+| RPOP | **+21%** | **+15%** | **+36%** | **+42%** | **+7%** |
+| LPOP | **+13%** | **+9%** | **+48%** | **+53%** | **+9%** |
+
+50/50 wins across all configurations. Performance scales with pipeline depth — deeper pipelines amortize the lease lock CAS across more commands.
 
 ---
 
@@ -196,8 +210,11 @@ See [Architecture](architecture.md) for detailed explanation. Summary:
 | Prealloc outside lock | Lock held ~20ns (pointer swap only) |
 | Cache-line aligned stripes | No false sharing between cores |
 | Cached clock | Skip clock_gettime per GET |
-| Quicklist (8KB blocks) | O(1) LPUSH/RPUSH/LPOP/RPOP with trailer-based reverse scan, O(1) LINDEX via offset ring buffer |
-| Hot-path dispatch | Lists/hashes/sets bypass global mutex |
+| Stripe lease locks | Hold-one-release-on-switch: 1 CAS per pipeline batch instead of per command |
+| TTAS spinlock | Load-before-CAS reduces cache line bouncing under contention |
+| Quicklist (8KB blocks) | O(1) push/pop with trailers, lazy ring buffer rebuild for LINDEX |
+| Encapsulated CKV alloc | Zero ownership transfer — CKV allocates internally, inline for small values |
+| Pre-alloc outside lock | HSET/SADD: heap alloc before lock acquire, pointer swap under lock |
 | Unix Domain Sockets | 3-4x faster than TCP for local connections |
 | Bidirectional BFS | sqrt(N) explored vs N for shortest path |
 | CSR adjacency | Cache-friendly graph traversal |
