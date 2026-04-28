@@ -507,21 +507,26 @@ pub const ConcurrentKV = struct {
         } else {
             const owned_key = try alloc.dupe(u8, key);
             errdefer alloc.free(owned_key);
-            var new_entry = Entry{
+            const gop = try s.map.getOrPut(owned_key);
+            if (!gop.found_existing) {
+                gop.key_ptr.* = owned_key;
+            } else {
+                alloc.free(owned_key);
+            }
+            gop.value_ptr.* = .{
                 .expires_at = expires_at,
                 .last_access = now,
                 .flags = .{ .has_ttl = has_ttl },
                 .value = undefined,
             };
             if (is_inline) {
-                @memcpy(new_entry.inline_buf[0..value.len], value);
-                new_entry.inline_len = @intCast(value.len);
-                new_entry.value = new_entry.inline_buf[0..value.len];
-                new_entry.flags.is_inline = true;
+                @memcpy(gop.value_ptr.inline_buf[0..value.len], value);
+                gop.value_ptr.inline_len = @intCast(value.len);
+                gop.value_ptr.value = gop.value_ptr.inline_buf[0..value.len];
+                gop.value_ptr.flags.is_inline = true;
             } else {
-                new_entry.value = try alloc.dupe(u8, value);
+                gop.value_ptr.value = try alloc.dupe(u8, value);
             }
-            try s.map.put(owned_key, new_entry);
         }
     }
 
