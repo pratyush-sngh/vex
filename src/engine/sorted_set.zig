@@ -85,11 +85,7 @@ pub const SortedSetStore = struct {
     }
 
     pub fn deinit(self: *SortedSetStore) void {
-        var it = self.zsets.iterator();
-        while (it.next()) |entry| {
-            entry.value_ptr.deinit();
-            self.allocator.free(entry.key_ptr.*);
-        }
+        self.flush();
         self.zsets.deinit();
     }
 
@@ -139,8 +135,7 @@ pub const SortedSetStore = struct {
     }
 
     /// ZRANK key member — 0-based rank (by ascending score). Returns null if not found.
-    pub fn zrank(self: *SortedSetStore, key: []const u8, member: []const u8, allocator: Allocator) !?usize {
-        _ = allocator;
+    pub fn zrank(self: *SortedSetStore, key: []const u8, member: []const u8) ?usize {
         const zs = self.zsets.getPtr(key) orelse return null;
         _ = zs.scores.get(member) orelse return null;
         const sorted = zs.ensureSorted() orelse return null;
@@ -287,11 +282,11 @@ test "ZRANK" {
     defer store.deinit();
 
     _ = try store.zadd("z", &[_][]const u8{ "30", "c", "10", "a", "20", "b" });
-    const rank_a = try store.zrank("z", "a", std.testing.allocator);
+    const rank_a = store.zrank("z", "a");
     try std.testing.expectEqual(@as(usize, 0), rank_a.?);
-    const rank_c = try store.zrank("z", "c", std.testing.allocator);
+    const rank_c = store.zrank("z", "c");
     try std.testing.expectEqual(@as(usize, 2), rank_c.?);
-    const rank_x = try store.zrank("z", "missing", std.testing.allocator);
+    const rank_x = store.zrank("z", "missing");
     try std.testing.expect(rank_x == null);
 }
 

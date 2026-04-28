@@ -592,11 +592,11 @@ fn parseArgs(init: std.process.Init) Config {
 fn printBanner(port: u16, kv_keys: usize, graph_nodes: usize, aof_replayed: u64) void {
     const banner =
         \\
-        \\   __   __  _____ __  __
-        \\   \ \ / / | ____|\ \/ /
-        \\    \ V /  |  _|   \  /
-        \\     | |   | |___  /  \
-        \\     |_|   |_____|/_/\_\
+        \\ __     __ _____  __  __
+        \\ \ \   / /| ____| \ \/ /
+        \\  \ \ / / |  _|    \  /
+        \\   \ V /  | |___   /  \
+        \\    \_/   |_____| /_/\_\
         \\
         \\   KV + Graph Database
         \\   Redis Protocol Compatible | v0.1.0
@@ -712,7 +712,6 @@ test {
     _ = @import("storage/aof.zig");
     _ = @import("perf/span.zig");
     _ = @import("engine/string_intern.zig");
-    _ = @import("engine/pool_arena.zig");
     _ = @import("engine/property_store.zig");
     _ = @import("command/comptime_dispatch.zig");
     _ = @import("server/tls.zig");
@@ -728,5 +727,4 @@ test {
     _ = @import("engine/vector_store.zig");
     _ = @import("engine/hnsw.zig");
     _ = @import("engine/rag.zig");
-    _ = @import("engine/lockfree_map.zig");
 }

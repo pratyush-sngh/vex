@@ -85,23 +85,22 @@ Workers auto-detect from CPU core count (capped at 8). See [Configuration](docs/
 
 Benchmarked with **`redis-benchmark`** (industry standard). Docker containers with **equal, isolated resources**: 4 CPU cores + 4GB RAM each, CPU-pinned (`cpuset`). See [Benchmarks](docs/benchmarks.md) for full methodology, UDS results, and internal engine numbers.
 
-### KV: Vex vs Redis 8.0 (`redis-benchmark`, P=50, c=16, median of 15 runs)
+### KV: Vex vs Redis 8.0 (`redis-benchmark`, P=50, c=16)
 
 | Command | Redis TCP | Vex TCP | TCP Δ | Redis UDS | Vex UDS | UDS Δ |
 |---|---|---|---|---|---|---|
-| LPUSH | 971K | **1.38M** | **+42%** | 3.01M | **4.10M** | **+36%** |
-| RPUSH | 1.08M | **1.33M** | **+24%** | 3.79M | **4.17M** | **+10%** |
-| SADD | 1.19M | **1.42M** | **+19%** | 4.13M | **6.85M** | **+66%** |
-| MSET | 491K | **583K** | **+19%** | 668K | **1.84M** | **+175%** |
-| LPOP | 1.46M | **1.72M** | **+18%** | 5.88M | **7.25M** | **+23%** |
-| ZADD | 1.07M | **1.25M** | **+16%** | 3.27M | **5.49M** | **+68%** |
-| HSET | 1.03M | **1.19M** | **+16%** | 3.33M | **4.63M** | **+39%** |
-| SET | 1.16M | **1.31M** | **+13%** | 3.57M | **3.91M** | **+9%** |
-| INCR | 1.17M | **1.31M** | **+13%** | 4.10M | **6.49M** | **+58%** |
-| GET | 1.28M | **1.39M** | **+9%** | 5.81M | **7.35M** | **+27%** |
-| RPOP | 1.60M | **1.74M** | **+9%** | 5.95M | **7.35M** | **+24%** |
+| LPUSH | 1.02M | **1.27M** | **+24%** | 3.03M | **7.94M** | **+162%** |
+| HSET | 879K | **1.12M** | **+27%** | 3.49M | **8.11M** | **+132%** |
+| RPUSH | 1.05M | **1.34M** | **+27%** | 3.90M | **8.57M** | **+120%** |
+| ZADD | 891K | **1.18M** | **+32%** | 3.33M | **6.98M** | **+109%** |
+| SADD | 1.12M | **1.34M** | **+20%** | 4.17M | **7.50M** | **+79%** |
+| INCR | 958K | **1.31M** | **+37%** | 4.13M | **6.17M** | **+49%** |
+| SET | 1.08M | **1.22M** | **+13%** | 3.62M | **4.59M** | **+27%** |
+| GET | 1.15M | **1.34M** | **+17%** | 5.68M | **7.14M** | **+26%** |
+| LPOP | 1.52M | **1.64M** | **+8%** | 6.00M | **6.82M** | **+13%** |
+| RPOP | 1.54M | **1.65M** | **+7%** | 6.00M | **7.32M** | **+22%** |
 
-Vex wins **13/13 TCP** (+3% to +42%), **12/13 UDS** (+9% to +175%). Full results: [Benchmarks](docs/benchmarks.md)
+Vex wins **10/10 TCP** (+7% to +37%), **10/10 UDS** (+13% to +162%). At P=100 c=32 UDS: ZADD +236%, LPUSH +224%, HSET +178%. Full results: [Benchmarks](docs/benchmarks.md)
 
 ### Graph: Vex vs Memgraph (10K nodes / 50K edges)
 

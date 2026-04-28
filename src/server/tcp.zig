@@ -997,7 +997,7 @@ pub const Server = struct {
         // Create ConcurrentKV and import existing data from the plain KVStore.
         const ConcurrentKV = @import("../engine/concurrent_kv.zig").ConcurrentKV;
         var ckv = ConcurrentKV.init(self.allocator, self.io);
-        ckv.initStripes(); // Must init AFTER ckv is at its final stack address (pthread_rwlock can't be moved)
+        ckv.initStripes();
         defer ckv.deinit();
         try ckv.importFrom(self.kv);
 
@@ -1159,12 +1159,16 @@ fn udsAcceptLoop(ctx: *UdsAcceptCtx) void {
     const path_len = @min(ctx.path.len, addr.path.len - 1);
     for (0..path_len) |i| addr.path[i] = @intCast(ctx.path[i]);
 
-    // Remove stale socket file
+    // Remove stale socket file before binding
     const path_z: [*:0]const u8 = @ptrCast(&addr.path);
     _ = std.c.unlink(path_z);
 
-    // Bind
-    if (std.c.bind(sock, @ptrCast(&addr), @sizeOf(std.c.sockaddr.un)) < 0) return;
+    // Bind — retry once after unlink
+    if (std.c.bind(sock, @ptrCast(&addr), @sizeOf(std.c.sockaddr.un)) < 0) {
+        // Second attempt: force remove and retry
+        _ = std.c.unlink(path_z);
+        if (std.c.bind(sock, @ptrCast(&addr), @sizeOf(std.c.sockaddr.un)) < 0) return;
+    }
 
     // chmod 777 so any user can connect
     const path_z_buf = @as([*:0]const u8, @ptrCast(&addr.path));

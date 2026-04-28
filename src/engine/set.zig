@@ -38,11 +38,7 @@ pub const SetStore = struct {
     }
 
     pub fn deinit(self: *SetStore) void {
-        var it = self.sets.iterator();
-        while (it.next()) |entry| {
-            entry.value_ptr.deinit();
-            self.allocator.free(entry.key_ptr.*);
-        }
+        self.flush();
         self.sets.deinit();
     }
 

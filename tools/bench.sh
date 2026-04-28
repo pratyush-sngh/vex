@@ -27,7 +27,6 @@ TESTS=(
     "ZADD"
     "MSET"
     "LRANGE_100"
-    "LRANGE_300"
 )
 
 echo "=== Vex vs Redis Benchmark (median of $RUNS runs) ==="

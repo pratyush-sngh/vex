@@ -24,15 +24,14 @@ pub const ListStore = struct {
 
         const Block = struct {
             data: [BLOCK_SIZE]u8,
-            head: usize, // first used byte (grows toward 0 on LPUSH)
-            tail: usize, // first free byte after last entry (grows toward BLOCK_SIZE on RPUSH)
+            head: usize,
+            tail: usize,
             entry_count: usize,
             prev: ?*Block,
             next: ?*Block,
-            // Ring buffer of byte offsets for O(1) random access within block.
-            // off_ring[off_start..off_start+entry_count] (mod MAX_ENTRIES) = entry offsets.
             off_ring: [MAX_ENTRIES]u16,
-            off_start: u16, // index of first logical entry in ring
+            off_start: u16,
+            ring_dirty: bool, // true = ring needs rebuild before LINDEX/LRANGE
         };
 
         first: ?*Block,
@@ -71,6 +70,7 @@ pub const ListStore = struct {
                 .next = null,
                 .off_ring = undefined,
                 .off_start = 0,
+                .ring_dirty = false,
             };
             return block;
         }
@@ -165,11 +165,9 @@ pub const ListStore = struct {
         fn popHeadFromBlock(self: *List, block: *Block) ?[]const u8 {
             if (block.head >= block.tail) return null;
             const vlen = std.mem.bytesAsValue(u16, block.data[block.head..][0..2]).*;
-            const start = block.head + HEADER_SIZE;
-            const val = block.data[start .. start + vlen];
+            const val = block.data[block.head + HEADER_SIZE ..][0 .. vlen];
             block.head += ENTRY_OVERHEAD + vlen;
-            // Advance ring buffer start
-            block.off_start = (block.off_start +% 1) % @as(u16, MAX_ENTRIES);
+            block.ring_dirty = true;
             block.entry_count -= 1;
             self.total_count -= 1;
             return val;
@@ -188,12 +186,10 @@ pub const ListStore = struct {
 
         fn popTailFromBlock(self: *List, block: *Block) ?[]const u8 {
             if (block.head >= block.tail) return null;
-            // O(1): read trailer to find last entry length, then step back
             const vlen = std.mem.bytesAsValue(u16, block.data[block.tail - TRAILER_SIZE ..][0..2]).*;
-            const entry_start = block.tail - ENTRY_OVERHEAD - vlen;
-            const val = block.data[entry_start + HEADER_SIZE ..][0..vlen];
-            block.tail = entry_start;
-            // Ring buffer tail shrinks automatically (entry_count decremented)
+            block.tail -= ENTRY_OVERHEAD + vlen;
+            const val = block.data[block.tail + HEADER_SIZE ..][0..vlen];
+            block.ring_dirty = true;
             block.entry_count -= 1;
             self.total_count -= 1;
             return val;
@@ -206,7 +202,7 @@ pub const ListStore = struct {
             var cur = self.first;
             while (cur) |block| {
                 if (remaining < block.entry_count) {
-                    // O(1) lookup via ring buffer
+                    if (block.ring_dirty) rebuildRing(block);
                     const ring_idx = (block.off_start +% @as(u16, @intCast(remaining))) % MAX_ENTRIES;
                     const pos = block.off_ring[ring_idx];
                     const vlen = std.mem.bytesAsValue(u16, block.data[pos..][0..2]).*;
@@ -216,6 +212,19 @@ pub const ListStore = struct {
                 cur = block.next;
             }
             return null;
+        }
+
+        fn rebuildRing(block: *Block) void {
+            var pos = block.head;
+            var i: usize = 0;
+            while (pos < block.tail and i < MAX_ENTRIES) {
+                block.off_ring[i] = @intCast(pos);
+                const vlen = std.mem.bytesAsValue(u16, block.data[pos..][0..2]).*;
+                pos += ENTRY_OVERHEAD + vlen;
+                i += 1;
+            }
+            block.off_start = 0;
+            block.ring_dirty = false;
         }
 
         fn removeBlock(self: *List, block: *Block) void {
@@ -246,12 +255,7 @@ pub const ListStore = struct {
     }
 
     pub fn deinit(self: *ListStore) void {
-        var it = self.lists.iterator();
-        while (it.next()) |entry| {
-            var list = entry.value_ptr.*;
-            list.deinit(self.allocator);
-            self.allocator.free(entry.key_ptr.*);
-        }
+        self.flush();
         self.lists.deinit();
     }
 
@@ -263,28 +267,14 @@ pub const ListStore = struct {
         return list.len();
     }
 
-    /// LPUSH with pre-allocated owned values. Same as lpush for flat buffer (just copies data).
-    pub fn lpushOwned(self: *ListStore, key: []const u8, owned: []const []u8) !usize {
-        const list = try self.getOrCreate(key);
-        for (owned) |val| try list.pushHead(val);
-        return list.len();
-    }
-
-    /// RPUSH key value [value ...] — append values, returns new length.
+/// RPUSH key value [value ...] — append values, returns new length.
     pub fn rpush(self: *ListStore, key: []const u8, values: []const []const u8) !usize {
         const list = try self.getOrCreate(key);
         for (values) |val| try list.pushTail(val);
         return list.len();
     }
 
-    /// RPUSH with pre-allocated owned values. Same as rpush for flat buffer.
-    pub fn rpushOwned(self: *ListStore, key: []const u8, owned: []const []u8) !usize {
-        const list = try self.getOrCreate(key);
-        for (owned) |val| try list.pushTail(val);
-        return list.len();
-    }
-
-    /// LPOP key — remove and return the first element. Returns slice into internal buffer.
+/// LPOP key — remove and return the first element. Returns slice into internal buffer.
     /// Caller must NOT free the returned slice (it's not heap-allocated).
     /// Note: empty lists are NOT auto-deleted — the returned slice points into block memory
     /// that would be freed by removeKey. Cleanup happens on next push/pop or DEL/FLUSHALL.
@@ -423,7 +413,7 @@ pub const ListStore = struct {
         return true;
     }
 
-    /// No-op for flat buffer lists. Values are slices into internal buffer, not heap-allocated.
+    /// No-op. Quicklist values are slices into block memory, not heap-allocated.
     pub fn freeVal(_: Allocator, _: []const u8) void {}
 
     fn getOrCreate(self: *ListStore, key: []const u8) !*List {
