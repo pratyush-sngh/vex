@@ -997,9 +997,16 @@ pub const Server = struct {
         // Create ConcurrentKV and import existing data from the plain KVStore.
         const ConcurrentKV = @import("../engine/concurrent_kv.zig").ConcurrentKV;
         var ckv = ConcurrentKV.init(self.allocator, self.io);
-        ckv.initStripes(); // Must init AFTER ckv is at its final stack address (pthread_rwlock can't be moved)
+        ckv.initStripes();
         defer ckv.deinit();
         try ckv.importFrom(self.kv);
+
+        // Pool arena for CKV — fast bump allocation for keys/values
+        const PA2 = @import("../engine/pool_arena.zig").PoolArena;
+        var ckv_pool = try PA2.init(self.allocator, .{ .enable_background_refill = true });
+        defer ckv_pool.deinit();
+        try ckv_pool.startRefiller();
+        ckv.setFastAllocator(ckv_pool.allocator());
 
         const PubSubRegistry = @import("worker.zig").PubSubRegistry;
         var pubsub = PubSubRegistry.init(self.allocator);

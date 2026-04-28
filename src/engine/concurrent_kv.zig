@@ -11,6 +11,7 @@ const STRIPE_MASK = STRIPE_COUNT - 1;
 pub const ConcurrentKV = struct {
     stripes: [STRIPE_COUNT]Stripe,
     allocator: Allocator,
+    fast_allocator: ?Allocator, // pool arena — used for key/value allocs when available
     io: std.Io,
     cached_now_ms: i64 = 0,
 
@@ -39,6 +40,7 @@ pub const ConcurrentKV = struct {
         var self: ConcurrentKV = .{
             .stripes = undefined,
             .allocator = allocator,
+            .fast_allocator = null,
             .io = io,
         };
         for (&self.stripes) |*s| {
@@ -351,22 +353,19 @@ pub const ConcurrentKV = struct {
     /// Lazy FLUSHALL: swap stripe maps to fresh empty ones, push old entries
     /// to garbage queue for async free. Returns instantly (~500ns for 256 stripes).
     pub fn flushdb(self: *ConcurrentKV) void {
-        // Collect garbage from each stripe under write lock (per-stripe, not global)
+        const alloc = self.kvAlloc();
         for (&self.stripes) |*s| {
             writeLockStripe(s);
-            // Swap the map with a fresh one. Old map's backing memory stays allocated
-            // until we free it, but the stripe is immediately usable.
             var old_map = s.map;
-            s.map = std.StringHashMap(Entry).init(self.allocator);
+            s.map = std.StringHashMap(Entry).init(alloc);
             s.map.ensureTotalCapacity(16384) catch {};
             writeUnlockStripe(s);
 
-            // Free old entries outside the lock — other workers can use the stripe now
             var iter = old_map.iterator();
             while (iter.next()) |entry| {
-                self.allocator.free(entry.key_ptr.*);
+                alloc.free(entry.key_ptr.*);
                 if (!entry.value_ptr.flags.is_inline and entry.value_ptr.value.len > 0) {
-                    self.allocator.free(entry.value_ptr.value);
+                    alloc.free(entry.value_ptr.value);
                 }
             }
             old_map.deinit();
@@ -442,18 +441,18 @@ pub const ConcurrentKV = struct {
             return new_val;
         }
 
-        // New key — create entry with native integer
-        const owned_key = self.allocator.dupe(u8, key) catch {
+        const alloc = self.kvAlloc();
+        const owned_key = alloc.dupe(u8, key) catch {
             writeUnlockStripe(s);
             return error.OutOfMemory;
         };
         s.map.put(owned_key, .{
-            .value = &[_]u8{}, // empty — GET will format from int_value
+            .value = &[_]u8{},
             .int_value = delta,
             .last_access = self.cached_now_ms,
             .flags = .{ .is_integer = true },
         }) catch {
-            self.allocator.free(owned_key);
+            alloc.free(owned_key);
             writeUnlockStripe(s);
             return error.OutOfMemory;
         };
@@ -476,10 +475,28 @@ pub const ConcurrentKV = struct {
         readUnlockStripe(s);
     }
 
+    /// Set the fast allocator (pool arena). Call after init, before use.
+    pub fn setFastAllocator(self: *ConcurrentKV, fa: Allocator) void {
+        self.fast_allocator = fa;
+        // Rebuild stripe maps with pool allocator
+        for (&self.stripes) |*s| {
+            if (s.map.count() == 0) {
+                s.map.deinit();
+                s.map = std.StringHashMap(Entry).init(fa);
+                s.map.ensureTotalCapacity(16384) catch {};
+            }
+        }
+    }
+
+    inline fn kvAlloc(self: *ConcurrentKV) Allocator {
+        return self.fast_allocator orelse self.allocator;
+    }
+
     // ── Internal helpers ──
 
     pub fn setInternal(self: *ConcurrentKV, key: []const u8, value: []const u8, expires_at: i64) !void {
         const s = self.getStripe(key);
+        const alloc = self.kvAlloc();
         writeLockStripe(s);
         defer writeUnlockStripe(s);
 
@@ -497,8 +514,8 @@ pub const ConcurrentKV = struct {
                 existing.flags = .{ .has_ttl = has_ttl, .is_inline = true };
             } else {
                 if (!existing.flags.is_inline and existing.value.len > 0)
-                    self.allocator.free(existing.value);
-                existing.value = try self.allocator.dupe(u8, value);
+                    alloc.free(existing.value);
+                existing.value = try alloc.dupe(u8, value);
                 existing.flags = .{ .has_ttl = has_ttl };
             }
             existing.expires_at = expires_at;
@@ -506,8 +523,8 @@ pub const ConcurrentKV = struct {
             existing.flags.is_integer = false;
             _ = existing.seq.fetchAdd(1, .release);
         } else {
-            const owned_key = try self.allocator.dupe(u8, key);
-            errdefer self.allocator.free(owned_key);
+            const owned_key = try alloc.dupe(u8, key);
+            errdefer alloc.free(owned_key);
             var new_entry = Entry{
                 .expires_at = expires_at,
                 .last_access = now,
@@ -520,7 +537,7 @@ pub const ConcurrentKV = struct {
                 new_entry.value = new_entry.inline_buf[0..value.len];
                 new_entry.flags.is_inline = true;
             } else {
-                new_entry.value = try self.allocator.dupe(u8, value);
+                new_entry.value = try alloc.dupe(u8, value);
             }
             try s.map.put(owned_key, new_entry);
         }
