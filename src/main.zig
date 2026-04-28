@@ -582,11 +582,11 @@ fn parseArgs(init: std.process.Init) Config {
 fn printBanner(port: u16, kv_keys: usize, graph_nodes: usize, aof_replayed: u64) void {
     const banner =
         \\
-        \\   __   __  _____ __  __
-        \\   \ \ / / | ____|\ \/ /
-        \\    \ V /  |  _|   \  /
-        \\     | |   | |___  /  \
-        \\     |_|   |_____|/_/\_\
+        \\ __     __ _____  __  __
+        \\ \ \   / /| ____| \ \/ /
+        \\  \ \ / / |  _|    \  /
+        \\   \ V /  | |___   /  \
+        \\    \_/   |_____| /_/\_\
         \\
         \\   KV + Graph Database
         \\   Redis Protocol Compatible | v0.1.0
