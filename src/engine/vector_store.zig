@@ -238,13 +238,48 @@ pub const VectorStore = struct {
         _ = std.c.mkdir(dir_z, 0o755);
 
         const field_count = self.field_intern.count();
+
+        // Save fields in parallel — each .vvf file is independent
+        const SaveCtx = struct {
+            vs: *VectorStore,
+            field_id: u16,
+            field_name: []const u8,
+            vec_dir: []const u8,
+            err: bool = false,
+
+            fn run(ctx: *@This()) void {
+                ctx.vs.saveField(ctx.field_id, ctx.field_name, ctx.vec_dir) catch {
+                    ctx.err = true;
+                };
+            }
+        };
+
+        var ctxs: [64]SaveCtx = undefined;
+        var threads: [64]?std.Thread = .{null} ** 64;
+        var thread_count: usize = 0;
+
         for (0..field_count) |fi| {
             const field_id: u16 = @intCast(fi);
             const mask = @as(u64, 1) << @intCast(field_id);
             if (self.field_dims_set & mask == 0) continue;
 
             const field_name = self.field_intern.resolve(field_id);
-            try self.saveField(field_id, field_name, vec_dir);
+
+            if (thread_count < ctxs.len) {
+                ctxs[thread_count] = .{ .vs = self, .field_id = field_id, .field_name = field_name, .vec_dir = vec_dir };
+                threads[thread_count] = std.Thread.spawn(.{}, SaveCtx.run, .{&ctxs[thread_count]}) catch {
+                    // Fallback: save inline
+                    self.saveField(field_id, field_name, vec_dir) catch continue;
+                    continue;
+                };
+                thread_count += 1;
+            } else {
+                self.saveField(field_id, field_name, vec_dir) catch continue;
+            }
+        }
+
+        for (threads[0..thread_count]) |t| {
+            if (t) |thread| thread.join();
         }
     }
 
