@@ -184,6 +184,49 @@ pub const ConcurrentKV = struct {
     /// ConcurrentKV takes ownership. Old value freed OUTSIDE the lock.
     /// On insert, owned_key is used. On update, owned_key is freed by caller
     /// (returned as stale_key).
+    /// SET for inline values — no value allocation needed. Copies directly from args buffer.
+    /// Only `owned_key` is heap-allocated (for new key insertion).
+    pub fn setInline(
+        self: *ConcurrentKV,
+        key: []const u8,
+        owned_key: []u8,
+        value: []const u8,
+        expires_at: i64,
+    ) struct { stale_key: ?[]const u8 } {
+        const s = self.getStripe(key);
+        writeLockStripe(s);
+
+        const has_ttl = expires_at != 0;
+        const result = s.map.getPtr(key);
+        if (result) |existing| {
+            _ = existing.seq.fetchAdd(1, .release);
+            @memcpy(existing.inline_buf[0..value.len], value);
+            existing.inline_len = @intCast(value.len);
+            existing.value = existing.inline_buf[0..value.len];
+            existing.flags = .{ .has_ttl = has_ttl, .is_inline = true };
+            existing.expires_at = expires_at;
+            existing.flags.is_integer = false;
+            _ = existing.seq.fetchAdd(1, .release);
+            writeUnlockStripe(s);
+            return .{ .stale_key = owned_key }; // key not needed for update
+        } else {
+            var new_entry = Entry{
+                .expires_at = expires_at,
+                .flags = .{ .has_ttl = has_ttl, .is_inline = true },
+                .value = undefined,
+            };
+            @memcpy(new_entry.inline_buf[0..value.len], value);
+            new_entry.inline_len = @intCast(value.len);
+            new_entry.value = new_entry.inline_buf[0..value.len];
+            s.map.put(owned_key, new_entry) catch {
+                writeUnlockStripe(s);
+                return .{ .stale_key = owned_key };
+            };
+            writeUnlockStripe(s);
+            return .{ .stale_key = null }; // key owned by map
+        }
+    }
+
     pub fn setPrealloc(
         self: *ConcurrentKV,
         key: []const u8,
@@ -303,22 +346,30 @@ pub const ConcurrentKV = struct {
         return self.setInternal(key, value, expires_at orelse 0);
     }
 
-    // ── Bulk operations (lock all stripes) ──
+    // ── Bulk operations ──
 
+    /// Lazy FLUSHALL: swap stripe maps to fresh empty ones, push old entries
+    /// to garbage queue for async free. Returns instantly (~500ns for 256 stripes).
     pub fn flushdb(self: *ConcurrentKV) void {
-        self.writeLockAll();
-        defer self.writeUnlockAll();
-
+        // Collect garbage from each stripe under write lock (per-stripe, not global)
         for (&self.stripes) |*s| {
-            var iter = s.map.iterator();
+            writeLockStripe(s);
+            // Swap the map with a fresh one. Old map's backing memory stays allocated
+            // until we free it, but the stripe is immediately usable.
+            var old_map = s.map;
+            s.map = std.StringHashMap(Entry).init(self.allocator);
+            s.map.ensureTotalCapacity(16384) catch {};
+            writeUnlockStripe(s);
+
+            // Free old entries outside the lock — other workers can use the stripe now
+            var iter = old_map.iterator();
             while (iter.next()) |entry| {
                 self.allocator.free(entry.key_ptr.*);
                 if (!entry.value_ptr.flags.is_inline and entry.value_ptr.value.len > 0) {
                     self.allocator.free(entry.value_ptr.value);
                 }
             }
-            // Retain capacity — preserves pre-allocated HashMap slots
-            s.map.clearRetainingCapacity();
+            old_map.deinit();
         }
     }
 

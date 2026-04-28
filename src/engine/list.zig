@@ -24,15 +24,14 @@ pub const ListStore = struct {
 
         const Block = struct {
             data: [BLOCK_SIZE]u8,
-            head: usize, // first used byte (grows toward 0 on LPUSH)
-            tail: usize, // first free byte after last entry (grows toward BLOCK_SIZE on RPUSH)
+            head: usize,
+            tail: usize,
             entry_count: usize,
             prev: ?*Block,
             next: ?*Block,
-            // Ring buffer of byte offsets for O(1) random access within block.
-            // off_ring[off_start..off_start+entry_count] (mod MAX_ENTRIES) = entry offsets.
             off_ring: [MAX_ENTRIES]u16,
-            off_start: u16, // index of first logical entry in ring
+            off_start: u16,
+            ring_dirty: bool, // true = ring needs rebuild before LINDEX/LRANGE
         };
 
         first: ?*Block,
@@ -71,6 +70,7 @@ pub const ListStore = struct {
                 .next = null,
                 .off_ring = undefined,
                 .off_start = 0,
+                .ring_dirty = false,
             };
             return block;
         }
@@ -165,11 +165,9 @@ pub const ListStore = struct {
         fn popHeadFromBlock(self: *List, block: *Block) ?[]const u8 {
             if (block.head >= block.tail) return null;
             const vlen = std.mem.bytesAsValue(u16, block.data[block.head..][0..2]).*;
-            const start = block.head + HEADER_SIZE;
-            const val = block.data[start .. start + vlen];
+            const val = block.data[block.head + HEADER_SIZE ..][0 .. vlen];
             block.head += ENTRY_OVERHEAD + vlen;
-            // Advance ring buffer start
-            block.off_start = (block.off_start +% 1) % @as(u16, MAX_ENTRIES);
+            block.ring_dirty = true;
             block.entry_count -= 1;
             self.total_count -= 1;
             return val;
@@ -188,12 +186,10 @@ pub const ListStore = struct {
 
         fn popTailFromBlock(self: *List, block: *Block) ?[]const u8 {
             if (block.head >= block.tail) return null;
-            // O(1): read trailer to find last entry length, then step back
             const vlen = std.mem.bytesAsValue(u16, block.data[block.tail - TRAILER_SIZE ..][0..2]).*;
-            const entry_start = block.tail - ENTRY_OVERHEAD - vlen;
-            const val = block.data[entry_start + HEADER_SIZE ..][0..vlen];
-            block.tail = entry_start;
-            // Ring buffer tail shrinks automatically (entry_count decremented)
+            block.tail -= ENTRY_OVERHEAD + vlen;
+            const val = block.data[block.tail + HEADER_SIZE ..][0..vlen];
+            block.ring_dirty = true;
             block.entry_count -= 1;
             self.total_count -= 1;
             return val;
@@ -206,7 +202,7 @@ pub const ListStore = struct {
             var cur = self.first;
             while (cur) |block| {
                 if (remaining < block.entry_count) {
-                    // O(1) lookup via ring buffer
+                    if (block.ring_dirty) rebuildRing(block);
                     const ring_idx = (block.off_start +% @as(u16, @intCast(remaining))) % MAX_ENTRIES;
                     const pos = block.off_ring[ring_idx];
                     const vlen = std.mem.bytesAsValue(u16, block.data[pos..][0..2]).*;
@@ -216,6 +212,19 @@ pub const ListStore = struct {
                 cur = block.next;
             }
             return null;
+        }
+
+        fn rebuildRing(block: *Block) void {
+            var pos = block.head;
+            var i: usize = 0;
+            while (pos < block.tail and i < MAX_ENTRIES) {
+                block.off_ring[i] = @intCast(pos);
+                const vlen = std.mem.bytesAsValue(u16, block.data[pos..][0..2]).*;
+                pos += ENTRY_OVERHEAD + vlen;
+                i += 1;
+            }
+            block.off_start = 0;
+            block.ring_dirty = false;
         }
 
         fn removeBlock(self: *List, block: *Block) void {

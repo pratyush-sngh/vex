@@ -1585,13 +1585,20 @@ pub const Worker = struct {
 
                     // Fallback: new key or large value — use write lock
                     const key_copy = self.allocator.dupe(u8, ns_key) catch return false;
-                    const val_copy = self.allocator.dupe(u8, value) catch {
-                        self.allocator.free(key_copy);
-                        return false;
-                    };
-                    const stale = ckv.setPrealloc(ns_key, key_copy, val_copy, expires);
-                    if (stale.stale_val) |v| self.allocator.free(v);
-                    if (stale.stale_key) |k| self.allocator.free(k);
+                    const KVS2 = @import("../engine/kv.zig").KVStore;
+                    if (value.len <= KVS2.INLINE_BUF_SIZE) {
+                        // Inline: no value allocation needed — copy directly from args
+                        const stale = ckv.setInline(ns_key, key_copy, value, expires);
+                        if (stale.stale_key) |k| self.allocator.free(k);
+                    } else {
+                        const val_copy = self.allocator.dupe(u8, value) catch {
+                            self.allocator.free(key_copy);
+                            return false;
+                        };
+                        const stale = ckv.setPrealloc(ns_key, key_copy, val_copy, expires);
+                        if (stale.stale_val) |v| self.allocator.free(v);
+                        if (stale.stale_key) |k| self.allocator.free(k);
+                    }
                     if (self.aof) |a| a.logCommand(args);
                     self.bumpWatchVersion(conn.selected_db, args[1]);
                     conn.write_buf.appendSlice(ct.resp_ok) catch {};
