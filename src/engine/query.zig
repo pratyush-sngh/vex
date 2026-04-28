@@ -850,6 +850,11 @@ pub fn impact(
         while (iter.next()) |node_id_usize| {
             const node_id: NodeId = @intCast(node_id_usize);
 
+            // Early exit: skip node if it has no outgoing edges of the filtered type
+            if (edge_type_mask != 0) {
+                if (g.node_out_type_mask.items[node_id] & edge_type_mask == 0) continue;
+            }
+
             for (csrs) |csr| {
                 const targets = csr.neighbors(node_id);
                 if (targets.len == 0) continue;

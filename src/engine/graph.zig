@@ -368,10 +368,15 @@ pub const GraphEngine = struct {
 
     /// Find an existing live edge matching (from_key, to_key, edge_type).
     /// Uses CSR outgoing adjacency + delta scan (O(degree) instead of O(E)).
+    /// Skips scan entirely if from_node's out-type-mask doesn't contain edge type.
     pub fn findEdge(self: *const GraphEngine, from_key: []const u8, to_key: []const u8, edge_type: []const u8) ?EdgeId {
         const from_id = self.resolveKey(from_key) orelse return null;
         const to_id = self.resolveKey(to_key) orelse return null;
         const type_id = self.type_intern.find(edge_type) orelse return null;
+
+        // Early exit: check if from_node has any outgoing edges of this type
+        const type_bit = StringIntern.mask(type_id);
+        if (self.node_out_type_mask.items[from_id] & type_bit == 0) return null;
 
         // Check base CSR outgoing edges
         const targets = self.base_out.neighbors(from_id);
@@ -390,6 +395,7 @@ pub const GraphEngine = struct {
     }
 
     /// List all live node IDs with the given type string.
+    /// Iterates node_alive bitset (skips 64 dead nodes per zero word).
     pub fn listByType(self: *const GraphEngine, node_type: []const u8, limit: u32) ![]NodeId {
         const type_id = self.type_intern.find(node_type) orelse {
             const empty = try self.allocator.alloc(NodeId, 0);
@@ -399,8 +405,8 @@ pub const GraphEngine = struct {
         var result = std.array_list.Managed(NodeId).init(self.allocator);
         errdefer result.deinit();
 
-        for (0..self.node_keys.items.len) |i| {
-            if (!self.node_alive.isSet(i)) continue;
+        var iter = self.node_alive.iterator(.{});
+        while (iter.next()) |i| {
             if (self.node_type_id.items[i] != type_id) continue;
             try result.append(@intCast(i));
             if (limit > 0 and result.items.len >= limit) break;
