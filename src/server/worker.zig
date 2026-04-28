@@ -19,6 +19,9 @@ const HashStore = @import("../engine/hash.zig").HashStore;
 const SetStore = @import("../engine/set.zig").SetStore;
 const SortedSetStore = @import("../engine/sorted_set.zig").SortedSetStore;
 
+const builtin = @import("builtin");
+const is_linux = builtin.os.tag == .linux;
+
 const READ_BUF_SIZE = 64 * 1024;
 const MAX_NEW_FDS = 256;
 
@@ -228,6 +231,10 @@ const Connection = struct {
     watched_keys: ?std.array_list.Managed(WatchEntry),
     /// Set to true if a watched key was modified (dirty flag)
     watch_dirty: bool,
+    /// io_uring recv/send state (only meaningful when worker.use_uring_io and ssl==null)
+    recv_pending: bool,
+    send_pending: bool,
+    recv_buf: [READ_BUF_SIZE]u8,
 
     const TxCommand = struct {
         args: [][]u8,
@@ -263,6 +270,9 @@ const Connection = struct {
             .tx_queue = null,
             .watched_keys = null,
             .watch_dirty = false,
+            .recv_pending = false,
+            .send_pending = false,
+            .recv_buf = undefined,
         };
         return conn;
     }
@@ -339,6 +349,8 @@ pub const Worker = struct {
     new_fd_tail: std.atomic.Value(usize),
     /// Last stripe lease held by this worker (only one at a time)
     last_stripe: u16,
+    /// true = use io_uring recv/send for non-TLS connections
+    use_uring_io: bool,
 
     pub fn init(
         allocator: Allocator,
@@ -399,6 +411,7 @@ pub const Worker = struct {
             .new_fd_head = std.atomic.Value(usize).init(0),
             .new_fd_tail = std.atomic.Value(usize).init(0),
             .last_stripe = STRIPE_UNOWNED,
+            .use_uring_io = false, // set after init when loop.use_uring is known
         };
     }
 
@@ -415,6 +428,11 @@ pub const Worker = struct {
     }
 
     pub fn run(self: *Worker) void {
+        // Detect io_uring availability at runtime
+        if (is_linux) {
+            self.use_uring_io = self.loop.use_uring;
+        }
+
         var event_buf: [128]EventLoop.Event = undefined;
 
         while (true) {
@@ -430,6 +448,29 @@ pub const Worker = struct {
                     continue;
                 }
 
+                if (ev.op == 1) {
+                    // io_uring recv completion
+                    if (ev.hup or ev.err) {
+                        self.closeConn(ev.fd);
+                        continue;
+                    }
+                    if (self.conns.get(ev.fd)) |conn| {
+                        self.handleRecvCompletion(conn, ev.bytes);
+                    }
+                    continue;
+                } else if (ev.op == 2) {
+                    // io_uring send completion
+                    if (ev.err) {
+                        self.closeConn(ev.fd);
+                        continue;
+                    }
+                    if (self.conns.get(ev.fd)) |conn| {
+                        self.handleSendCompletion(conn, ev.bytes);
+                    }
+                    continue;
+                }
+
+                // op=0: poll-based path (TLS, epoll, kqueue)
                 if (ev.hup or ev.err) {
                     self.closeConn(ev.fd);
                     continue;
@@ -538,6 +579,11 @@ pub const Worker = struct {
             _ = std.c.close(fd);
             return;
         };
+
+        // For non-TLS io_uring connections: submit recv to replace poll_add
+        if (self.use_uring_io and conn.ssl == null) {
+            self.rearmRecv(conn);
+        }
     }
 
     fn closeConn(self: *Worker, fd: i32) void {
@@ -651,6 +697,122 @@ pub const Worker = struct {
 
         // Release the single held stripe lease.
         if (self.ds_locks) |dsl| dsl.releaseAll(&self.last_stripe);
+    }
+
+    // ── io_uring recv/send completion handlers ──────────────────────────
+
+    fn handleRecvCompletion(self: *Worker, conn: *Connection, bytes: i32) void {
+        conn.recv_pending = false;
+
+        if (bytes <= 0) {
+            self.closeConn(conn.fd);
+            return;
+        }
+        const n: usize = @intCast(bytes);
+
+        // Same parsing logic as handleRead, but from conn.recv_buf (single batch)
+        if (conn.accum_pos >= conn.accum.items.len) {
+            conn.accum.clearRetainingCapacity();
+            conn.accum_pos = 0;
+
+            var pos: usize = 0;
+            while (pos < n) {
+                const data = conn.recv_buf[pos..n];
+                if (data.len >= 4 and data[0] == '*') {
+                    if (parseFastResp(data)) |result| {
+                        self.dispatchCommand(conn, result.args[0..result.argc]);
+                        pos += result.consumed;
+                        continue;
+                    }
+                }
+                break;
+            }
+
+            if (pos < n) {
+                conn.accum.appendSlice(conn.recv_buf[pos..n]) catch {
+                    self.closeConn(conn.fd);
+                    return;
+                };
+                while (conn.accumData().len > 0) {
+                    if (!self.processOneCommand(conn)) break;
+                }
+            }
+        } else {
+            conn.accum.appendSlice(conn.recv_buf[0..n]) catch {
+                self.closeConn(conn.fd);
+                return;
+            };
+
+            if (conn.accum.items.len > self.max_client_buffer) {
+                _ = std.c.write(conn.fd, "-ERR max client buffer exceeded\r\n", 33);
+                self.closeConn(conn.fd);
+                return;
+            }
+
+            while (conn.accumData().len > 0) {
+                if (!self.processOneCommand(conn)) break;
+            }
+        }
+
+        // Flush response via io_uring send
+        if (conn.write_buf.items.len > conn.write_offset) {
+            self.submitUringWrite(conn);
+        }
+
+        // Re-arm recv for next data (recv_buf is independent from write_buf)
+        self.rearmRecv(conn);
+
+        if (self.ds_locks) |dsl| dsl.releaseAll(&self.last_stripe);
+    }
+
+    fn handleSendCompletion(self: *Worker, conn: *Connection, bytes: i32) void {
+        conn.send_pending = false;
+
+        if (bytes <= 0) {
+            self.closeConn(conn.fd);
+            return;
+        }
+
+        conn.write_offset += @as(usize, @intCast(bytes));
+
+        if (conn.write_offset >= conn.write_buf.items.len) {
+            // All data sent
+            conn.write_buf.clearRetainingCapacity();
+            conn.write_offset = 0;
+        } else {
+            // Partial send — submit another for remainder
+            self.submitUringWrite(conn);
+        }
+    }
+
+    fn submitUringWrite(self: *Worker, conn: *Connection) void {
+        if (conn.send_pending) return; // already in-flight, completion will chain
+
+        const remaining = conn.write_buf.items[conn.write_offset..];
+        if (remaining.len == 0) return;
+
+        conn.send_pending = true;
+        if (is_linux) {
+            self.loop.submitSend(conn.fd, remaining) catch {
+                conn.send_pending = false;
+                // Fallback: synchronous flush
+                self.directFlush(conn);
+                return;
+            };
+            self.loop.flushSqes();
+        }
+    }
+
+    fn rearmRecv(self: *Worker, conn: *Connection) void {
+        if (conn.recv_pending or conn.ssl != null) return;
+        conn.recv_pending = true;
+        if (is_linux) {
+            self.loop.submitRecv(conn.fd, &conn.recv_buf) catch {
+                conn.recv_pending = false;
+                return;
+            };
+            self.loop.flushSqes();
+        }
     }
 
     fn processOneCommand(self: *Worker, conn: *Connection) bool {
