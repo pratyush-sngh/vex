@@ -380,13 +380,14 @@ pub const VectorStore = struct {
         const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
         if (fd < 0) return error.FileNotFound;
 
-        // Get file size
-        var stat: std.c.Stat = undefined;
-        if (std.c.fstat(fd, &stat) < 0) {
+        // Get file size via lseek (cross-platform, avoids fstat Linux gap)
+        const size = std.c.lseek(fd, 0, std.c.SEEK.END);
+        if (size < 0) {
             _ = std.c.close(fd);
             return error.StatFailed;
         }
-        const file_len: usize = @intCast(stat.size);
+        _ = std.c.lseek(fd, 0, std.c.SEEK.SET);
+        const file_len: usize = @intCast(size);
         if (file_len < VVF_HEADER_SIZE) {
             _ = std.c.close(fd);
             return error.FileTooSmall;
