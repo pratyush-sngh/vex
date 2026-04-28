@@ -18,7 +18,7 @@ pub const RagOptions = struct {
 pub const RagResult = struct {
     node_id: NodeId,
     key: []const u8,
-    score: f32, // cosine similarity (1 - distance)
+    score: f32,
     props: []const PropertyStore.PropPair,
     neighbor_keys: [][]const u8,
 
@@ -29,13 +29,6 @@ pub const RagResult = struct {
     }
 };
 
-/// Execute RAG query: vector search + graph expansion in one call.
-///
-/// 1. Normalize the query vector
-/// 2. Run HNSW ANN search on the named field → K nearest NodeIds + scores
-/// 3. For each result, BFS expand DEPTH hops using existing graph traverse
-/// 4. Collect properties for seed nodes
-/// 5. Collect neighbor keys from expansion
 pub fn ragSearch(
     graph: *const GraphEngine,
     allocator: Allocator,
@@ -44,20 +37,17 @@ pub fn ragSearch(
     k: u32,
     opts: RagOptions,
 ) ![]RagResult {
-    // Look up HNSW index for this field
-    const idx = graph.vec_indices.get(field) orelse return error.FieldNotFound;
+    const vi = graph.vec_indices orelse return error.FieldNotFound;
+    const idx = vi.get(field) orelse return error.FieldNotFound;
 
-    // Normalize query vector (copy to avoid mutating caller's data)
     const normalized = try allocator.alloc(f32, query_vec.len);
     defer allocator.free(normalized);
     @memcpy(normalized, query_vec);
     VectorStore.normalize(normalized);
 
-    // HNSW search
     const search_results = try idx.search(normalized, k, &graph.node_alive);
     defer allocator.free(search_results);
 
-    // Build results with graph expansion
     var results = std.array_list.Managed(RagResult).init(allocator);
     errdefer {
         for (results.items) |*r| r.deinit(allocator);
@@ -66,12 +56,9 @@ pub fn ragSearch(
 
     for (search_results) |sr| {
         const node = graph.getNodeById(sr.node_id) orelse continue;
-        const score = 1.0 - sr.distance; // cosine similarity
-
-        // Collect properties for this node
+        const score = 1.0 - sr.distance;
         const props = graph.node_props.collectAll(sr.node_id, allocator) catch &.{};
 
-        // BFS expand from this node
         var neighbor_keys = std.array_list.Managed([]const u8).init(allocator);
         if (opts.depth > 0) {
             const traverse_opts = query.TraversalOptions{
@@ -84,13 +71,10 @@ pub fn ragSearch(
             defer if (expanded.len > 0) allocator.free(expanded);
 
             for (expanded) |nid| {
-                if (nid == sr.node_id) continue; // skip self
+                if (nid == sr.node_id) continue;
                 const exp_node = graph.getNodeById(nid) orelse continue;
                 const key_copy = allocator.dupe(u8, exp_node.key) catch continue;
-                neighbor_keys.append(key_copy) catch {
-                    allocator.free(key_copy);
-                    continue;
-                };
+                neighbor_keys.append(key_copy) catch { allocator.free(key_copy); continue; };
             }
         }
 
@@ -113,33 +97,23 @@ test "rag basic search with expansion" {
     var g = GraphEngine.init(allocator);
     defer g.deinit();
 
-    // Create nodes
     _ = try g.addNode("doc:1", "document");
     _ = try g.addNode("doc:2", "document");
     _ = try g.addNode("topic:ai", "topic");
-
-    // Add edges
     _ = try g.addEdge("doc:1", "topic:ai", "about", 1.0);
 
-    // Set vectors
     try g.setVector("doc:1", "emb", &[_]f32{ 1.0, 0.0, 0.0 });
     try g.setVector("doc:2", "emb", &[_]f32{ 0.0, 1.0, 0.0 });
 
-    // RAG search: query closest to doc:1, expand 1 hop
     const results = try ragSearch(&g, allocator, "emb", &[_]f32{ 0.9, 0.1, 0.0 }, 2, .{ .depth = 1 });
     defer {
-        for (results) |*r| {
-            var rm = r.*;
-            rm.deinit(allocator);
-        }
+        for (results) |*r| { var rm = r.*; rm.deinit(allocator); }
         allocator.free(results);
     }
 
     try std.testing.expect(results.len >= 1);
-    // First result should be doc:1 (closest to query)
     try std.testing.expectEqualStrings("doc:1", results[0].key);
     try std.testing.expect(results[0].score > 0.5);
-    // Should have topic:ai as a neighbor (1-hop expansion)
     try std.testing.expect(results[0].neighbor_keys.len >= 1);
 }
 
@@ -155,14 +129,10 @@ test "rag depth 0 is pure vector search" {
 
     const results = try ragSearch(&g, allocator, "emb", &[_]f32{ 1.0, 0.0 }, 2, .{ .depth = 0 });
     defer {
-        for (results) |*r| {
-            var rm = r.*;
-            rm.deinit(allocator);
-        }
+        for (results) |*r| { var rm = r.*; rm.deinit(allocator); }
         allocator.free(results);
     }
 
     try std.testing.expect(results.len >= 1);
-    // No neighbors at depth 0
     try std.testing.expectEqual(@as(usize, 0), results[0].neighbor_keys.len);
 }
