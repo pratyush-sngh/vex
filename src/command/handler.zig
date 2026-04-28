@@ -241,9 +241,21 @@ pub const CommandHandler = struct {
                     if (std.mem.eql(u8, sub, "SETVEC")) return self.cmdGraphSetVec(args, w);
                     if (std.mem.eql(u8, sub, "STATS")) return self.cmdGraphStats(w);
                 },
+                'U' => {
+                    if (std.mem.eql(u8, sub, "UPSERT_NODE")) return self.cmdGraphUpsertNode(args, w);
+                    if (std.mem.eql(u8, sub, "UPSERT_EDGE")) return self.cmdGraphUpsertEdge(args, w);
+                },
+                'I' => {
+                    if (std.mem.eql(u8, sub, "INGEST")) return self.cmdGraphIngest(args, w);
+                    if (std.mem.eql(u8, sub, "IMPACT")) return self.cmdGraphImpact(args, w);
+                },
+                'L' => if (std.mem.eql(u8, sub, "LIST_BY_TYPE")) return self.cmdGraphListByType(args, w),
                 'N' => if (std.mem.eql(u8, sub, "NEIGHBORS")) return self.cmdGraphNeighbors(args, w),
                 'T' => if (std.mem.eql(u8, sub, "TRAVERSE")) return self.cmdGraphTraverse(args, w),
-                'P' => if (std.mem.eql(u8, sub, "PATH")) return self.cmdGraphPath(args, w),
+                'P' => {
+                    if (std.mem.eql(u8, sub, "PATH")) return self.cmdGraphPath(args, w);
+                    if (std.mem.eql(u8, sub, "PATHS")) return self.cmdGraphPaths(args, w);
+                },
                 'W' => if (std.mem.eql(u8, sub, "WPATH")) return self.cmdGraphWPath(args, w),
                 'C' => if (std.mem.eql(u8, sub, "COMPACT")) return self.cmdGraphCompact(w),
                 'V' => if (std.mem.eql(u8, sub, "VECSEARCH")) return self.cmdGraphVecSearch(args, w),
@@ -1242,7 +1254,6 @@ pub const CommandHandler = struct {
         var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeBulkString(w, null); return; };
         defer key_ref.deinit(self.allocator);
         if (self.getListStore().lpop(key_ref.key)) |val| {
-            defer self.allocator.free(val);
             self.logToAOF(args);
             try resp.serializeBulkString(w, val);
         } else {
@@ -1256,7 +1267,6 @@ pub const CommandHandler = struct {
         var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeBulkString(w, null); return; };
         defer key_ref.deinit(self.allocator);
         if (self.getListStore().rpop(key_ref.key)) |val| {
-            defer self.allocator.free(val);
             self.logToAOF(args);
             try resp.serializeBulkString(w, val);
         } else {
@@ -2161,6 +2171,283 @@ pub const CommandHandler = struct {
             for (r.props) |p| { try resp.serializeBulkString(w, p.key); try resp.serializeBulkString(w, p.value); }
             try resp.serializeArrayHeader(w, r.neighbor_keys.len);
             for (r.neighbor_keys) |nk| { try resp.serializeBulkString(w, stripGraphDbPrefix(self, nk) orelse nk); }
+        }
+    }
+
+    // ── Upsert / Ingest / List / Impact / Paths Commands ──────────────
+
+    /// GRAPH.UPSERT_NODE <key> <type> [json_metadata]
+    fn cmdGraphUpsertNode(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 3) { try resp.serializeError(w, "usage: GRAPH.UPSERT_NODE <key> <type> [json_metadata]"); return; }
+        const nk = graphNamespacedKey(self, args[1]) catch { try resp.serializeError(w, "internal error"); return; };
+        defer self.allocator.free(nk);
+        _ = self.graph.upsertNode(nk, args[2]) catch |err| { try resp.serializeError(w, @errorName(err)); return; };
+        // Parse and set metadata if provided
+        if (args.len >= 4) {
+            self.applyJsonMetadataToNode(nk, args[3]) catch |err| { try resp.serializeError(w, @errorName(err)); return; };
+        }
+        self.logToAOF(args);
+        try resp.serializeSimpleString(w, "OK");
+    }
+
+    /// GRAPH.UPSERT_EDGE <from> <to> <type> [json_metadata]
+    fn cmdGraphUpsertEdge(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 4) { try resp.serializeError(w, "usage: GRAPH.UPSERT_EDGE <from> <to> <type> [json_metadata]"); return; }
+        const from = graphNamespacedKey(self, args[1]) catch { try resp.serializeError(w, "internal error"); return; };
+        defer self.allocator.free(from);
+        const to = graphNamespacedKey(self, args[2]) catch { try resp.serializeError(w, "internal error"); return; };
+        defer self.allocator.free(to);
+        // Create nodes if they don't exist (upsert semantics)
+        _ = self.graph.upsertNode(from, "unknown") catch |err| { try resp.serializeError(w, @errorName(err)); return; };
+        _ = self.graph.upsertNode(to, "unknown") catch |err| { try resp.serializeError(w, @errorName(err)); return; };
+        // Find existing edge or create new
+        const eid = self.graph.findEdge(from, to, args[3]) orelse blk: {
+            break :blk self.graph.addEdge(from, to, args[3], 1.0) catch |err| { try resp.serializeError(w, @errorName(err)); return; };
+        };
+        // Apply metadata if provided
+        if (args.len >= 5) {
+            self.applyJsonMetadataToEdge(eid, args[4]) catch |err| { try resp.serializeError(w, @errorName(err)); return; };
+        }
+        self.logToAOF(args);
+        try resp.serializeSimpleString(w, "OK");
+    }
+
+    /// GRAPH.INGEST <json>
+    fn cmdGraphIngest(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 2) { try resp.serializeError(w, "usage: GRAPH.INGEST <json>"); return; }
+        const json_str = args[1];
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, json_str, .{}) catch {
+            try resp.serializeError(w, "invalid JSON");
+            return;
+        };
+        defer parsed.deinit();
+        const root = parsed.value;
+        if (root != .object) { try resp.serializeError(w, "JSON must be an object with 'nodes' and/or 'edges'"); return; }
+
+        // Process nodes
+        if (root.object.get("nodes")) |nodes_val| {
+            if (nodes_val == .array) {
+                for (nodes_val.array.items) |node_val| {
+                    if (node_val != .object) continue;
+                    const obj = node_val.object;
+                    const id_str = if (obj.get("id")) |v| (if (v == .string) v.string else null) else null;
+                    const type_str = if (obj.get("type")) |v| (if (v == .string) v.string else null) else null;
+                    if (id_str == null or type_str == null) continue;
+                    const nk = graphNamespacedKey(self, id_str.?) catch continue;
+                    defer self.allocator.free(nk);
+                    _ = self.graph.upsertNode(nk, type_str.?) catch continue;
+                    // Apply metadata
+                    if (obj.get("metadata")) |meta_val| {
+                        if (meta_val == .object) {
+                            var meta_iter = meta_val.object.iterator();
+                            while (meta_iter.next()) |entry| {
+                                const val_str = if (entry.value_ptr.* == .string) entry.value_ptr.*.string else continue;
+                                self.graph.setNodeProperty(nk, entry.key_ptr.*, val_str) catch continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Process edges
+        if (root.object.get("edges")) |edges_val| {
+            if (edges_val == .array) {
+                for (edges_val.array.items) |edge_val| {
+                    if (edge_val != .object) continue;
+                    const obj = edge_val.object;
+                    const from_str = if (obj.get("from")) |v| (if (v == .string) v.string else null) else null;
+                    const to_str = if (obj.get("to")) |v| (if (v == .string) v.string else null) else null;
+                    const etype_str = if (obj.get("type")) |v| (if (v == .string) v.string else null) else null;
+                    if (from_str == null or to_str == null or etype_str == null) continue;
+                    const from = graphNamespacedKey(self, from_str.?) catch continue;
+                    defer self.allocator.free(from);
+                    const to = graphNamespacedKey(self, to_str.?) catch continue;
+                    defer self.allocator.free(to);
+                    // Ensure nodes exist
+                    _ = self.graph.upsertNode(from, "unknown") catch continue;
+                    _ = self.graph.upsertNode(to, "unknown") catch continue;
+                    // Upsert edge
+                    const eid = self.graph.findEdge(from, to, etype_str.?) orelse (self.graph.addEdge(from, to, etype_str.?, 1.0) catch continue);
+                    // Apply edge metadata
+                    if (obj.get("metadata")) |meta_val| {
+                        if (meta_val == .object) {
+                            var meta_iter = meta_val.object.iterator();
+                            while (meta_iter.next()) |entry| {
+                                const val_str = if (entry.value_ptr.* == .string) entry.value_ptr.*.string else continue;
+                                self.graph.setEdgeProperty(eid, entry.key_ptr.*, val_str) catch continue;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        self.logToAOF(args);
+        try resp.serializeSimpleString(w, "OK");
+    }
+
+    /// GRAPH.LIST_BY_TYPE <type> [LIMIT n]
+    fn cmdGraphListByType(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 2) { try resp.serializeError(w, "usage: GRAPH.LIST_BY_TYPE <type> [LIMIT n]"); return; }
+        const node_type = args[1];
+        var limit: u32 = 0;
+        var i: usize = 2;
+        while (i < args.len) {
+            var flag_buf: [64]u8 = undefined;
+            const flag = toUpper(args[i], &flag_buf);
+            if (std.mem.eql(u8, flag, "LIMIT") and i + 1 < args.len) {
+                limit = std.fmt.parseInt(u32, args[i + 1], 10) catch 0;
+                i += 2;
+            } else { i += 1; }
+        }
+        // listByType uses interned type name — graph engine compares type_ids directly
+        // But we need to find the type in the intern table. The type is NOT namespaced.
+        const ids = self.graph.listByType(node_type, limit) catch |err| { try resp.serializeError(w, @errorName(err)); return; };
+        defer self.allocator.free(ids);
+        try resp.serializeArrayHeader(w, ids.len);
+        for (ids) |nid| {
+            const node = self.graph.getNodeById(nid);
+            if (node) |n| {
+                try resp.serializeArrayHeader(w, 2);
+                try resp.serializeBulkString(w, stripGraphDbPrefix(self, n.key) orelse n.key);
+                try resp.serializeBulkString(w, n.node_type);
+            }
+        }
+    }
+
+    /// GRAPH.IMPACT <id> [EDGES e1 e2 ...] [NODES n1 n2 ...] [DEPTH n]
+    fn cmdGraphImpact(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 2) { try resp.serializeError(w, "usage: GRAPH.IMPACT <id> [EDGES e1 ...] [NODES n1 ...] [DEPTH n]"); return; }
+        const nk = graphNamespacedKey(self, args[1]) catch { try resp.serializeError(w, "internal error"); return; };
+        defer self.allocator.free(nk);
+
+        var opts = query.ImpactOptions{};
+        var edge_filters_buf: [32][]const u8 = undefined;
+        var edge_filters_len: usize = 0;
+        var node_filters_buf: [32][]const u8 = undefined;
+        var node_filters_len: usize = 0;
+
+        var i: usize = 2;
+        while (i < args.len) {
+            var flag_buf: [64]u8 = undefined;
+            const flag = toUpper(args[i], &flag_buf);
+            if (std.mem.eql(u8, flag, "DEPTH") and i + 1 < args.len) {
+                opts.max_depth = std.fmt.parseInt(u32, args[i + 1], 10) catch 10;
+                i += 2;
+            } else if (std.mem.eql(u8, flag, "EDGES")) {
+                i += 1;
+                while (i < args.len) {
+                    var check_buf: [64]u8 = undefined;
+                    const check = toUpper(args[i], &check_buf);
+                    if (std.mem.eql(u8, check, "NODES") or std.mem.eql(u8, check, "DEPTH")) break;
+                    if (edge_filters_len < 32) { edge_filters_buf[edge_filters_len] = args[i]; edge_filters_len += 1; }
+                    i += 1;
+                }
+            } else if (std.mem.eql(u8, flag, "NODES")) {
+                i += 1;
+                while (i < args.len) {
+                    var check_buf: [64]u8 = undefined;
+                    const check = toUpper(args[i], &check_buf);
+                    if (std.mem.eql(u8, check, "EDGES") or std.mem.eql(u8, check, "DEPTH")) break;
+                    if (node_filters_len < 32) { node_filters_buf[node_filters_len] = args[i]; node_filters_len += 1; }
+                    i += 1;
+                }
+            } else { i += 1; }
+        }
+        if (edge_filters_len > 0) opts.edge_type_filters = edge_filters_buf[0..edge_filters_len];
+        if (node_filters_len > 0) opts.node_type_filters = node_filters_buf[0..node_filters_len];
+
+        const results = query.impact(self.graph, self.allocator, nk, opts) catch |err| { try resp.serializeError(w, @errorName(err)); return; };
+        defer self.allocator.free(results);
+
+        // Serialize as flat array: [type_name, count, type_name, count, ...]
+        try resp.serializeArrayHeader(w, results.len * 2);
+        for (results) |r| {
+            try resp.serializeBulkString(w, r.type_name);
+            try resp.serializeInteger(w, @intCast(r.count));
+        }
+    }
+
+    /// GRAPH.PATHS <start> <target_type> [EDGES e1 e2 ...] [LIMIT n] [DEPTH n]
+    fn cmdGraphPaths(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        if (args.len < 3) { try resp.serializeError(w, "usage: GRAPH.PATHS <start> <target_type> [EDGES ...] [LIMIT n] [DEPTH n]"); return; }
+        const nk = graphNamespacedKey(self, args[1]) catch { try resp.serializeError(w, "internal error"); return; };
+        defer self.allocator.free(nk);
+        const target_type = args[2];
+
+        var opts = query.FindPathsOptions{};
+        var edge_filters_buf: [32][]const u8 = undefined;
+        var edge_filters_len: usize = 0;
+
+        var i: usize = 3;
+        while (i < args.len) {
+            var flag_buf: [64]u8 = undefined;
+            const flag = toUpper(args[i], &flag_buf);
+            if (std.mem.eql(u8, flag, "DEPTH") and i + 1 < args.len) {
+                opts.max_depth = std.fmt.parseInt(u32, args[i + 1], 10) catch 10;
+                i += 2;
+            } else if (std.mem.eql(u8, flag, "LIMIT") and i + 1 < args.len) {
+                opts.limit = std.fmt.parseInt(u32, args[i + 1], 10) catch 100;
+                i += 2;
+            } else if (std.mem.eql(u8, flag, "EDGES")) {
+                i += 1;
+                while (i < args.len) {
+                    var check_buf: [64]u8 = undefined;
+                    const check = toUpper(args[i], &check_buf);
+                    if (std.mem.eql(u8, check, "LIMIT") or std.mem.eql(u8, check, "DEPTH")) break;
+                    if (edge_filters_len < 32) { edge_filters_buf[edge_filters_len] = args[i]; edge_filters_len += 1; }
+                    i += 1;
+                }
+            } else { i += 1; }
+        }
+        if (edge_filters_len > 0) opts.edge_type_filters = edge_filters_buf[0..edge_filters_len];
+
+        const paths = query.findPaths(self.graph, self.allocator, nk, target_type, opts) catch |err| { try resp.serializeError(w, @errorName(err)); return; };
+        defer {
+            for (paths) |p| self.allocator.free(p);
+            self.allocator.free(paths);
+        }
+
+        try resp.serializeArrayHeader(w, paths.len);
+        for (paths) |path| {
+            try resp.serializeArrayHeader(w, path.len);
+            for (path) |nid| {
+                const node = self.graph.getNodeById(nid);
+                if (node) |n| {
+                    try resp.serializeArrayHeader(w, 2);
+                    try resp.serializeBulkString(w, stripGraphDbPrefix(self, n.key) orelse n.key);
+                    try resp.serializeBulkString(w, n.node_type);
+                } else {
+                    try resp.serializeArrayHeader(w, 2);
+                    try resp.serializeBulkString(w, null);
+                    try resp.serializeBulkString(w, null);
+                }
+            }
+        }
+    }
+
+    // ── JSON metadata helper ────────────────────────────────────────────
+
+    fn applyJsonMetadataToNode(self: *CommandHandler, key: []const u8, json_str: []const u8) !void {
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, json_str, .{}) catch return error.InvalidJSON;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidJSON;
+        var iter = parsed.value.object.iterator();
+        while (iter.next()) |entry| {
+            const val_str = if (entry.value_ptr.* == .string) entry.value_ptr.*.string else continue;
+            try self.graph.setNodeProperty(key, entry.key_ptr.*, val_str);
+        }
+    }
+
+    fn applyJsonMetadataToEdge(self: *CommandHandler, eid: graph_mod.EdgeId, json_str: []const u8) !void {
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, json_str, .{}) catch return error.InvalidJSON;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.InvalidJSON;
+        var iter = parsed.value.object.iterator();
+        while (iter.next()) |entry| {
+            const val_str = if (entry.value_ptr.* == .string) entry.value_ptr.*.string else continue;
+            try self.graph.setEdgeProperty(eid, entry.key_ptr.*, val_str);
         }
     }
 

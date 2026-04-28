@@ -360,6 +360,51 @@ pub const GraphEngine = struct {
         self.mutation_seq += 1;
     }
 
+    /// Create node if it doesn't exist, return existing ID if it does.
+    pub fn upsertNode(self: *GraphEngine, key: []const u8, node_type: []const u8) !NodeId {
+        if (self.key_to_id.get(key)) |id| {
+            if (self.node_alive.isSet(id)) return id;
+        }
+        return self.addNode(key, node_type);
+    }
+
+    /// Find an existing live edge matching (from_key, to_key, edge_type).
+    pub fn findEdge(self: *const GraphEngine, from_key: []const u8, to_key: []const u8, edge_type: []const u8) ?EdgeId {
+        const from_id = self.resolveKey(from_key) orelse return null;
+        const to_id = self.resolveKey(to_key) orelse return null;
+        const type_id = self.type_intern.find(edge_type) orelse return null;
+
+        for (0..self.edge_from.items.len) |eidx| {
+            if (!self.edge_alive.isSet(eidx)) continue;
+            if (self.edge_from.items[eidx] == from_id and
+                self.edge_to.items[eidx] == to_id and
+                self.edge_type_id.items[eidx] == type_id)
+            {
+                return @intCast(eidx);
+            }
+        }
+        return null;
+    }
+
+    /// List all live node IDs with the given type string.
+    pub fn listByType(self: *const GraphEngine, node_type: []const u8, limit: u32) ![]NodeId {
+        const type_id = self.type_intern.find(node_type) orelse {
+            const empty = try self.allocator.alloc(NodeId, 0);
+            return empty;
+        };
+
+        var result = std.array_list.Managed(NodeId).init(self.allocator);
+        errdefer result.deinit();
+
+        for (0..self.node_keys.items.len) |i| {
+            if (!self.node_alive.isSet(i)) continue;
+            if (self.node_type_id.items[i] != type_id) continue;
+            try result.append(@intCast(i));
+            if (limit > 0 and result.items.len >= limit) break;
+        }
+        return result.toOwnedSlice();
+    }
+
     // ─── Edge Operations ──────────────────────────────────────────────
 
     pub fn addEdge(self: *GraphEngine, from_key: []const u8, to_key: []const u8, edge_type: []const u8, weight: f64) !EdgeId {
@@ -735,4 +780,52 @@ test "graph_v2 all_base_edges_alive flag" {
 
     try g.compact();
     try std.testing.expect(g.all_base_edges_alive);
+}
+
+test "upsertNode creates and returns existing" {
+    var g = GraphEngine.init(std.testing.allocator);
+    defer g.deinit();
+
+    const id1 = try g.upsertNode("svc:a", "service");
+    const id2 = try g.upsertNode("svc:a", "service");
+    try std.testing.expectEqual(id1, id2);
+    try std.testing.expectEqual(@as(usize, 1), g.nodeCount());
+
+    const id3 = try g.upsertNode("svc:b", "service");
+    try std.testing.expect(id3 != id1);
+    try std.testing.expectEqual(@as(usize, 2), g.nodeCount());
+}
+
+test "findEdge returns existing edge" {
+    var g = GraphEngine.init(std.testing.allocator);
+    defer g.deinit();
+
+    _ = try g.addNode("a", "t");
+    _ = try g.addNode("b", "t");
+    const eid = try g.addEdge("a", "b", "calls", 1.0);
+
+    try std.testing.expectEqual(@as(?EdgeId, eid), g.findEdge("a", "b", "calls"));
+    try std.testing.expectEqual(@as(?EdgeId, null), g.findEdge("a", "b", "owns"));
+    try std.testing.expectEqual(@as(?EdgeId, null), g.findEdge("b", "a", "calls"));
+}
+
+test "listByType filters correctly" {
+    var g = GraphEngine.init(std.testing.allocator);
+    defer g.deinit();
+
+    _ = try g.addNode("svc:a", "service");
+    _ = try g.addNode("svc:b", "service");
+    _ = try g.addNode("db:1", "database");
+
+    const services = try g.listByType("service", 0);
+    defer std.testing.allocator.free(services);
+    try std.testing.expectEqual(@as(usize, 2), services.len);
+
+    const dbs = try g.listByType("database", 0);
+    defer std.testing.allocator.free(dbs);
+    try std.testing.expectEqual(@as(usize, 1), dbs.len);
+
+    const limited = try g.listByType("service", 1);
+    defer std.testing.allocator.free(limited);
+    try std.testing.expectEqual(@as(usize, 1), limited.len);
 }
