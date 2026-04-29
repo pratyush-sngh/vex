@@ -2621,18 +2621,23 @@ fn isGraphCommand(args: []const []const u8) bool {
 }
 
 /// Graph write commands need exclusive (write) lock.
-/// Read commands (GETNODE, NEIGHBORS, TRAVERSE, PATH, WPATH, STATS) take shared read lock.
+/// Read commands (GETNODE, GETVEC, NEIGHBORS, TRAVERSE, PATH, PATHS, WPATH, STATS, VECSEARCH, RAG) take shared read lock.
 fn isGraphWriteCommand(args: []const []const u8) bool {
     if (args.len == 0) return false;
     const cmd = args[0];
-    // Write commands: ADDNODE, DELNODE, SETPROP, ADDEDGE, DELEDGE
-    if (cmd.len >= 12 and equalsAsciiUpperPrefix(cmd[6..], "ADDNOD")) return true;
-    if (cmd.len >= 12 and equalsAsciiUpperPrefix(cmd[6..], "DELNOD")) return true;
-    if (cmd.len >= 13 and equalsAsciiUpperPrefix(cmd[6..], "SETPRO")) return true;
-    if (cmd.len >= 12 and equalsAsciiUpperPrefix(cmd[6..], "ADDEDG")) return true;
-    if (cmd.len >= 12 and equalsAsciiUpperPrefix(cmd[6..], "DELEDG")) return true;
-    if (cmd.len >= 12 and equalsAsciiUpperPrefix(cmd[6..], "SETVEC")) return true;
-    return false; // GETNODE, GETVEC, NEIGHBORS, TRAVERSE, PATH, WPATH, STATS, VECSEARCH, RAG = read
+    if (cmd.len < 12) return false;
+    const sub = cmd[6..];
+    // Write commands: ADDNODE, DELNODE, SETPROP, ADDEDGE, DELEDGE, SETVEC, UPSERT_NODE, UPSERT_EDGE, INGEST, COMPACT
+    if (equalsAsciiUpperPrefix(sub, "ADDNOD")) return true;
+    if (equalsAsciiUpperPrefix(sub, "DELNOD")) return true;
+    if (equalsAsciiUpperPrefix(sub, "ADDEDG")) return true;
+    if (equalsAsciiUpperPrefix(sub, "DELEDG")) return true;
+    if (cmd.len >= 13 and equalsAsciiUpperPrefix(sub, "SETPRO")) return true;
+    if (equalsAsciiUpperPrefix(sub, "SETVEC")) return true;
+    if (equalsAsciiUpperPrefix(sub, "UPSERT")) return true;
+    if (equalsAsciiUpperPrefix(sub, "INGEST")) return true;
+    if (equalsAsciiUpperPrefix(sub, "COMPAC")) return true;
+    return false;
 }
 
 fn equalsAsciiUpper(s: []const u8, comptime upper: []const u8) bool {
