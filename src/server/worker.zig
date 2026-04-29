@@ -2178,6 +2178,7 @@ pub const Worker = struct {
             &selected_db,
             self.keys_mode,
         );
+        handler.ckv = self.ckv;
         handler.list_store = self.list_store;
         handler.hash_store = self.hash_store;
         handler.set_store = self.set_store;
