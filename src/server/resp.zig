@@ -164,16 +164,16 @@ pub fn serializeErrorTyped(w: *std.Io.Writer, err_type: []const u8, msg: []const
 }
 
 pub fn serializeInteger(w: *std.Io.Writer, val: i64) std.Io.Writer.Error!void {
-    try w.writeAll(":");
-    try w.print("{d}", .{val});
-    try w.writeAll("\r\n");
+    var buf: [32]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, ":{d}\r\n", .{val}) catch unreachable;
+    try w.writeAll(s);
 }
 
 pub fn serializeBulkString(w: *std.Io.Writer, data: ?[]const u8) std.Io.Writer.Error!void {
     if (data) |d| {
-        try w.writeAll("$");
-        try w.print("{d}", .{d.len});
-        try w.writeAll("\r\n");
+        var hdr: [32]u8 = undefined;
+        const h = std.fmt.bufPrint(&hdr, "${d}\r\n", .{d.len}) catch unreachable;
+        try w.writeAll(h);
         try w.writeAll(d);
         try w.writeAll("\r\n");
     } else {
@@ -183,9 +183,9 @@ pub fn serializeBulkString(w: *std.Io.Writer, data: ?[]const u8) std.Io.Writer.E
 
 pub fn serializeArrayHeader(w: *std.Io.Writer, len: ?usize) std.Io.Writer.Error!void {
     if (len) |l| {
-        try w.writeAll("*");
-        try w.print("{d}", .{l});
-        try w.writeAll("\r\n");
+        var hdr: [32]u8 = undefined;
+        const h = std.fmt.bufPrint(&hdr, "*{d}\r\n", .{l}) catch unreachable;
+        try w.writeAll(h);
     } else {
         try w.writeAll("*-1\r\n");
     }

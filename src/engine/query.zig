@@ -18,6 +18,7 @@ pub const TraversalOptions = struct {
     direction: Direction = .outgoing,
     edge_type_filter: ?[]const u8 = null,
     node_type_filter: ?[]const u8 = null,
+    max_results: u32 = 0, // 0 = unlimited
 };
 
 pub const PathResult = struct {
@@ -204,6 +205,10 @@ pub fn traverse(
                 visited.set(nid);
                 any_in_next = true;
                 result.append(nid) catch break;
+                // Early exit if limit reached
+                if (opts.max_results > 0 and result.items.len >= opts.max_results) {
+                    return result.toOwnedSlice();
+                }
             }
         }
 

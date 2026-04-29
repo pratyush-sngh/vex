@@ -1929,6 +1929,9 @@ pub const CommandHandler = struct {
             } else if (std.mem.eql(u8, flag, "NODETYPE") and i + 1 < args.len) {
                 opts.node_type_filter = args[i + 1];
                 i += 2;
+            } else if (std.mem.eql(u8, flag, "LIMIT") and i + 1 < args.len) {
+                opts.max_results = std.fmt.parseInt(u32, args[i + 1], 10) catch 0;
+                i += 2;
             } else {
                 i += 1;
             }
@@ -1946,16 +1949,53 @@ pub const CommandHandler = struct {
         };
         defer self.allocator.free(ids);
 
-        try resp.serializeArrayHeader(w, ids.len);
-        for (ids) |nid| {
-            const node = self.graph.getNodeById(nid);
-            if (node) |n| {
-                const user_key = stripGraphDbPrefix(self, n.key) orelse n.key;
-                try resp.serializeBulkString(w, user_key);
-            } else {
-                try resp.serializeBulkString(w, null);
+        // Pre-build entire RESP response in one buffer — single writeAll instead of 3*N calls
+        const keys = self.graph.node_keys.items;
+        // Estimate size: array header + per-node ($len\r\nkey\r\n)
+        const est_size = 32 + ids.len * 32; // generous estimate
+        var buf = self.allocator.alloc(u8, est_size) catch {
+            // Fallback: stream per-node
+            try resp.serializeArrayHeader(w, ids.len);
+            for (ids) |nid| {
+                if (nid < keys.len) {
+                    try resp.serializeBulkString(w, stripGraphDbPrefix(self, keys[nid]) orelse keys[nid]);
+                } else {
+                    try resp.serializeBulkString(w, null);
+                }
             }
+            return;
+        };
+        defer self.allocator.free(buf);
+
+        var pos: usize = 0;
+        // Array header
+        const hdr = std.fmt.bufPrint(buf[pos..], "*{d}\r\n", .{ids.len}) catch unreachable;
+        pos += hdr.len;
+
+        for (ids) |nid| {
+            // Grow buffer if needed
+            if (pos + 64 > buf.len) {
+                buf = self.allocator.realloc(buf, buf.len * 2) catch break;
+            }
+            if (nid < keys.len) {
+                const user_key = stripGraphDbPrefix(self, keys[nid]) orelse keys[nid];
+                const entry_hdr = std.fmt.bufPrint(buf[pos..], "${d}\r\n", .{user_key.len}) catch break;
+                pos += entry_hdr.len;
+                if (pos + user_key.len + 2 > buf.len) {
+                    buf = self.allocator.realloc(buf, buf.len * 2) catch break;
+                }
+                @memcpy(buf[pos .. pos + user_key.len], user_key);
+                pos += user_key.len;
+            } else {
+                @memcpy(buf[pos .. pos + 5], "$-1\r\n");
+                pos += 5;
+            }
+            buf[pos] = '\r';
+            buf[pos + 1] = '\n';
+            pos += 2;
         }
+
+        try w.writeAll(buf[0..pos]);
 
     }
 
