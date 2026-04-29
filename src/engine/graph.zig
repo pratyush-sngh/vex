@@ -312,32 +312,75 @@ pub const GraphEngine = struct {
             return;
         }
 
-        // Rebuild HNSW indices from loaded mmap data
+        // Rebuild HNSW indices from loaded mmap data — parallel per field
         var vi = &self.vec_indices.?;
         const field_count = vs.field_intern.count();
-        for (0..field_count) |fi| {
-            const field_id: u16 = @intCast(fi);
-            if (vs.mmap_fields[fi] == null) continue;
 
+        // Pre-create indices (must be sequential — vi HashMap is not thread-safe)
+        for (0..field_count) |fi| {
+            if (vs.mmap_fields[fi] == null) continue;
+            const field_id: u16 = @intCast(fi);
             const field_name = vs.field_intern.resolve(field_id);
             const dim = vs.field_dims[fi];
-
             if (!vi.contains(field_name)) {
                 const idx = try self.allocator.create(HnswIndex);
                 idx.* = HnswIndex.init(self.allocator, dim, vs, field_id);
                 const owned_field = try self.allocator.dupe(u8, field_name);
                 try vi.put(owned_field, idx);
             }
+        }
+
+        // Spawn threads for HNSW insertion (each field is independent)
+        const BuildCtx = struct {
+            idx: *HnswIndex,
+            node_ids: []u32,
+            allocator: Allocator,
+
+            fn run(ctx: *@This()) void {
+                for (ctx.node_ids) |nid| {
+                    ctx.idx.insert(nid) catch continue;
+                }
+                ctx.allocator.free(ctx.node_ids);
+                ctx.allocator.destroy(ctx);
+            }
+        };
+
+        var threads: [64]?std.Thread = .{null} ** 64;
+        var thread_count: usize = 0;
+
+        for (0..field_count) |fi| {
+            if (vs.mmap_fields[fi] == null) continue;
+            const field_name = vs.field_intern.resolve(@intCast(fi));
+            const idx = vi.get(field_name).?;
 
             const mf = &vs.mmap_fields[fi].?;
             var node_ids = std.array_list.Managed(u32).init(self.allocator);
             defer node_ids.deinit();
-            try mf.iterNodeIds(&node_ids);
+            mf.iterNodeIds(&node_ids) catch continue;
 
-            const idx = vi.get(field_name).?;
-            for (node_ids.items) |nid| {
-                idx.insert(nid) catch continue;
+            // Move owned node_ids to thread context
+            const owned_ids = self.allocator.dupe(u32, node_ids.items) catch continue;
+            const ctx = self.allocator.create(BuildCtx) catch {
+                self.allocator.free(owned_ids);
+                continue;
+            };
+            ctx.* = .{ .idx = idx, .node_ids = owned_ids, .allocator = self.allocator };
+
+            if (thread_count < threads.len) {
+                threads[thread_count] = std.Thread.spawn(.{}, BuildCtx.run, .{ctx}) catch {
+                    // Fallback: build inline
+                    BuildCtx.run(ctx);
+                    continue;
+                };
+                thread_count += 1;
+            } else {
+                BuildCtx.run(ctx);
             }
+        }
+
+        // Join all builder threads
+        for (threads[0..thread_count]) |t| {
+            if (t) |thread| thread.join();
         }
     }
 

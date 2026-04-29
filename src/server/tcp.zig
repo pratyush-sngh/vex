@@ -1046,11 +1046,15 @@ pub const Server = struct {
                 arr[j] = try AOF.init(self.io, shard_path, self.aof.?.snapshot_path);
                 arr[j].prof = self.profile;
                 arr[j].initGroupBuf(self.allocator);
+                arr[j].enableDirectIO(self.allocator);
             }
             reactor_shard_aofs = arr;
         }
         // Init group buf on main AOF too (if not already done)
-        if (self.aof) |a| a.initGroupBuf(self.allocator);
+        if (self.aof) |a| {
+            a.initGroupBuf(self.allocator);
+            a.enableDirectIO(self.allocator);
+        }
         defer if (reactor_shard_aofs) |arr| {
             for (arr) |*a| a.deinit();
             self.allocator.free(arr);

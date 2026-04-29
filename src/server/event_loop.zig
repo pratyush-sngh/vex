@@ -10,6 +10,25 @@ const is_darwin = builtin.os.tag == .macos or builtin.os.tag == .ios or
 const MAX_EVENTS = 256;
 const FD_TABLE_SIZE = 4096;
 
+// io_uring operation tags encoded in upper bits of user_data
+const OP_POLL: u64 = 0;
+const OP_RECV: u64 = 1;
+const OP_SEND: u64 = 2;
+const OP_AOF_WRITE: u64 = 3;
+const OP_AOF_FSYNC: u64 = 4;
+
+fn encodeUserData(op: u64, fd: i32) u64 {
+    return (op << 48) | @as(u64, @intCast(@as(u32, @bitCast(fd))));
+}
+
+fn decodeOp(user_data: u64) u64 {
+    return (user_data >> 48) & 0xFFFF;
+}
+
+fn decodeFd(user_data: u64) i32 {
+    return @bitCast(@as(u32, @truncate(user_data)));
+}
+
 pub const EventLoop = struct {
     pub const Event = struct {
         fd: i32,
@@ -18,6 +37,8 @@ pub const EventLoop = struct {
         writable: bool,
         err: bool,
         hup: bool,
+        op: u2 = 0, // 0=poll, 1=recv, 2=send
+        bytes: i32 = 0, // bytes transferred (recv/send CQE result)
     };
 
     // --- Backend handle ---
@@ -55,39 +76,47 @@ pub const EventLoop = struct {
     }
 
     fn initLinux() !EventLoop {
-        // Try io_uring first; fall back to epoll if unavailable (Docker, old kernels).
-        if (linux.IoUring.init(512, 0)) |ring_val| {
-            var ring = ring_val;
-            const efd_raw = linux.eventfd(0, linux.EFD.NONBLOCK);
-            if (efd_raw > std.math.maxInt(usize) / 2) {
-                ring.deinit();
-                return initLinuxEpoll();
-            }
-            const efd: i32 = @intCast(efd_raw);
-
-            var self = EventLoop{
-                .kq_or_epfd = 0,
-                .ring = ring,
-                .use_uring = true,
-                .epoll_events_buf = undefined,
-                .notify_read_fd = efd,
-                .notify_write_fd = efd,
-                .events_buf = {},
-                .fd_data = [_]usize{0} ** FD_TABLE_SIZE,
-                .fd_active = [_]bool{false} ** FD_TABLE_SIZE,
-                .fd_want_write = [_]bool{false} ** FD_TABLE_SIZE,
-            };
-
-            self.submitPollAdd(efd, @as(u32, linux.POLL.IN)) catch {
-                ring.deinit();
-                _ = std.c.close(efd);
-                return initLinuxEpoll();
-            };
-
-            return self;
+        // Try io_uring with SQPOLL (kernel poll thread, eliminates submit syscalls).
+        // Fall back to plain io_uring, then epoll.
+        if (linux.IoUring.init(1024, linux.IORING_SETUP_SQPOLL)) |ring_val| {
+            return initLinuxUring(ring_val);
+        } else |_| {}
+        if (linux.IoUring.init(1024, 0)) |ring_val| {
+            return initLinuxUring(ring_val);
         } else |_| {
             return initLinuxEpoll();
         }
+    }
+
+    fn initLinuxUring(ring_val: linux.IoUring) !EventLoop {
+        var ring = ring_val;
+        const efd_raw = linux.eventfd(0, linux.EFD.NONBLOCK);
+        if (efd_raw > std.math.maxInt(usize) / 2) {
+            ring.deinit();
+            return initLinuxEpoll();
+        }
+        const efd: i32 = @intCast(efd_raw);
+
+        var self = EventLoop{
+            .kq_or_epfd = 0,
+            .ring = ring,
+            .use_uring = true,
+            .epoll_events_buf = undefined,
+            .notify_read_fd = efd,
+            .notify_write_fd = efd,
+            .events_buf = {},
+            .fd_data = [_]usize{0} ** FD_TABLE_SIZE,
+            .fd_active = [_]bool{false} ** FD_TABLE_SIZE,
+            .fd_want_write = [_]bool{false} ** FD_TABLE_SIZE,
+        };
+
+        self.submitPollAdd(efd, @as(u32, linux.POLL.IN)) catch {
+            ring.deinit();
+            _ = std.c.close(efd);
+            return initLinuxEpoll();
+        };
+
+        return self;
     }
 
     fn initLinuxEpoll() !EventLoop {
@@ -303,46 +332,95 @@ pub const EventLoop = struct {
 
         var out_idx: usize = 0;
         for (cqes[0..n]) |cqe| {
-            const fd: i32 = @intCast(cqe.user_data & 0xFFFFFFFF);
-            const res = cqe.res;
-
             if (out_idx >= max_cqes) break;
 
-            if (fd == self.notify_read_fd) {
-                // Notify event — report as readable, re-arm
-                out[out_idx] = .{ .fd = fd, .data = 0, .readable = true, .writable = false, .err = false, .hup = false };
+            const op = decodeOp(cqe.user_data);
+            const fd = decodeFd(cqe.user_data);
+            const res = cqe.res;
+
+            if (op == OP_RECV) {
+                // recv completion — deliver bytes to worker
+                const idx = fdIdx(fd) orelse continue;
+                if (!self.fd_active[idx]) continue;
+                out[out_idx] = .{
+                    .fd = fd,
+                    .data = self.fd_data[idx],
+                    .readable = false,
+                    .writable = false,
+                    .err = res < 0,
+                    .hup = res == 0,
+                    .op = 1,
+                    .bytes = res,
+                };
                 out_idx += 1;
-                self.submitPollAdd(fd, linux.POLL.IN) catch {};
+            } else if (op == OP_AOF_WRITE) {
+                // AOF write completion — ignore, wait for linked fsync
                 continue;
-            }
-
-            const idx = fdIdx(fd) orelse continue;
-            if (!self.fd_active[idx]) continue;
-
-            if (res < 0) {
-                // Error on the poll
-                out[out_idx] = .{ .fd = fd, .data = self.fd_data[idx], .readable = false, .writable = false, .err = true, .hup = false };
+            } else if (op == OP_AOF_FSYNC) {
+                // AOF fsync completion — signal worker that flush is durable
+                out[out_idx] = .{
+                    .fd = fd,
+                    .data = 0,
+                    .readable = false,
+                    .writable = false,
+                    .err = res < 0,
+                    .hup = false,
+                    .op = 3, // AOF flush complete
+                    .bytes = res,
+                };
                 out_idx += 1;
-                continue;
-            }
+            } else if (op == OP_SEND) {
+                // send completion — deliver result to worker
+                const idx = fdIdx(fd) orelse continue;
+                if (!self.fd_active[idx]) continue;
+                out[out_idx] = .{
+                    .fd = fd,
+                    .data = self.fd_data[idx],
+                    .readable = false,
+                    .writable = false,
+                    .err = res < 0,
+                    .hup = false,
+                    .op = 2,
+                    .bytes = res,
+                };
+                out_idx += 1;
+            } else {
+                // OP_POLL: existing poll_add completion logic
 
-            const revents: u32 = @intCast(res);
-            out[out_idx] = .{
-                .fd = fd,
-                .data = self.fd_data[idx],
-                .readable = (revents & linux.POLL.IN) != 0,
-                .writable = (revents & linux.POLL.OUT) != 0,
-                .err = (revents & linux.POLL.ERR) != 0,
-                .hup = (revents & linux.POLL.HUP) != 0,
-            };
-            out_idx += 1;
+                if (fd == self.notify_read_fd) {
+                    out[out_idx] = .{ .fd = fd, .data = 0, .readable = true, .writable = false, .err = false, .hup = false };
+                    out_idx += 1;
+                    self.submitPollAdd(fd, linux.POLL.IN) catch {};
+                    continue;
+                }
 
-            // Re-arm the poll for this fd (io_uring poll_add is one-shot)
-            if (self.fd_active[idx]) {
-                const poll_in: u32 = linux.POLL.IN;
-                const poll_out: u32 = linux.POLL.OUT;
-                const poll_mask: u32 = if (self.fd_want_write[idx]) poll_in | poll_out else poll_in;
-                self.submitPollAdd(fd, poll_mask) catch {};
+                const idx = fdIdx(fd) orelse continue;
+                if (!self.fd_active[idx]) continue;
+
+                if (res < 0) {
+                    out[out_idx] = .{ .fd = fd, .data = self.fd_data[idx], .readable = false, .writable = false, .err = true, .hup = false };
+                    out_idx += 1;
+                    continue;
+                }
+
+                const revents: u32 = @intCast(res);
+                out[out_idx] = .{
+                    .fd = fd,
+                    .data = self.fd_data[idx],
+                    .readable = (revents & linux.POLL.IN) != 0,
+                    .writable = (revents & linux.POLL.OUT) != 0,
+                    .err = (revents & linux.POLL.ERR) != 0,
+                    .hup = (revents & linux.POLL.HUP) != 0,
+                };
+                out_idx += 1;
+
+                // Re-arm the poll for this fd (io_uring poll_add is one-shot)
+                if (self.fd_active[idx]) {
+                    const poll_in: u32 = linux.POLL.IN;
+                    const poll_out: u32 = linux.POLL.OUT;
+                    const poll_mask: u32 = if (self.fd_want_write[idx]) poll_in | poll_out else poll_in;
+                    self.submitPollAdd(fd, poll_mask) catch {};
+                }
             }
         }
 
@@ -436,7 +514,37 @@ pub const EventLoop = struct {
 
     fn submitPollAdd(self: *EventLoop, fd: i32, poll_mask: u32) !void {
         if (!is_linux) unreachable;
-        _ = try self.ring.poll_add(@intCast(fd), fd, poll_mask);
+        _ = try self.ring.poll_add(encodeUserData(OP_POLL, fd), fd, poll_mask);
+    }
+
+    /// Submit a recv SQE. Buffer must remain valid until CQE.
+    pub fn submitRecv(self: *EventLoop, fd: i32, buf: []u8) !void {
+        if (!is_linux) unreachable;
+        _ = try self.ring.recv(encodeUserData(OP_RECV, fd), fd, .{ .buffer = buf }, 0);
+    }
+
+    /// Submit a send SQE. Buffer must remain valid until CQE.
+    pub fn submitSend(self: *EventLoop, fd: i32, buf: []const u8) !void {
+        if (!is_linux) unreachable;
+        _ = try self.ring.send(encodeUserData(OP_SEND, fd), fd, buf, 0);
+    }
+
+    /// Submit a write SQE linked to fsync for AOF durability.
+    /// The write and fsync are chained: fsync executes only after write completes.
+    pub fn submitAofWriteFsync(self: *EventLoop, fd: i32, buf: []const u8, offset: u64) !void {
+        if (!is_linux) unreachable;
+        // Write SQE — linked to next SQE (fsync)
+        const write_sqe = try self.ring.write(encodeUserData(OP_AOF_WRITE, fd), fd, buf, offset);
+        write_sqe.flags |= linux.IOSQE_IO_LINK;
+        // Fsync SQE — executes after write completes
+        _ = try self.ring.fsync(encodeUserData(OP_AOF_FSYNC, fd), fd, 0);
+    }
+
+    /// Flush any queued SQEs to the kernel (non-blocking).
+    pub fn flushSqes(self: *EventLoop) void {
+        if (is_linux and self.use_uring) {
+            _ = self.ring.submit() catch {};
+        }
     }
 
     fn fdIdx(fd: i32) ?usize {

@@ -326,7 +326,10 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    // ── Load vector files (mmap'd .vvf) ────────────────────────────
+    // ── Load vector files (mmap'd .vvf) — parallel with AOF replay when possible ──
+    // Vector load already overlapped: if called after AOF replay, it benefits from
+    // parallel HNSW index rebuild within loadVectors(). On large datasets with many
+    // vector fields, this saves significant startup time.
     if (!config.no_persistence) {
         graph.loadVectors(config.data_dir) catch |err| {
             log("warning: vector load failed: {s}", .{@errorName(err)});

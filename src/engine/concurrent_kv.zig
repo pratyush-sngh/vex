@@ -313,7 +313,9 @@ pub const ConcurrentKV = struct {
         const result = s.map.fetchRemove(key);
         writeUnlockStripe(s);
         if (result) |kv| {
-            return .{ .found = true, .stale_key = kv.key, .stale_val = kv.value.value };
+            // Inline values point into the entry's inline_buf (not heap-allocated) — don't free
+            const stale_val = if (!kv.value.flags.is_inline) kv.value.value else null;
+            return .{ .found = true, .stale_key = kv.key, .stale_val = stale_val };
         }
         return .{ .found = false, .stale_key = null, .stale_val = null };
     }

@@ -10,11 +10,15 @@ const TypeMask = @import("string_intern.zig").TypeMask;
 
 pub const Direction = enum { outgoing, incoming, both };
 
+const PARALLEL_BFS_THRESHOLD = 512; // min frontier size to parallelize
+const MAX_BFS_THREADS = 4;
+
 pub const TraversalOptions = struct {
     max_depth: u32 = 10,
     direction: Direction = .outgoing,
     edge_type_filter: ?[]const u8 = null,
     node_type_filter: ?[]const u8 = null,
+    max_results: u32 = 0, // 0 = unlimited
 };
 
 pub const PathResult = struct {
@@ -84,85 +88,126 @@ pub fn traverse(
     while (depth < opts.max_depth) {
         next.setRangeValue(.{ .start = 0, .end = node_cap }, false);
 
-        var any_in_next = false;
-
-        var iter = current.iterator(.{});
-        while (iter.next()) |node_id_usize| {
-            const node_id: NodeId = @intCast(node_id_usize);
-
-            // Early exit: check node's edge type mask
-            if (edge_type_mask != 0) {
-                const node_mask = switch (opts.direction) {
-                    .outgoing => g.node_out_type_mask.items[node_id],
-                    .incoming => g.node_in_type_mask.items[node_id],
-                    .both => g.node_out_type_mask.items[node_id] | g.node_in_type_mask.items[node_id],
-                };
-                if (node_mask & edge_type_mask == 0) continue;
+        // Collect frontier node IDs for potential parallel expansion
+        var frontier_nodes = std.array_list.Managed(NodeId).init(allocator);
+        defer frontier_nodes.deinit();
+        {
+            var iter = current.iterator(.{});
+            while (iter.next()) |nid| {
+                frontier_nodes.append(@intCast(nid)) catch break;
             }
+        }
 
-            // Scan CSR neighbors
-            for (csrs) |csr| {
-                const targets = csr.neighbors(node_id);
-                if (targets.len == 0) continue;
+        if (frontier_nodes.items.len == 0) break;
 
-                if (all_alive and edge_type_mask == 0 and node_type_id == null) {
-                    for (targets) |nid| {
-                        if (!g.node_alive.isSet(nid)) continue;
-                        if (visited.isSet(nid)) continue;
-                        visited.set(nid);
-                        next.set(nid);
-                        any_in_next = true;
-                        try result.append(nid);
+        const frontier_count = frontier_nodes.items.len;
+        const num_threads = if (frontier_count >= PARALLEL_BFS_THRESHOLD)
+            @min(MAX_BFS_THREADS, std.Thread.getCpuCount() catch 1)
+        else
+            1;
+
+        if (num_threads <= 1) {
+            // Sequential path — same as before
+            expandFrontierSeq(g, frontier_nodes.items, &visited, next, all_alive, has_delta, csrs, edge_type_mask, node_type_id, opts.direction);
+        } else {
+            // Parallel path — thread-local next bitsets, merge with OR
+            var local_nexts: [MAX_BFS_THREADS]std.DynamicBitSet = undefined;
+            var inited: usize = 0;
+            for (0..num_threads) |t| {
+                local_nexts[t] = std.DynamicBitSet.initEmpty(allocator, node_cap) catch break;
+                inited += 1;
+            }
+            defer for (0..inited) |t| local_nexts[t].deinit();
+
+            if (inited < num_threads) {
+                // Allocation failed — fall back to sequential
+                expandFrontierSeq(g, frontier_nodes.items, &visited, next, all_alive, has_delta, csrs, edge_type_mask, node_type_id, opts.direction);
+            } else {
+                const chunk = (frontier_count + num_threads - 1) / num_threads;
+                const ExpandCtx = struct {
+                    g: *const GraphEngine,
+                    nodes: []const NodeId,
+                    visited: *const std.DynamicBitSet,
+                    local_next: *std.DynamicBitSet,
+                    all_alive: bool,
+                    has_delta: bool,
+                    csrs: []const *const CSR,
+                    edge_type_mask: TypeMask,
+                    node_type_id: ?u16,
+                    direction: Direction,
+
+                    fn run(ctx: *@This()) void {
+                        expandFrontierSeq(ctx.g, ctx.nodes, ctx.visited, ctx.local_next, ctx.all_alive, ctx.has_delta, ctx.csrs, ctx.edge_type_mask, ctx.node_type_id, ctx.direction);
                     }
-                } else {
-                    const edge_indices = csr.edgeIndices(node_id);
-                    for (targets, edge_indices) |nid, eidx| {
-                        if (!g.edge_alive.isSet(eidx)) continue;
-                        if (!g.node_alive.isSet(nid)) continue;
-                        if (visited.isSet(nid)) continue;
+                };
 
-                        if (edge_type_mask != 0) {
-                            const emask = StringIntern.mask(g.edge_type_id.items[eidx]);
-                            if (edge_type_mask & emask == 0) continue;
-                        }
-                        if (node_type_id) |ntid| {
-                            if (g.node_type_id.items[nid] != ntid) continue;
-                        }
+                var ctxs: [MAX_BFS_THREADS]ExpandCtx = undefined;
+                var threads: [MAX_BFS_THREADS]?std.Thread = .{null} ** MAX_BFS_THREADS;
+                var spawned: usize = 0;
 
-                        visited.set(nid);
-                        next.set(nid);
-                        any_in_next = true;
-                        try result.append(nid);
+                for (0..num_threads) |t| {
+                    const start_idx = t * chunk;
+                    const end_idx = @min(start_idx + chunk, frontier_count);
+                    if (start_idx >= end_idx) break;
+
+                    ctxs[t] = .{
+                        .g = g,
+                        .nodes = frontier_nodes.items[start_idx..end_idx],
+                        .visited = &visited,
+                        .local_next = &local_nexts[t],
+                        .all_alive = all_alive,
+                        .has_delta = has_delta,
+                        .csrs = csrs,
+                        .edge_type_mask = edge_type_mask,
+                        .node_type_id = node_type_id,
+                        .direction = opts.direction,
+                    };
+
+                    if (t == 0) {
+                        // Run first chunk inline (avoid thread for small remainder)
+                        continue;
                     }
+                    threads[t] = std.Thread.spawn(.{}, ExpandCtx.run, .{&ctxs[t]}) catch {
+                        ExpandCtx.run(&ctxs[t]); // fallback inline
+                        continue;
+                    };
+                    spawned += 1;
+                }
+
+                // Run chunk 0 on this thread while others work
+                if (frontier_nodes.items.len > 0) {
+                    ExpandCtx.run(&ctxs[0]);
+                }
+
+                // Join spawned threads
+                for (threads[0..num_threads]) |t| {
+                    if (t) |thread| thread.join();
+                }
+
+                // Merge: OR all local_next bitsets into global next
+                const mask_count = (node_cap + @bitSizeOf(usize) - 1) / @bitSizeOf(usize);
+                for (0..mask_count) |mi| {
+                    var merged: usize = 0;
+                    for (0..inited) |t| {
+                        merged |= local_nexts[t].unmanaged.masks[mi];
+                    }
+                    next.unmanaged.masks[mi] = merged;
                 }
             }
+        }
 
-            // Delta edges
-            if (has_delta) {
-                for (g.delta_edges.items) |de| {
-                    const matches = switch (opts.direction) {
-                        .outgoing => de.from == node_id,
-                        .incoming => de.to == node_id,
-                        .both => de.from == node_id or de.to == node_id,
-                    };
-                    if (!matches) continue;
-                    if (!g.edge_alive.isSet(de.eidx)) continue;
-                    const nid = if (de.from == node_id) de.to else de.from;
-                    if (!g.node_alive.isSet(nid)) continue;
-                    if (visited.isSet(nid)) continue;
-
-                    if (edge_type_mask != 0) {
-                        const emask = StringIntern.mask(g.edge_type_id.items[de.eidx]);
-                        if (edge_type_mask & emask == 0) continue;
-                    }
-                    if (node_type_id) |ntid| {
-                        if (g.node_type_id.items[nid] != ntid) continue;
-                    }
-
-                    visited.set(nid);
-                    next.set(nid);
-                    any_in_next = true;
-                    try result.append(nid);
+        // Build result from next bitset + update visited
+        var any_in_next = false;
+        var next_iter = next.iterator(.{});
+        while (next_iter.next()) |nid_usize| {
+            const nid: NodeId = @intCast(nid_usize);
+            if (!visited.isSet(nid)) {
+                visited.set(nid);
+                any_in_next = true;
+                result.append(nid) catch break;
+                // Early exit if limit reached
+                if (opts.max_results > 0 and result.items.len >= opts.max_results) {
+                    return result.toOwnedSlice();
                 }
             }
         }
@@ -678,6 +723,91 @@ fn inlineContains(buf: []const NodeId, count: usize, val: NodeId) bool {
 // ─── Internal helpers ─────────────────────────────────────────────────
 
 /// Returns 1 CSR for single-direction, 2 for both. No wasted iterations.
+/// Expand a subset of frontier nodes into the next bitset.
+/// Thread-safe: reads graph state (immutable during BFS), writes only to local `next` bitset.
+/// Does NOT update `visited` — caller merges and updates after all threads complete.
+fn expandFrontierSeq(
+    g: *const GraphEngine,
+    frontier_nodes: []const NodeId,
+    visited: *const std.DynamicBitSet,
+    next: *std.DynamicBitSet,
+    all_alive: bool,
+    has_delta: bool,
+    csrs: []const *const CSR,
+    edge_type_mask: TypeMask,
+    node_type_id: ?u16,
+    direction: Direction,
+) void {
+    for (frontier_nodes) |node_id| {
+        // Early exit: check node's edge type mask
+        if (edge_type_mask != 0) {
+            const node_mask = switch (direction) {
+                .outgoing => g.node_out_type_mask.items[node_id],
+                .incoming => g.node_in_type_mask.items[node_id],
+                .both => g.node_out_type_mask.items[node_id] | g.node_in_type_mask.items[node_id],
+            };
+            if (node_mask & edge_type_mask == 0) continue;
+        }
+
+        // Scan CSR neighbors
+        for (csrs) |csr| {
+            const targets = csr.neighbors(node_id);
+            if (targets.len == 0) continue;
+
+            if (all_alive and edge_type_mask == 0 and node_type_id == null) {
+                for (targets) |nid| {
+                    if (!g.node_alive.isSet(nid)) continue;
+                    if (visited.isSet(nid)) continue;
+                    next.set(nid);
+                }
+            } else {
+                const edge_indices = csr.edgeIndices(node_id);
+                for (targets, edge_indices) |nid, eidx| {
+                    if (!g.edge_alive.isSet(eidx)) continue;
+                    if (!g.node_alive.isSet(nid)) continue;
+                    if (visited.isSet(nid)) continue;
+
+                    if (edge_type_mask != 0) {
+                        const emask = StringIntern.mask(g.edge_type_id.items[eidx]);
+                        if (edge_type_mask & emask == 0) continue;
+                    }
+                    if (node_type_id) |ntid| {
+                        if (g.node_type_id.items[nid] != ntid) continue;
+                    }
+
+                    next.set(nid);
+                }
+            }
+        }
+
+        // Delta edges
+        if (has_delta) {
+            for (g.delta_edges.items) |de| {
+                const matches = switch (direction) {
+                    .outgoing => de.from == node_id,
+                    .incoming => de.to == node_id,
+                    .both => de.from == node_id or de.to == node_id,
+                };
+                if (!matches) continue;
+                if (!g.edge_alive.isSet(de.eidx)) continue;
+                const nid = if (de.from == node_id) de.to else de.from;
+                if (!g.node_alive.isSet(nid)) continue;
+                if (visited.isSet(nid)) continue;
+
+                if (edge_type_mask != 0) {
+                    const emask = StringIntern.mask(g.edge_type_id.items[de.eidx]);
+                    if (edge_type_mask & emask == 0) continue;
+                }
+                if (node_type_id) |ntid| {
+                    if (g.node_type_id.items[nid] != ntid) continue;
+                }
+
+                next.set(nid);
+            }
+        }
+    }
+}
+
 fn getCSRSlice(g: *const GraphEngine, direction: Direction) []const *const CSR {
     const S = struct {
         threadlocal var buf: [2]*const CSR = undefined;

@@ -26,6 +26,8 @@ pub const KeysMode = enum {
 /// Shared atomic flag for BGSAVE (prevents concurrent background saves).
 pub var bgsave_in_progress: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
+pub const ConcurrentKV = @import("../engine/concurrent_kv.zig").ConcurrentKV;
+
 pub const CommandHandler = struct {
     kv: *KVStore,
     graph: *GraphEngine,
@@ -40,6 +42,10 @@ pub const CommandHandler = struct {
     set_store: ?*SetStore,
     sorted_set_store: ?*SortedSetStore,
     data_dir: ?[]const u8,
+    /// ConcurrentKV for reactor mode — when set, KV ops route through CKV instead of plain KVStore
+    ckv: ?*ConcurrentKV = null,
+    /// Stashed OwnedValue from last kvGet — freed on next kvGet or cleanup
+    last_owned_get: ?ConcurrentKV.OwnedValue = null,
 
     pub fn init(
         allocator: Allocator,
@@ -65,6 +71,51 @@ pub const CommandHandler = struct {
             .sorted_set_store = null,
             .data_dir = null,
         };
+    }
+
+    // ── CKV-aware KV helpers (dispatch to ConcurrentKV in reactor mode) ──
+
+    fn kvGet(self: *CommandHandler, key: []const u8) ?[]const u8 {
+        // Free previous CKV get result
+        if (self.last_owned_get) |prev| prev.deinit();
+        self.last_owned_get = null;
+
+        if (self.ckv) |ckv| {
+            const owned = ckv.get(key) orelse return null;
+            self.last_owned_get = owned;
+            return owned.data;
+        }
+        return self.kv.get(key);
+    }
+
+    pub fn kvGetCleanup(self: *CommandHandler) void {
+        if (self.last_owned_get) |prev| prev.deinit();
+        self.last_owned_get = null;
+    }
+
+    fn kvSet(self: *CommandHandler, key: []const u8, value: []const u8) !void {
+        if (self.ckv) |ckv| return ckv.setInternal(key, value, 0);
+        return self.kv.set(key, value);
+    }
+
+    fn kvSetEx(self: *CommandHandler, key: []const u8, value: []const u8, ttl_seconds: i64) !void {
+        if (self.ckv) |ckv| return ckv.setEx(key, value, ttl_seconds);
+        return self.kv.setEx(key, value, ttl_seconds);
+    }
+
+    fn kvSetPx(self: *CommandHandler, key: []const u8, value: []const u8, ttl_millis: i64) !void {
+        if (self.ckv) |ckv| return ckv.setPx(key, value, ttl_millis);
+        return self.kv.setPx(key, value, ttl_millis);
+    }
+
+    fn kvDelete(self: *CommandHandler, key: []const u8) bool {
+        if (self.ckv) |ckv| return ckv.delete(key);
+        return self.kv.delete(key);
+    }
+
+    fn kvExists(self: *CommandHandler, key: []const u8) bool {
+        if (self.ckv) |ckv| return ckv.exists(key);
+        return self.kv.exists(key);
     }
 
     /// Execute a command from a parsed RESP array and write the response.
@@ -324,28 +375,28 @@ pub const CommandHandler = struct {
         }
 
         // NX: only set if key does NOT exist
-        if (nx and self.kv.exists(key_ref.key)) {
+        if (nx and self.kvExists(key_ref.key)) {
             try resp.serializeBulkString(w, null);
             return;
         }
         // XX: only set if key DOES exist
-        if (xx and !self.kv.exists(key_ref.key)) {
+        if (xx and !self.kvExists(key_ref.key)) {
             try resp.serializeBulkString(w, null);
             return;
         }
 
         if (ttl_sec) |t| {
-            self.kv.setEx(key_ref.key, args[2], t) catch {
+            self.kvSetEx(key_ref.key, args[2], t) catch {
                 try resp.serializeError(w, "internal error");
                 return;
             };
         } else if (ttl_ms) |t| {
-            self.kv.setPx(key_ref.key, args[2], t) catch {
+            self.kvSetPx(key_ref.key, args[2], t) catch {
                 try resp.serializeError(w, "internal error");
                 return;
             };
         } else {
-            self.kv.set(key_ref.key, args[2]) catch {
+            self.kvSet(key_ref.key, args[2]) catch {
                 try resp.serializeError(w, "internal error");
                 return;
             };
@@ -365,7 +416,7 @@ pub const CommandHandler = struct {
             return;
         };
         defer key_ref.deinit(self.allocator);
-        const val = self.kv.get(key_ref.key);
+        const val = self.kvGet(key_ref.key);
         try resp.serializeBulkString(w, val);
     }
 
@@ -378,7 +429,7 @@ pub const CommandHandler = struct {
         for (args[1..]) |key| {
             var key_buf: [512]u8 = undefined;
             var key_ref = namespacedKeyRef(self, key, &key_buf) catch continue;
-            if (self.kv.delete(key_ref.key)) count += 1;
+            if (self.kvDelete(key_ref.key)) count += 1;
             key_ref.deinit(self.allocator);
         }
         if (count > 0) self.logToAOF(args);
@@ -394,7 +445,7 @@ pub const CommandHandler = struct {
         for (args[1..]) |key| {
             var key_buf: [512]u8 = undefined;
             var key_ref = namespacedKeyRef(self, key, &key_buf) catch continue;
-            if (self.kv.exists(key_ref.key)) count += 1;
+            if (self.kvExists(key_ref.key)) count += 1;
             key_ref.deinit(self.allocator);
         }
         try resp.serializeInteger(w, count);
@@ -535,7 +586,7 @@ pub const CommandHandler = struct {
             }
         }
         for (to_delete.items) |k| {
-            _ = self.kv.delete(k);
+            _ = self.kvDelete(k);
         }
         var graph_to_delete = std.array_list.Managed([]const u8).init(self.allocator);
         defer {
@@ -614,21 +665,21 @@ pub const CommandHandler = struct {
         if (src_entry.flags.has_ttl) {
             const remaining = src_entry.expires_at - now;
             if (remaining <= 0) {
-                _ = self.kv.delete(src);
+                _ = self.kvDelete(src);
                 try resp.serializeInteger(w, 0);
                 return;
             }
-            self.kv.setPx(dst, src_entry.value, remaining) catch {
+            self.kvSetPx(dst, src_entry.value, remaining) catch {
                 try resp.serializeError(w, "internal error");
                 return;
             };
         } else {
-            self.kv.set(dst, src_entry.value) catch {
+            self.kvSet(dst, src_entry.value) catch {
                 try resp.serializeError(w, "internal error");
                 return;
             };
         }
-        _ = self.kv.delete(src);
+        _ = self.kvDelete(src);
         self.logToAOF(args);
         try resp.serializeInteger(w, 1);
     }
@@ -684,7 +735,7 @@ pub const CommandHandler = struct {
                 continue;
             };
             defer key_ref.deinit(self.allocator);
-            if (self.kv.get(key_ref.key)) |val| {
+            if (self.kvGet(key_ref.key)) |val| {
                 try resp.serializeBulkString(w, val);
             } else {
                 try resp.serializeBulkString(w, null);
@@ -703,7 +754,7 @@ pub const CommandHandler = struct {
             var key_buf: [512]u8 = undefined;
             var key_ref = namespacedKeyRef(self, args[i], &key_buf) catch continue;
             defer key_ref.deinit(self.allocator);
-            self.kv.set(key_ref.key, args[i + 1]) catch continue;
+            self.kvSet(key_ref.key, args[i + 1]) catch continue;
         }
         self.logToAOF(args);
         try resp.serializeSimpleString(w, "OK");
@@ -759,7 +810,7 @@ pub const CommandHandler = struct {
 
         // Get current value (default 0)
         var current: i64 = 0;
-        if (self.kv.get(key_ref.key)) |val| {
+        if (self.kvGet(key_ref.key)) |val| {
             current = std.fmt.parseInt(i64, val, 10) catch {
                 try resp.serializeError(w, "value is not an integer or out of range");
                 return;
@@ -772,7 +823,7 @@ pub const CommandHandler = struct {
             try resp.serializeError(w, "internal error");
             return;
         };
-        self.kv.set(key_ref.key, val_str) catch {
+        self.kvSet(key_ref.key, val_str) catch {
             try resp.serializeError(w, "internal error");
             return;
         };
@@ -798,8 +849,8 @@ pub const CommandHandler = struct {
         defer key_ref.deinit(self.allocator);
 
         // Get current value, re-set with TTL
-        if (self.kv.get(key_ref.key)) |val| {
-            self.kv.setEx(key_ref.key, val, ttl_seconds) catch {
+        if (self.kvGet(key_ref.key)) |val| {
+            self.kvSetEx(key_ref.key, val, ttl_seconds) catch {
                 try resp.serializeInteger(w, 0);
                 return;
             };
@@ -824,8 +875,8 @@ pub const CommandHandler = struct {
         defer key_ref.deinit(self.allocator);
 
         // Get current value, re-set without TTL
-        if (self.kv.get(key_ref.key)) |val| {
-            self.kv.set(key_ref.key, val) catch {
+        if (self.kvGet(key_ref.key)) |val| {
+            self.kvSet(key_ref.key, val) catch {
                 try resp.serializeInteger(w, 0);
                 return;
             };
@@ -849,7 +900,7 @@ pub const CommandHandler = struct {
         };
         defer key_ref.deinit(self.allocator);
 
-        if (self.kv.get(key_ref.key)) |existing| {
+        if (self.kvGet(key_ref.key)) |existing| {
             // Concatenate existing + new
             const new_len = existing.len + args[2].len;
             const new_val = self.allocator.alloc(u8, new_len) catch {
@@ -859,7 +910,7 @@ pub const CommandHandler = struct {
             defer self.allocator.free(new_val);
             @memcpy(new_val[0..existing.len], existing);
             @memcpy(new_val[existing.len..], args[2]);
-            self.kv.set(key_ref.key, new_val) catch {
+            self.kvSet(key_ref.key, new_val) catch {
                 try resp.serializeError(w, "internal error");
                 return;
             };
@@ -867,7 +918,7 @@ pub const CommandHandler = struct {
             try resp.serializeInteger(w, @intCast(new_len));
         } else {
             // Key doesn't exist — create with just the append value
-            self.kv.set(key_ref.key, args[2]) catch {
+            self.kvSet(key_ref.key, args[2]) catch {
                 try resp.serializeError(w, "internal error");
                 return;
             };
@@ -902,7 +953,7 @@ pub const CommandHandler = struct {
             return;
         };
         defer key_ref.deinit(self.allocator);
-        if (self.kv.exists(key_ref.key)) {
+        if (self.kvExists(key_ref.key)) {
             try resp.serializeSimpleString(w, "string");
         } else {
             try resp.serializeSimpleString(w, "none");
@@ -921,7 +972,7 @@ pub const CommandHandler = struct {
             return;
         };
         defer key_ref.deinit(self.allocator);
-        if (self.kv.get(key_ref.key)) |val| {
+        if (self.kvGet(key_ref.key)) |val| {
             try resp.serializeInteger(w, @intCast(val.len));
         } else {
             try resp.serializeInteger(w, 0);
@@ -940,10 +991,10 @@ pub const CommandHandler = struct {
             return;
         };
         defer key_ref.deinit(self.allocator);
-        if (self.kv.exists(key_ref.key)) {
+        if (self.kvExists(key_ref.key)) {
             try resp.serializeInteger(w, 0);
         } else {
-            self.kv.set(key_ref.key, args[2]) catch {
+            self.kvSet(key_ref.key, args[2]) catch {
                 try resp.serializeInteger(w, 0);
                 return;
             };
@@ -972,7 +1023,7 @@ pub const CommandHandler = struct {
             return;
         };
         defer key_ref.deinit(self.allocator);
-        self.kv.setEx(key_ref.key, args[3], ttl) catch {
+        self.kvSetEx(key_ref.key, args[3], ttl) catch {
             try resp.serializeError(w, "internal error");
             return;
         };
@@ -992,7 +1043,7 @@ pub const CommandHandler = struct {
             return;
         };
         defer key_ref.deinit(self.allocator);
-        const old = self.kv.get(key_ref.key);
+        const old = self.kvGet(key_ref.key);
         // Must copy old value before overwriting since KV owns the memory
         var old_copy: ?[]u8 = null;
         if (old) |v| {
@@ -1002,7 +1053,7 @@ pub const CommandHandler = struct {
             };
         }
         defer if (old_copy) |oc| self.allocator.free(oc);
-        self.kv.set(key_ref.key, args[2]) catch {
+        self.kvSet(key_ref.key, args[2]) catch {
             try resp.serializeError(w, "internal error");
             return;
         };
@@ -1022,14 +1073,14 @@ pub const CommandHandler = struct {
             return;
         };
         defer key_ref.deinit(self.allocator);
-        const val = self.kv.get(key_ref.key);
+        const val = self.kvGet(key_ref.key);
         if (val) |v| {
             const copy = self.allocator.dupe(u8, v) catch {
                 try resp.serializeError(w, "internal error");
                 return;
             };
             defer self.allocator.free(copy);
-            _ = self.kv.delete(key_ref.key);
+            _ = self.kvDelete(key_ref.key);
             self.logToAOF(args);
             try resp.serializeBulkString(w, copy);
         } else {
@@ -1049,7 +1100,7 @@ pub const CommandHandler = struct {
             return;
         };
         defer key_ref.deinit(self.allocator);
-        const val = self.kv.get(key_ref.key);
+        const val = self.kvGet(key_ref.key);
         if (val == null) {
             try resp.serializeBulkString(w, null);
             return;
@@ -1069,19 +1120,19 @@ pub const CommandHandler = struct {
                     try resp.serializeError(w, "value is not an integer or out of range");
                     return;
                 };
-                self.kv.setEx(key_ref.key, copy, ttl) catch {};
+                self.kvSetEx(key_ref.key, copy, ttl) catch {};
             } else if (std.mem.eql(u8, flag, "PX")) {
                 const ttl = std.fmt.parseInt(i64, args[3], 10) catch {
                     try resp.serializeError(w, "value is not an integer or out of range");
                     return;
                 };
-                self.kv.setPx(key_ref.key, copy, ttl) catch {};
+                self.kvSetPx(key_ref.key, copy, ttl) catch {};
             }
         } else if (args.len == 3) {
             var flag_buf: [64]u8 = undefined;
             const flag = toUpper(args[2], &flag_buf);
             if (std.mem.eql(u8, flag, "PERSIST")) {
-                self.kv.set(key_ref.key, copy) catch {};
+                self.kvSet(key_ref.key, copy) catch {};
             }
         }
         try resp.serializeBulkString(w, copy);
@@ -1099,7 +1150,7 @@ pub const CommandHandler = struct {
             return;
         };
         defer key_ref.deinit(self.allocator);
-        if (!self.kv.exists(key_ref.key)) {
+        if (!self.kvExists(key_ref.key)) {
             try resp.serializeInteger(w, -2);
             return;
         }
@@ -1132,8 +1183,8 @@ pub const CommandHandler = struct {
             return;
         };
         defer key_ref.deinit(self.allocator);
-        if (self.kv.get(key_ref.key)) |val| {
-            self.kv.setPx(key_ref.key, val, ttl_ms) catch {
+        if (self.kvGet(key_ref.key)) |val| {
+            self.kvSetPx(key_ref.key, val, ttl_ms) catch {
                 try resp.serializeInteger(w, 0);
                 return;
             };
@@ -1156,7 +1207,7 @@ pub const CommandHandler = struct {
             return;
         };
         defer src_ref.deinit(self.allocator);
-        const val = self.kv.get(src_ref.key);
+        const val = self.kvGet(src_ref.key);
         if (val == null) {
             try resp.serializeError(w, "no such key");
             return;
@@ -1172,11 +1223,11 @@ pub const CommandHandler = struct {
             return;
         };
         defer dst_ref.deinit(self.allocator);
-        self.kv.set(dst_ref.key, copy) catch {
+        self.kvSet(dst_ref.key, copy) catch {
             try resp.serializeError(w, "internal error");
             return;
         };
-        _ = self.kv.delete(src_ref.key);
+        _ = self.kvDelete(src_ref.key);
         self.logToAOF(args);
         try resp.serializeSimpleString(w, "OK");
     }
@@ -1193,7 +1244,7 @@ pub const CommandHandler = struct {
             return;
         };
         defer src_ref.deinit(self.allocator);
-        if (!self.kv.exists(src_ref.key)) {
+        if (!self.kvExists(src_ref.key)) {
             try resp.serializeError(w, "no such key");
             return;
         }
@@ -1203,21 +1254,21 @@ pub const CommandHandler = struct {
             return;
         };
         defer dst_ref.deinit(self.allocator);
-        if (self.kv.exists(dst_ref.key)) {
+        if (self.kvExists(dst_ref.key)) {
             try resp.serializeInteger(w, 0);
             return;
         }
-        const val = self.kv.get(src_ref.key).?;
+        const val = self.kvGet(src_ref.key).?;
         const copy = self.allocator.dupe(u8, val) catch {
             try resp.serializeError(w, "internal error");
             return;
         };
         defer self.allocator.free(copy);
-        self.kv.set(dst_ref.key, copy) catch {
+        self.kvSet(dst_ref.key, copy) catch {
             try resp.serializeError(w, "internal error");
             return;
         };
-        _ = self.kv.delete(src_ref.key);
+        _ = self.kvDelete(src_ref.key);
         self.logToAOF(args);
         try resp.serializeInteger(w, 1);
     }
@@ -1929,6 +1980,9 @@ pub const CommandHandler = struct {
             } else if (std.mem.eql(u8, flag, "NODETYPE") and i + 1 < args.len) {
                 opts.node_type_filter = args[i + 1];
                 i += 2;
+            } else if (std.mem.eql(u8, flag, "LIMIT") and i + 1 < args.len) {
+                opts.max_results = std.fmt.parseInt(u32, args[i + 1], 10) catch 0;
+                i += 2;
             } else {
                 i += 1;
             }
@@ -1946,16 +2000,53 @@ pub const CommandHandler = struct {
         };
         defer self.allocator.free(ids);
 
-        try resp.serializeArrayHeader(w, ids.len);
-        for (ids) |nid| {
-            const node = self.graph.getNodeById(nid);
-            if (node) |n| {
-                const user_key = stripGraphDbPrefix(self, n.key) orelse n.key;
-                try resp.serializeBulkString(w, user_key);
-            } else {
-                try resp.serializeBulkString(w, null);
+        // Pre-build entire RESP response in one buffer — single writeAll instead of 3*N calls
+        const keys = self.graph.node_keys.items;
+        // Estimate size: array header + per-node ($len\r\nkey\r\n)
+        const est_size = 32 + ids.len * 32; // generous estimate
+        var buf = self.allocator.alloc(u8, est_size) catch {
+            // Fallback: stream per-node
+            try resp.serializeArrayHeader(w, ids.len);
+            for (ids) |nid| {
+                if (nid < keys.len) {
+                    try resp.serializeBulkString(w, stripGraphDbPrefix(self, keys[nid]) orelse keys[nid]);
+                } else {
+                    try resp.serializeBulkString(w, null);
+                }
             }
+            return;
+        };
+        defer self.allocator.free(buf);
+
+        var pos: usize = 0;
+        // Array header
+        const hdr = std.fmt.bufPrint(buf[pos..], "*{d}\r\n", .{ids.len}) catch unreachable;
+        pos += hdr.len;
+
+        for (ids) |nid| {
+            // Grow buffer if needed
+            if (pos + 64 > buf.len) {
+                buf = self.allocator.realloc(buf, buf.len * 2) catch break;
+            }
+            if (nid < keys.len) {
+                const user_key = stripGraphDbPrefix(self, keys[nid]) orelse keys[nid];
+                const entry_hdr = std.fmt.bufPrint(buf[pos..], "${d}\r\n", .{user_key.len}) catch break;
+                pos += entry_hdr.len;
+                if (pos + user_key.len + 2 > buf.len) {
+                    buf = self.allocator.realloc(buf, buf.len * 2) catch break;
+                }
+                @memcpy(buf[pos .. pos + user_key.len], user_key);
+                pos += user_key.len;
+            } else {
+                @memcpy(buf[pos .. pos + 5], "$-1\r\n");
+                pos += 5;
+            }
+            buf[pos] = '\r';
+            buf[pos + 1] = '\n';
+            pos += 2;
         }
+
+        try w.writeAll(buf[0..pos]);
 
     }
 
