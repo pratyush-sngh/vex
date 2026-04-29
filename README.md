@@ -255,8 +255,8 @@ src/
 
 ## Changelog
 
-### v0.6.0 -- Vector Search & GRAPH.RAG
-GRAPH.SETVEC/GETVEC/VECSEARCH for storing and searching embeddings on graph nodes. GRAPH.RAG combines vector ANN search + graph BFS expansion in a single command — purpose-built for agentic AI and RAG pipelines. HNSW index (M=16, ef=200/50), cosine similarity, graph-native NodeId results.
+### v0.6.0 -- Vector Search, GRAPH.RAG & Performance
+GRAPH.SETVEC/GETVEC/VECSEARCH for storing and searching embeddings on graph nodes. GRAPH.RAG combines vector ANN search + graph BFS expansion in a single command — purpose-built for agentic AI and RAG pipelines. HNSW index (M=16, ef=200/50), cosine similarity, graph-native NodeId results. io_uring recv/send for TCP I/O, SQPOLL + async AOF fsync + Direct I/O. Batch commands (MGET/MSET/HMGET/HMSET/HGETALL), RESP serialization optimization, parallel BFS frontier expansion, parallel vector field load/save.
 
 ### v0.5.0 -- Sets & Sorted Sets
 Sets (SADD/SREM/SMEMBERS/SISMEMBER/SCARD/SUNION/SINTER/SDIFF), Sorted Sets (ZADD/ZREM/ZRANGE/ZSCORE/ZRANK/ZCARD/ZINCRBY/ZCOUNT). All 5 Redis data types now supported.
@@ -276,11 +276,6 @@ Redis-compatible KV + graph DB with multi-reactor architecture.
 ---
 
 ## Roadmap
-
-### v0.6 -- io_uring & Networking
-- io_uring batched read/write (Linux) — batch syscalls into single kernel submission
-- Full io_uring event loop (replace epoll fallback)
-- Connection lifecycle management via io_uring (accept, close)
 
 ### v0.7 -- Partitioned Graph & Graph Query
 - Hash-partition graph nodes across machines
@@ -303,6 +298,7 @@ Redis-compatible KV + graph DB with multi-reactor architecture.
 
 ### v0.9 -- DPDK, Scripting & Query
 - DPDK kernel bypass networking (optional, Linux)
+- Full io_uring event loop with connection lifecycle management (accept, close)
 - Lua scripting (`EVAL`/`EVALSHA`)
 - Graph secondary indexes on properties
 - Cypher query language subset
