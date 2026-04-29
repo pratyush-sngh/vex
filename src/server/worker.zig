@@ -1791,6 +1791,93 @@ pub const Worker = struct {
                 else => {},
             },
             4 => switch (first) {
+                'M' => if (args.len >= 2 and equalsAsciiUpper(cmd, "MGET")) {
+                    // Ultra-fast MGET: batch lookup via ConcurrentKV, single RESP write
+                    const KVS = @import("../engine/kv.zig").KVStore;
+                    const key_count = args.len - 1;
+
+                    // Pre-size response buffer: array header + per-key estimate
+                    const est = 32 + key_count * 64;
+                    conn.write_buf.ensureTotalCapacity(conn.write_buf.items.len + est) catch {};
+
+                    // Write array header
+                    var hdr_buf: [32]u8 = undefined;
+                    const hdr = std.fmt.bufPrint(&hdr_buf, "*{d}\r\n", .{key_count}) catch return false;
+                    conn.write_buf.appendSlice(hdr) catch {};
+
+                    for (args[1..]) |user_key| {
+                        const ns = nsKey(conn.selected_db, user_key) orelse {
+                            conn.write_buf.appendSlice("$-1\r\n") catch {};
+                            continue;
+                        };
+
+                        const stripe = ckv.getStripePublic(ns);
+                        const entry_opt = stripe.map.getPtr(ns);
+                        if (entry_opt == null) {
+                            conn.write_buf.appendSlice("$-1\r\n") catch {};
+                            continue;
+                        }
+                        const entry = entry_opt.?;
+
+                        if (entry.flags.deleted or
+                            (entry.flags.has_ttl and ckv.cached_now_ms > entry.expires_at))
+                        {
+                            conn.write_buf.appendSlice("$-1\r\n") catch {};
+                            continue;
+                        }
+
+                        // Integer path
+                        if (entry.flags.is_integer) {
+                            var int_buf: [24]u8 = undefined;
+                            const int_str = std.fmt.bufPrint(&int_buf, "{d}", .{entry.int_value}) catch {
+                                conn.write_buf.appendSlice("$-1\r\n") catch {};
+                                continue;
+                            };
+                            var val_hdr: [32]u8 = undefined;
+                            const vh = std.fmt.bufPrint(&val_hdr, "${d}\r\n", .{int_str.len}) catch continue;
+                            conn.write_buf.appendSlice(vh) catch {};
+                            conn.write_buf.appendSlice(int_str) catch {};
+                            conn.write_buf.appendSlice("\r\n") catch {};
+                            continue;
+                        }
+
+                        // Inline value path: SeqLock read
+                        if (entry.flags.is_inline) {
+                            var val_copy: [KVS.INLINE_BUF_SIZE]u8 = undefined;
+                            var vlen: u8 = undefined;
+                            var attempts: u32 = 0;
+                            while (attempts < 64) : (attempts += 1) {
+                                const s1 = entry.seq.load(.acquire);
+                                if (s1 & 1 != 0) { std.atomic.spinLoopHint(); continue; }
+                                vlen = entry.inline_len;
+                                @memcpy(val_copy[0..vlen], entry.inline_buf[0..vlen]);
+                                const s2 = entry.seq.load(.acquire);
+                                if (s1 == s2) break;
+                                std.atomic.spinLoopHint();
+                            }
+                            var val_hdr: [32]u8 = undefined;
+                            const vh = std.fmt.bufPrint(&val_hdr, "${d}\r\n", .{vlen}) catch continue;
+                            conn.write_buf.appendSlice(vh) catch {};
+                            conn.write_buf.appendSlice(val_copy[0..vlen]) catch {};
+                            conn.write_buf.appendSlice("\r\n") catch {};
+                            continue;
+                        }
+
+                        // Large value fallback: read lock
+                        ckv.readLockStripePublic(stripe);
+                        const vlen = entry.value.len;
+                        var val_hdr: [32]u8 = undefined;
+                        const vh = std.fmt.bufPrint(&val_hdr, "${d}\r\n", .{vlen}) catch {
+                            ckv.readUnlockStripePublic(stripe);
+                            continue;
+                        };
+                        conn.write_buf.appendSlice(vh) catch {};
+                        conn.write_buf.appendSlice(entry.value) catch {};
+                        conn.write_buf.appendSlice("\r\n") catch {};
+                        ckv.readUnlockStripePublic(stripe);
+                    }
+                    return true;
+                },
                 'P' => if (equalsAsciiUpper(cmd, "PING")) {
                     if (args.len > 1) writeBulkTo(&conn.write_buf, args[1]) else conn.write_buf.appendSlice(ct.resp_pong) catch {};
                     return true;
