@@ -1598,14 +1598,17 @@ pub const Worker = struct {
                 self.allocator, self.io, self.kv, self.graph, self.aof,
                 &selected_db, self.keys_mode,
             );
+            handler.ckv = self.ckv;
             var list: std.ArrayList(u8) = .empty;
             defer list.deinit(self.allocator);
             var aw = std.Io.Writer.Allocating.fromArrayList(self.allocator, &list);
             defer aw.deinit();
             handler.execute(args, &aw.writer) catch {
+                handler.kvGetCleanup();
                 conn.write_buf.appendSlice("-ERR internal error\r\n") catch {};
                 continue;
             };
+            handler.kvGetCleanup();
             conn.selected_db = selected_db.load(.monotonic);
             conn.write_buf.appendSlice(aw.written()) catch {};
         }
@@ -1719,6 +1722,10 @@ pub const Worker = struct {
                     return true;
                 },
                 'S' => if (args.len >= 3 and equalsAsciiUpper(cmd, "SET")) {
+                    // Bail to CommandHandler for NX/XX flags (require exists check)
+                    if (args.len >= 4 and args[3].len == 2) {
+                        if (equalsAsciiUpper(args[3], "NX") or equalsAsciiUpper(args[3], "XX")) return false;
+                    }
                     const KVS = @import("../engine/kv.zig").KVStore;
                     const ns_key = nsKey(conn.selected_db, args[1]) orelse return false;
                     const value = args[2];
@@ -1791,7 +1798,17 @@ pub const Worker = struct {
                 else => {},
             },
             4 => switch (first) {
-                'M' => if (args.len >= 2 and equalsAsciiUpper(cmd, "MGET")) {
+                'M' => if (args.len >= 3 and (args.len - 1) % 2 == 0 and equalsAsciiUpper(cmd, "MSET")) {
+                    // Hot-path MSET via ConcurrentKV
+                    var i: usize = 1;
+                    while (i + 1 < args.len) : (i += 2) {
+                        const ns = nsKey(conn.selected_db, args[i]) orelse continue;
+                        ckv.setInternal(ns, args[i + 1], 0) catch continue;
+                    }
+                    if (self.aof) |a| a.logCommand(args);
+                    conn.write_buf.appendSlice(ct.resp_ok) catch {};
+                    return true;
+                } else if (args.len >= 2 and equalsAsciiUpper(cmd, "MGET")) {
                     // Ultra-fast MGET: batch lookup via ConcurrentKV, single RESP write
                     const KVS = @import("../engine/kv.zig").KVStore;
                     const key_count = args.len - 1;
