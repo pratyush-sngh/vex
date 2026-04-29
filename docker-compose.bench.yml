@@ -1,0 +1,30 @@
+services:
+  vex-baseline:
+    image: zigraph-vex-baseline
+    container_name: vex-baseline
+    command: ["--port", "6380", "--data-dir", "/data", "--reactor", "--workers", "4"]
+    ports:
+      - "16381:6380"
+    volumes:
+      - vex_baseline_data:/data
+    cpuset: "0-3"
+    mem_limit: 4g
+    memswap_limit: 4g
+
+  vex-perf3:
+    build:
+      context: .
+      dockerfile: Dockerfile.vex
+    container_name: vex-perf3
+    command: ["--port", "6380", "--data-dir", "/data", "--reactor", "--workers", "4"]
+    ports:
+      - "16382:6380"
+    volumes:
+      - vex_perf3_data:/data
+    cpuset: "4-7"
+    mem_limit: 4g
+    memswap_limit: 4g
+
+volumes:
+  vex_baseline_data:
+  vex_perf3_data:
