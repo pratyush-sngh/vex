@@ -160,6 +160,62 @@ Vex wins all 5 operations. Shortest path uses bidirectional BFS (meet-in-the-mid
 
 ---
 
+## perf-v3 Optimizations (branch: perf-v3)
+
+### AOF Persistence: Async vs Sync (`redis-benchmark`, P=16 and P=1)
+
+| Benchmark | main (sync AOF) | perf-v3 (async AOF) | Δ |
+|---|---|---|---|
+| **SET P=16** | 722K | **808K** | **+12%** |
+| **GET P=16** | 649K | **797K** | **+23%** |
+| **SET P=1** | 20.7K | **53.5K** | **+158%** |
+| **GET P=1** | 37.6K | **49.7K** | **+32%** |
+
+io_uring linked write→fsync chain keeps the worker thread unblocked during AOF flushes. 2.5x SET throughput at P=1 — the biggest win.
+
+### MGET Bulk Fetch (100 keys, `redis-benchmark`)
+
+| Pipeline | Throughput | Notes |
+|---|---|---|
+| P=1 | 46K rps | Real CKV lookups with SeqLock reads |
+| P=16 | 352K rps | Staging buffer: 1 memcpy vs 300 appendSlice |
+| P=32 | 467K rps | |
+| P=64 | 505K rps | |
+| P=128 | 491K rps | TCP saturation limit |
+
+MGET was broken in reactor mode on main (returned nil — read from empty plain KVStore). Now correctly routes through ConcurrentKV.
+
+### Graph Traversal — RESP Serialization + LIMIT
+
+| Operation (x200) | main | perf-v3 | Δ |
+|---|---|---|---|
+| TRAVERSE depth=5 | 113ms | 104ms | -8% |
+| **TRAVERSE depth=10** | **2185ms** | **1158ms** | **-47%** |
+| **TRAVERSE d=10 LIMIT 100** | **2244ms** | **145ms** | **-94%** |
+| PATH | 101ms | 44ms | **-56%** |
+
+`bufPrint` replaces `w.print` format engine in all RESP serialization. Batch response buffer for TRAVERSE. `GRAPH.TRAVERSE ... LIMIT N` for early BFS exit (p99: 222ms → 2.8ms).
+
+### What Changed (perf-v3)
+
+| Optimization | Impact |
+|---|---|
+| io_uring recv/send | Replace poll+syscall with async completions for TCP I/O |
+| IORING_SETUP_SQPOLL | Kernel poll thread eliminates submit syscalls |
+| Async AOF write+fsync | io_uring linked SQE chain, worker stays unblocked |
+| O_DIRECT for AOF | Bypass page cache, page-aligned staging buffer |
+| Per-worker AOF shards | Eliminate cross-worker mutex contention |
+| RESP bufPrint | Replace format engine with bufPrint in all serialization |
+| MGET hot path | ConcurrentKV bulk lookup with staging buffer |
+| MSET hot path | ConcurrentKV batch write |
+| CommandHandler CKV routing | All KV commands work in reactor mode (was broken) |
+| CKV inline delete fix | Don't free inline_buf pointers (not heap-allocated) |
+| TRAVERSE LIMIT | Early BFS exit, caps serialization cost |
+| Parallel HNSW rebuild | Per-field threads at startup |
+| Parallel BFS frontier | Thread-local bitsets, merge with OR |
+
+---
+
 ## How to Reproduce
 
 ```bash
