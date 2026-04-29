@@ -1809,56 +1809,51 @@ pub const Worker = struct {
                     conn.write_buf.appendSlice(ct.resp_ok) catch {};
                     return true;
                 } else if (args.len >= 2 and equalsAsciiUpper(cmd, "MGET")) {
-                    // Ultra-fast MGET: batch lookup via ConcurrentKV, single RESP write
+                    // MGET: build response in staging buffer, single write_buf append
+                    // One alloc+free per call beats 300 appendSlice calls (1 memcpy vs 300)
                     const KVS = @import("../engine/kv.zig").KVStore;
                     const key_count = args.len - 1;
+                    const est = 32 + key_count * 80;
+                    var resp_buf = self.allocator.alloc(u8, est) catch return false;
+                    defer self.allocator.free(resp_buf);
+                    var pos: usize = 0;
 
-                    // Pre-size response buffer: array header + per-key estimate
-                    const est = 32 + key_count * 64;
-                    conn.write_buf.ensureTotalCapacity(conn.write_buf.items.len + est) catch {};
-
-                    // Write array header
-                    var hdr_buf: [32]u8 = undefined;
-                    const hdr = std.fmt.bufPrint(&hdr_buf, "*{d}\r\n", .{key_count}) catch return false;
-                    conn.write_buf.appendSlice(hdr) catch {};
+                    const hdr = std.fmt.bufPrint(resp_buf[pos..], "*{d}\r\n", .{key_count}) catch return false;
+                    pos += hdr.len;
 
                     for (args[1..]) |user_key| {
+                        if (pos + 128 > resp_buf.len) {
+                            resp_buf = self.allocator.realloc(resp_buf, resp_buf.len * 2) catch break;
+                        }
                         const ns = nsKey(conn.selected_db, user_key) orelse {
-                            conn.write_buf.appendSlice("$-1\r\n") catch {};
+                            @memcpy(resp_buf[pos .. pos + 5], "$-1\r\n");
+                            pos += 5;
                             continue;
                         };
-
                         const stripe = ckv.getStripePublic(ns);
                         const entry_opt = stripe.map.getPtr(ns);
                         if (entry_opt == null) {
-                            conn.write_buf.appendSlice("$-1\r\n") catch {};
+                            @memcpy(resp_buf[pos .. pos + 5], "$-1\r\n");
+                            pos += 5;
                             continue;
                         }
                         const entry = entry_opt.?;
-
                         if (entry.flags.deleted or
                             (entry.flags.has_ttl and ckv.cached_now_ms > entry.expires_at))
                         {
-                            conn.write_buf.appendSlice("$-1\r\n") catch {};
+                            @memcpy(resp_buf[pos .. pos + 5], "$-1\r\n");
+                            pos += 5;
                             continue;
                         }
 
-                        // Integer path
                         if (entry.flags.is_integer) {
-                            var int_buf: [24]u8 = undefined;
-                            const int_str = std.fmt.bufPrint(&int_buf, "{d}", .{entry.int_value}) catch {
-                                conn.write_buf.appendSlice("$-1\r\n") catch {};
-                                continue;
-                            };
-                            var val_hdr: [32]u8 = undefined;
-                            const vh = std.fmt.bufPrint(&val_hdr, "${d}\r\n", .{int_str.len}) catch continue;
-                            conn.write_buf.appendSlice(vh) catch {};
-                            conn.write_buf.appendSlice(int_str) catch {};
-                            conn.write_buf.appendSlice("\r\n") catch {};
+                            const s = std.fmt.bufPrint(resp_buf[pos..], "${d}\r\n{d}\r\n", .{
+                                std.fmt.count("{d}", .{entry.int_value}), entry.int_value,
+                            }) catch continue;
+                            pos += s.len;
                             continue;
                         }
 
-                        // Inline value path: SeqLock read
                         if (entry.flags.is_inline) {
                             var val_copy: [KVS.INLINE_BUF_SIZE]u8 = undefined;
                             var vlen: u8 = undefined;
@@ -1872,27 +1867,34 @@ pub const Worker = struct {
                                 if (s1 == s2) break;
                                 std.atomic.spinLoopHint();
                             }
-                            var val_hdr: [32]u8 = undefined;
-                            const vh = std.fmt.bufPrint(&val_hdr, "${d}\r\n", .{vlen}) catch continue;
-                            conn.write_buf.appendSlice(vh) catch {};
-                            conn.write_buf.appendSlice(val_copy[0..vlen]) catch {};
-                            conn.write_buf.appendSlice("\r\n") catch {};
+                            const vh = std.fmt.bufPrint(resp_buf[pos..], "${d}\r\n", .{vlen}) catch continue;
+                            pos += vh.len;
+                            @memcpy(resp_buf[pos .. pos + vlen], val_copy[0..vlen]);
+                            pos += vlen;
+                            resp_buf[pos] = '\r'; resp_buf[pos + 1] = '\n'; pos += 2;
                             continue;
                         }
 
-                        // Large value fallback: read lock
                         ckv.readLockStripePublic(stripe);
                         const vlen = entry.value.len;
-                        var val_hdr: [32]u8 = undefined;
-                        const vh = std.fmt.bufPrint(&val_hdr, "${d}\r\n", .{vlen}) catch {
+                        if (pos + vlen + 32 > resp_buf.len) {
+                            resp_buf = self.allocator.realloc(resp_buf, pos + vlen + 64) catch {
+                                ckv.readUnlockStripePublic(stripe);
+                                continue;
+                            };
+                        }
+                        const vh = std.fmt.bufPrint(resp_buf[pos..], "${d}\r\n", .{vlen}) catch {
                             ckv.readUnlockStripePublic(stripe);
                             continue;
                         };
-                        conn.write_buf.appendSlice(vh) catch {};
-                        conn.write_buf.appendSlice(entry.value) catch {};
-                        conn.write_buf.appendSlice("\r\n") catch {};
+                        pos += vh.len;
+                        @memcpy(resp_buf[pos .. pos + vlen], entry.value);
+                        pos += vlen;
+                        resp_buf[pos] = '\r'; resp_buf[pos + 1] = '\n'; pos += 2;
                         ckv.readUnlockStripePublic(stripe);
                     }
+
+                    conn.write_buf.appendSlice(resp_buf[0..pos]) catch {};
                     return true;
                 },
                 'P' => if (equalsAsciiUpper(cmd, "PING")) {
