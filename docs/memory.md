@@ -109,6 +109,17 @@ For precise memory control, set `maxmemory` to ~80% of available RAM.
 
 ---
 
+## Vector Store Memory
+
+Vector embeddings use a separate memory model from the KV store:
+
+- **On-disk vectors** (mmap'd `.vvf` files) do **not** count against `maxmemory` — they are managed by the OS page cache
+- **Write buffer**: new vectors are held in an f32 in-memory buffer until the next SAVE/BGSAVE, which flushes them to f16 `.vvf` files
+- **HNSW index**: the index structure (neighbor lists, layers) is held in memory — roughly ~1KB per vector for M=16
+- **Scratch buffers**: two f32 buffers per vector field for f16→f32 conversion during search queries
+
+---
+
 ## ConcurrentKV (Reactor Mode)
 
 In reactor mode, the `ConcurrentKV` (256-stripe rwlock) also tracks `last_access`:

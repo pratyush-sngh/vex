@@ -46,11 +46,15 @@ openssl req -x509 -newkey rsa:2048 -keyout /etc/vex/key.pem -out /etc/vex/cert.p
 mkdir -p /var/lib/vex
 chown vex:vex /var/lib/vex
 
-# 4. Build release binary
+# 4. Create vector data directory
+mkdir -p /var/lib/vex/vectors
+chown vex:vex /var/lib/vex/vectors
+
+# 5. Build release binary
 zig build -Doptimize=ReleaseFast
 cp zig-out/bin/vex /usr/local/bin/vex
 
-# 5. Run
+# 6. Run
 VEX_CONFIG=/etc/vex/vex.conf /usr/local/bin/vex
 ```
 
@@ -103,8 +107,8 @@ docker pull ghcr.io/pratyush-sngh/vex:latest
 
 Available tags:
 - `ghcr.io/pratyush-sngh/vex:latest` -- latest release
-- `ghcr.io/pratyush-sngh/vex:0.3.2` -- specific version
-- `ghcr.io/pratyush-sngh/vex:0.3` -- latest patch in 0.3.x
+- `ghcr.io/pratyush-sngh/vex:0.6.0` -- specific version
+- `ghcr.io/pratyush-sngh/vex:0.6` -- latest patch in 0.6.x
 - `ghcr.io/pratyush-sngh/vex:0` -- latest in 0.x
 
 ### Run (Quick Start)
@@ -265,6 +269,14 @@ For durability with performance:
 # Default: AOF group commit (batch writes per tick)
 # Periodic BGSAVE via application timer or cron
 ```
+
+### io_uring (Linux)
+
+On Linux, Vex automatically uses io_uring with SQPOLL for async TCP I/O and AOF fsync. Falls back to epoll if io_uring is unavailable. No configuration required.
+
+### Direct I/O (Linux)
+
+AOF uses `O_DIRECT` to bypass the page cache when supported. Requires a filesystem that supports Direct I/O (ext4, xfs). Falls back to buffered I/O automatically.
 
 ---
 

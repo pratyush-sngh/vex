@@ -12,10 +12,11 @@ Vex uses a dual persistence model similar to Redis RDB+AOF.
 |-----------|------|-------------|
 | Snapshot | `vex.zdb` | Binary format with CRC-32 checksum. Full KV + graph state |
 | AOF | `vex.aof` | Append-only file. Every write command in binary format |
+| Vectors | `vectors/*.vvf` | Per-field f16 vector embeddings (mmap'd on load) |
 
 ### Lifecycle
 
-1. **Startup**: loads snapshot (`vex.zdb`), then replays AOF (`vex.aof`) to recover commands since last snapshot
+1. **Startup**: loads snapshot (`vex.zdb`), replays AOF (`vex.aof`), and mmap's vector files (`vectors/*.vvf`) with parallel HNSW rebuild
 2. **Runtime**: write commands are buffered in memory and flushed to AOF per event loop tick (group commit)
 3. **SAVE/BGSAVE**: writes a new snapshot, truncates AOF
 4. **BGREWRITEAOF**: compacts AOF by serializing current state to a new file, atomic rename
@@ -136,6 +137,73 @@ Compacts the AOF by serializing the current in-memory state:
 4. Atomically renames temp file over the current AOF
 
 This eliminates redundant operations (e.g., 1000 SETs to the same key become 1 SET).
+
+---
+
+## Vector Persistence (.vvf files)
+
+Vector embeddings are stored in separate `.vvf` (Vex Vector Field) files, one per vector field:
+
+```
+data-dir/
+├── vex.zdb          # KV + graph snapshot
+├── vex.aof          # Append-only file
+└── vectors/
+    ├── field_0.vvf  # Embeddings for field 0
+    └── field_1.vvf  # Embeddings for field 1
+```
+
+### .vvf Format
+
+```
+VVF_MAGIC (4 bytes)
+VERSION (1 byte)
+DTYPE (1 byte: 0=f32, 1=f16)
+DIMENSION (u32)
+[vector data: dimension * dtype_size * count bytes]
+```
+
+### Lifecycle
+
+- **First SETVEC**: VectorStore is lazily initialized (zero cost when vectors unused)
+- **Runtime**: new vectors are written to an in-memory f32 buffer
+- **SAVE/BGSAVE**: vectors are quantized to f16 and written to `.vvf` files
+- **Shutdown**: final vector save triggered alongside KV snapshot
+- **Startup**: `.vvf` files are mmap'd for zero-copy reads; HNSW index is rebuilt in parallel (per-field threads)
+
+---
+
+## Advanced AOF Features
+
+### Per-Worker AOF Shards
+
+In reactor mode, each worker writes to its own AOF shard to avoid mutex contention on the main AOF:
+
+```
+data-dir/
+├── vex.aof          # Worker 0 (primary)
+├── vex.aof.shard1   # Worker 1
+├── vex.aof.shard2   # Worker 2
+└── vex.aof.shard3   # Worker 3
+```
+
+All shards are replayed on startup based on the configured shard count.
+
+### Direct I/O (Linux)
+
+On Linux, the AOF can use `O_DIRECT` to bypass the page cache:
+
+- Opens a second file descriptor with `O_DIRECT` flag
+- Uses a 4KB-aligned staging buffer for sector-aligned writes
+- Falls back gracefully on systems without `O_DIRECT` support
+
+### Async AOF Fsync (io_uring)
+
+When io_uring is available, AOF writes and fsyncs are submitted asynchronously:
+
+- `prepareAsyncFlush()` returns pending data for io_uring submission
+- Double-buffered: `group_buf` accumulates while `flush_buf` is written
+- Worker submits write+fsync to io_uring, falls back to synchronous `write()` if unavailable
 
 ---
 

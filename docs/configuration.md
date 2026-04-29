@@ -38,6 +38,9 @@ Vex can be configured via CLI flags, config files, or environment variables.
 | `--cluster-config` | none | Path to cluster config file |
 | `--profile` | off | Enable latency profiling |
 | `--profile-every N` | 100000 | Print profile every N commands |
+| `--keys-mode` | strict | KEYS command mode: `strict` (disabled for large DBs) or `autoscan` |
+| `--engine-threads N` | auto | Thread count for scaled mode |
+| `--unixsocket path` | none | Unix socket path for connections (in addition to TCP) |
 
 ### Examples
 
@@ -105,6 +108,11 @@ loglevel info
 | `log-level` or `loglevel` | `--log-level` | Both aliases work |
 | `tls-cert` | `--tls-cert` | |
 | `tls-key` | `--tls-key` | |
+| `keys-mode` | `--keys-mode` | `strict` or `autoscan` |
+| `engine-threads` | `--engine-threads` | |
+| `unixsocket` | `--unixsocket` | |
+| `profile` | `--profile` | Boolean flag |
+| `profile-every` | `--profile-every` | |
 
 Unknown keys are silently ignored for forward compatibility.
 

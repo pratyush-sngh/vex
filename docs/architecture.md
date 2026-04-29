@@ -10,15 +10,17 @@
               Accept Thread (main)
               /    |    |    \
          Worker0  W1   W2   W3     -- N event-loop threads (auto-detected)
-         (kqueue) ...              -- kqueue on macOS, epoll on Linux, io_uring fallback
+         (kqueue) ...              -- io_uring (SQPOLL) on Linux, kqueue on macOS
          /  |  \
       conn conn conn               -- non-blocking I/O per worker
             |
    ┌────────┴────────┐
    │  ConcurrentKV   │             -- 256-stripe rwlock (parallel reads, exclusive writes)
    │  GraphEngine    │             -- CSR adjacency, SoA layout, auto-compact
+   │  VectorStore    │             -- HNSW index, f16 mmap, cosine ANN search
+   │  Collections    │             -- List, Hash, Set, SortedSet stores
    │  PubSubRegistry │             -- shared cross-worker subscriber map
-   │  AOF (group)    │             -- buffered write-ahead log, flushed per tick
+   │  AOF (group)    │             -- buffered WAL, async io_uring fsync on Linux
    └─────────────────┘
 ```
 
@@ -53,6 +55,22 @@ The KV store is split into 256 independent stripes, each with its own `pthread_r
 - **SoA layout**: node keys, type IDs, property masks are separate arrays (CPU cache friendly)
 - TypeMask bitmask filtering, string interning (u16 IDs), shared PropertyStore
 
+### Vector Search (HNSW + mmap)
+
+- **HNSW index** (M=16, ef_construction=200, ef_search=50) for approximate nearest neighbor
+- **Dual-tier storage**: f32 write buffer for new vectors, f16 mmap `.vvf` files for bulk data
+- **Lazy initialization**: VectorStore is null until the first `GRAPH.SETVEC` — zero overhead when unused
+- **GRAPH.RAG**: single command combining vector ANN search + graph BFS expansion
+- **Cosine similarity** with f16→f32 conversion on the query path
+- **Parallel field save/load**: per-field threads for HNSW rebuild on startup and BGSAVE
+
+### Collection Stores
+
+- **ListStore**: doubly-linked list with O(1) push/pop, O(n) index access
+- **HashStore**: per-key field→value maps (HSET/HGET/HGETALL)
+- **SetStore**: unordered unique member sets (SADD/SREM/SMEMBERS/SINTER/SUNION/SDIFF)
+- **SortedSetStore**: score-ordered members (ZADD/ZRANGE/ZRANK/ZSCORE)
+
 ### Networking
 
 - **Zero-copy read**: parse RESP directly from stack read buffer (no memcpy for complete commands)
@@ -64,7 +82,9 @@ The KV store is split into 256 independent stripes, each with its own `pthread_r
 
 ### Persistence
 
-- **AOF group commit**: buffer all writes in memory, single `write()` syscall per event loop tick
+- **AOF group commit**: buffer all writes in memory, single `write()` per tick; async io_uring fsync on Linux
+- **Direct I/O** (Linux): O_DIRECT AOF writes bypass page cache, 4KB-aligned staging buffer
+- **Per-worker AOF shards**: each reactor worker gets its own AOF file, reducing mutex contention
 - **BGSAVE**: background thread with read locks (non-blocking)
 - **Tombstone DEL**: ~25ns (flag set) vs ~140ns (full remove + free)
 
@@ -91,7 +111,13 @@ src/
 │   ├── query.zig           # Bidirectional BFS, frontier traverse, Dijkstra
 │   ├── string_intern.zig   # Type string pooling (u16 IDs, bitmask filtering)
 │   ├── property_store.zig  # Sparse property storage for nodes/edges
-│   └── pool_arena.zig      # Slab allocator with background arena refill
+│   ├── vector_store.zig    # Dual-tier vector store (f32 write buffer + f16 mmap)
+│   ├── hnsw.zig            # HNSW approximate nearest neighbor index
+│   ├── rag.zig             # RAG: vector search + graph BFS expansion
+│   ├── list.zig            # List data structure (LPUSH/RPUSH/LPOP/RPOP/LRANGE)
+│   ├── hash.zig            # Hash data structure (HSET/HGET/HDEL/HGETALL)
+│   ├── set.zig             # Set data structure (SADD/SREM/SMEMBERS/SINTER)
+│   └── sorted_set.zig      # Sorted set (ZADD/ZREM/ZRANGE/ZSCORE/ZRANK)
 ├── command/
 │   ├── handler.zig         # Command dispatch + implementations (KV, graph, BGSAVE)
 │   └── comptime_dispatch.zig  # Compile-time command table + RESP literals
@@ -115,8 +141,9 @@ Platform-abstracted with automatic selection:
 | Platform | Backend | Notes |
 |----------|---------|-------|
 | macOS | kqueue | EVFILT_READ + EVFILT_WRITE |
-| Linux | io_uring | poll_add one-shot with re-arming |
-| Linux (fallback) | epoll | Edge-triggered (EPOLLET) |
+| Linux | io_uring + SQPOLL | Kernel poll thread, async recv/send/AOF write+fsync |
+| Linux (fallback 1) | io_uring | poll_add one-shot with re-arming |
+| Linux (fallback 2) | epoll | Edge-triggered (EPOLLET) |
 
 The event loop supports:
 - `addFd(fd, data)`: register for read events

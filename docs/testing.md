@@ -23,15 +23,22 @@ zig build test -Doptimize=ReleaseFast
 
 ## Test Coverage
 
-**107 tests total (106 passed, 1 skipped in debug mode)**
+**167 tests total (166 passed, 1 skipped in debug mode)**
 
 | Module | Tests | What's Covered |
 |--------|-------|----------------|
 | **kv.zig** | 15 | SET/GET, tombstone DEL, tombstone reuse, overwrite, exists, dbsize, compact, TTL tracking, keys skip tombstones, flushdb, glob matcher, memoryUsage, LRU eviction, noeviction error, last_access tracking |
 | **concurrent_kv.zig** | 6 | Basic set/get, delete, overwrite, exists, flushdb+dbsize, multi-thread stress (8 threads x 1000 ops) |
-| **graph.zig** | 11 | Add nodes/edges, duplicate node error, node properties, remove node, remove edge, compact, type interning, type mask filtering, uniform weights flag, edge properties, all_base_edges_alive flag |
-| **query.zig** | 7 | BFS traverse outgoing, shortest path, weighted shortest path (Dijkstra), neighbors, edge type filter, traverse after compact, traverse with delta only, shortest path via delta |
-| **handler.zig** | 10 | PING, SET/GET, GRAPH.ADDNODE, SELECT namespace isolation, MGET/MSET, INCR/DECR/INCRBY/DECRBY, EXPIRE/PERSIST/TTL, APPEND, BGSAVE without persistence, bgsave_in_progress flag |
+| **list.zig** | 6 | LPUSH/RPUSH, LPOP/RPOP, LLEN, LRANGE, LINDEX, LSET/LREM |
+| **hash.zig** | 8 | HSET/HGET, HDEL, HMSET/HMGET, HGETALL, HLEN, HKEYS/HVALS, HEXISTS, HINCRBY |
+| **set.zig** | 7 | SADD/SREM, SMEMBERS, SISMEMBER, SCARD, SUNION, SINTER, SDIFF |
+| **sorted_set.zig** | 8 | ZADD/ZREM, ZCARD, ZRANK, ZSCORE, ZINCRBY, ZCOUNT, ZRANGE |
+| **vector_store.zig** | 10 | Dual-tier store, f16 quantization, mmap save/load, lazy init, multi-field isolation |
+| **hnsw.zig** | 6 | HNSW insert/search, recall accuracy, distance calculations, layer management |
+| **rag.zig** | 2 | RAG search with graph expansion, vector+BFS integration |
+| **graph.zig** | 14 | Add nodes/edges, duplicate node error, node properties, remove node, remove edge, compact, type interning, type mask filtering, uniform weights flag, edge properties, all_base_edges_alive flag, vector field integration |
+| **query.zig** | 12 | BFS traverse outgoing, shortest path, weighted shortest path (Dijkstra), neighbors, edge type filter, traverse after compact, traverse with delta only, shortest path via delta, parallel BFS, LIMIT, impact analysis, list_by_type |
+| **handler.zig** | 19 | PING, SET/GET, GRAPH.ADDNODE, SELECT namespace isolation, MGET/MSET, INCR/DECR/INCRBY/DECRBY, EXPIRE/PERSIST/TTL, APPEND, BGSAVE without persistence, bgsave_in_progress flag, lists, hashes, sets, sorted sets, vector commands, UPSERT, RENAME, TYPE, GETEX/GETDEL |
 | **resp.zig** | 4 | Parse RESP array, null bulk string, serialize round-trip, inline command parse |
 | **aof.zig** | 4 | Write and replay, truncate, replay missing file, group commit buffer |
 | **snapshot.zig** | 4 | Round-trip (KV + graph with properties), missing file, CRC corruption detection, CRC-32 known value |
@@ -43,7 +50,10 @@ zig build test -Doptimize=ReleaseFast
 | **cluster/config.zig** | 3 | Parse leader config, parse follower config, invalid config (missing self) |
 | **cluster/protocol.zig** | 3 | Encode/decode repl_request, encode/decode write_forward, frame header size |
 | **cluster/replication.zig** | 3 | isWriteCommand, follower promoted flag blocks forwarding, probeForLeader returns null |
-| **Other** | 5 | String intern (intern/resolve, find null, mask positions, max limit), pool arena (alloc/release, recycling, exhaustion, oversized, zero-length, size classes, stats), property store (set/get, overwrite, delete, deleteAll, count, collectAll), comptime dispatch (unique keys, key computation, resp literals, findCommand) |
+| **shard_router.zig** | 5 | Key-to-shard routing, MPSC queues, worker dispatch |
+| **tls.zig** | 1 | TLS context initialization |
+| **property_store.zig** | 6 | Set/get, overwrite, delete, deleteAll, count, collectAll |
+| **Other** | 8 | String intern (intern/resolve, find null, mask positions, max limit), comptime dispatch (unique keys, key computation, resp literals, findCommand) |
 
 ### Skipped Test
 
