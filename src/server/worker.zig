@@ -1989,6 +1989,100 @@ pub const Worker = struct {
                             return true;
                         }
                     }
+                    // HMGET: stack buffer for typical requests, heap for large
+                    if (args.len >= 3 and equalsAsciiUpper(cmd, "HMGET")) {
+                        if (self.hash_store) |hs| {
+                            const ns = nsKey(conn.selected_db, args[1]) orelse return false;
+                            const dsl = self.ds_locks orelse return false;
+                            dsl.acquire(ns, self.id, &self.last_stripe);
+                            const fields = args[2..];
+                            var stack_buf: [8192]u8 = undefined;
+                            const need_heap = fields.len * 80 > stack_buf.len;
+                            const heap_buf: ?[]u8 = if (need_heap)
+                                self.allocator.alloc(u8, 32 + fields.len * 80) catch null
+                            else
+                                null;
+                            defer if (heap_buf) |hb| self.allocator.free(hb);
+                            const buf: []u8 = heap_buf orelse &stack_buf;
+                            var pos: usize = 0;
+                            const arr_hdr = std.fmt.bufPrint(buf[pos..], "*{d}\r\n", .{fields.len}) catch return false;
+                            pos += arr_hdr.len;
+                            for (fields) |field| {
+                                if (pos + 64 > buf.len) break;
+                                if (hs.hget(ns, field)) |val| {
+                                    if (pos + val.len + 16 > buf.len) break;
+                                    const vh = std.fmt.bufPrint(buf[pos..], "${d}\r\n", .{val.len}) catch continue;
+                                    pos += vh.len;
+                                    @memcpy(buf[pos .. pos + val.len], val);
+                                    pos += val.len;
+                                    buf[pos] = '\r'; buf[pos + 1] = '\n'; pos += 2;
+                                } else {
+                                    @memcpy(buf[pos .. pos + 5], "$-1\r\n");
+                                    pos += 5;
+                                }
+                            }
+                            conn.write_buf.appendSlice(buf[0..pos]) catch {};
+                            return true;
+                        }
+                    }
+                    // HMSET: batch field set
+                    if (args.len >= 4 and equalsAsciiUpper(cmd, "HMSET")) {
+                        if (self.hash_store) |hs| {
+                            const ns = nsKey(conn.selected_db, args[1]) orelse return false;
+                            const dsl = self.ds_locks orelse return false;
+                            const fv = args[2..];
+                            var owned_buf: [64][]u8 = undefined;
+                            if (fv.len > owned_buf.len) return false;
+                            for (fv, 0..) |v, i| {
+                                owned_buf[i] = self.allocator.dupe(u8, v) catch return false;
+                            }
+                            const owned = owned_buf[0..fv.len];
+                            dsl.acquire(ns, self.id, &self.last_stripe);
+                            _ = hs.hsetOwned(ns, owned) catch {
+                                for (owned) |o| self.allocator.free(o);
+                                return false;
+                            };
+                            if (self.aof) |a| a.logCommand(args);
+                            self.bumpWatchVersion(conn.selected_db, args[1]);
+                            conn.write_buf.appendSlice(ct.resp_ok) catch {};
+                            return true;
+                        }
+                    }
+                    // HGETALL: stack buffer for typical hashes, heap for large
+                    if (args.len >= 2 and equalsAsciiUpper(cmd, "HGETALL")) {
+                        if (self.hash_store) |hs| {
+                            const ns = nsKey(conn.selected_db, args[1]) orelse return false;
+                            const dsl = self.ds_locks orelse return false;
+                            dsl.acquire(ns, self.id, &self.last_stripe);
+                            const pairs = hs.hgetall(ns, self.allocator) catch {
+                                conn.write_buf.appendSlice("*0\r\n") catch {};
+                                return true;
+                            };
+                            defer if (pairs.len > 0) self.allocator.free(pairs);
+                            // Stack buffer for ≤128 fields (typical), heap for larger
+                            var stack_buf: [16384]u8 = undefined;
+                            const need_heap = pairs.len * 48 > stack_buf.len;
+                            const heap_buf: ?[]u8 = if (need_heap)
+                                self.allocator.alloc(u8, 32 + pairs.len * 64) catch null
+                            else
+                                null;
+                            defer if (heap_buf) |hb| self.allocator.free(hb);
+                            const buf: []u8 = heap_buf orelse &stack_buf;
+                            var pos: usize = 0;
+                            const arr_hdr = std.fmt.bufPrint(buf[pos..], "*{d}\r\n", .{pairs.len}) catch return false;
+                            pos += arr_hdr.len;
+                            for (pairs) |item| {
+                                if (pos + item.len + 16 > buf.len) break;
+                                const vh = std.fmt.bufPrint(buf[pos..], "${d}\r\n", .{item.len}) catch continue;
+                                pos += vh.len;
+                                @memcpy(buf[pos .. pos + item.len], item);
+                                pos += item.len;
+                                buf[pos] = '\r'; buf[pos + 1] = '\n'; pos += 2;
+                            }
+                            conn.write_buf.appendSlice(buf[0..pos]) catch {};
+                            return true;
+                        }
+                    }
                 },
                 'L' => {
                     if (args.len >= 2 and equalsAsciiUpper(cmd, "LLEN")) {
