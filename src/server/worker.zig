@@ -2164,16 +2164,52 @@ pub const Worker = struct {
                 else => {},
             },
             5 => switch (first) {
-                'L' => if (args.len >= 3 and equalsAsciiUpper(cmd, "LPUSH")) {
-                    if (self.list_store) |ls| {
-                        const ns = nsKey(conn.selected_db, args[1]) orelse return false;
-                        const dsl = self.ds_locks orelse return false;
-                        dsl.acquire(ns, self.id, &self.last_stripe);
-                        const list_len = ls.lpush(ns, args[2..]) catch return false;
-                        if (self.aof) |a| a.logCommand(args);
-                        self.bumpWatchVersion(conn.selected_db, args[1]);
-                        writeIntTo(&conn.write_buf, @intCast(list_len));
-                        return true;
+                'L' => {
+                    if (args.len >= 3 and equalsAsciiUpper(cmd, "LPUSH")) {
+                        if (self.list_store) |ls| {
+                            const ns = nsKey(conn.selected_db, args[1]) orelse return false;
+                            const dsl = self.ds_locks orelse return false;
+                            dsl.acquire(ns, self.id, &self.last_stripe);
+                            const list_len = ls.lpush(ns, args[2..]) catch return false;
+                            if (self.aof) |a| a.logCommand(args);
+                            self.bumpWatchVersion(conn.selected_db, args[1]);
+                            writeIntTo(&conn.write_buf, @intCast(list_len));
+                            return true;
+                        }
+                    }
+                    // LPOPN key count — batch pop from list head
+                    if (args.len >= 3 and equalsAsciiUpper(cmd, "LPOPN")) {
+                        if (self.list_store) |ls| {
+                            const ns = nsKey(conn.selected_db, args[1]) orelse return false;
+                            const count = std.fmt.parseInt(usize, args[2], 10) catch return false;
+                            const dsl = self.ds_locks orelse return false;
+                            dsl.acquire(ns, self.id, &self.last_stripe);
+                            var stack_buf: [8192]u8 = undefined;
+                            var pos: usize = 16; // reserve for array header
+                            var popped: usize = 0;
+                            var i: usize = 0;
+                            while (i < count) : (i += 1) {
+                                const val = ls.lpop(ns) orelse break;
+                                if (pos + val.len + 16 > stack_buf.len) break;
+                                const vh = std.fmt.bufPrint(stack_buf[pos..], "${d}\r\n", .{val.len}) catch break;
+                                pos += vh.len;
+                                @memcpy(stack_buf[pos .. pos + val.len], val);
+                                pos += val.len;
+                                stack_buf[pos] = '\r'; stack_buf[pos + 1] = '\n'; pos += 2;
+                                popped += 1;
+                            }
+                            const hdr = std.fmt.bufPrint(stack_buf[0..16], "*{d}\r\n", .{popped}) catch return false;
+                            if (hdr.len < 16) {
+                                const data_len = pos - 16;
+                                std.mem.copyForwards(u8, stack_buf[hdr.len .. hdr.len + data_len], stack_buf[16 .. 16 + data_len]);
+                                pos = hdr.len + data_len;
+                            }
+                            if (popped > 0) {
+                                if (self.aof) |a| a.logCommand(args);
+                            }
+                            conn.write_buf.appendSlice(stack_buf[0..pos]) catch {};
+                            return true;
+                        }
                     }
                 },
                 'R' => if (args.len >= 3 and equalsAsciiUpper(cmd, "RPUSH")) {
@@ -2222,9 +2258,195 @@ pub const Worker = struct {
                     writeIntTo(&conn.write_buf, @intCast(ckv.dbsize()));
                     return true;
                 },
+                'M' => {
+                    // MSETEX key1 val1 ttl1 key2 val2 ttl2 ...
+                    if (args.len >= 4 and (args.len - 1) % 3 == 0 and equalsAsciiUpper(cmd, "MSETEX")) {
+                        var i: usize = 1;
+                        while (i + 2 < args.len) : (i += 3) {
+                            const ns = nsKey(conn.selected_db, args[i]) orelse continue;
+                            const ttl = std.fmt.parseInt(i64, args[i + 2], 10) catch continue;
+                            ckv.setEx(ns, args[i + 1], ttl) catch continue;
+                        }
+                        if (self.aof) |a| a.logCommand(args);
+                        conn.write_buf.appendSlice(ct.resp_ok) catch {};
+                        return true;
+                    }
+                    // MSETNX key1 val1 key2 val2 ... — atomic all-or-nothing
+                    if (args.len >= 3 and (args.len - 1) % 2 == 0 and equalsAsciiUpper(cmd, "MSETNX")) {
+                        // Check all keys first
+                        var any_exists = false;
+                        var i: usize = 1;
+                        while (i + 1 < args.len) : (i += 2) {
+                            const ns = nsKey(conn.selected_db, args[i]) orelse continue;
+                            if (ckv.exists(ns)) { any_exists = true; break; }
+                        }
+                        if (any_exists) {
+                            conn.write_buf.appendSlice(ct.RespInts.@"0") catch {};
+                        } else {
+                            i = 1;
+                            while (i + 1 < args.len) : (i += 2) {
+                                const ns = nsKey(conn.selected_db, args[i]) orelse continue;
+                                ckv.setInternal(ns, args[i + 1], 0) catch continue;
+                            }
+                            if (self.aof) |a| a.logCommand(args);
+                            conn.write_buf.appendSlice(ct.RespInts.@"1") catch {};
+                        }
+                        return true;
+                    }
+                },
                 else => {},
             },
             7 => switch (first) {
+                'M' => {
+                    // MEXISTS key1 key2 key3 ... — count of existing keys
+                    if (args.len >= 2 and equalsAsciiUpper(cmd, "MEXISTS")) {
+                        var count: i64 = 0;
+                        for (args[1..]) |user_key| {
+                            const ns = nsKey(conn.selected_db, user_key) orelse continue;
+                            if (ckv.exists(ns)) count += 1;
+                        }
+                        writeIntTo(&conn.write_buf, count);
+                        return true;
+                    }
+                    // MGETDEL key1 key2 ... — GET+DEL each key atomically
+                    if (args.len >= 2 and equalsAsciiUpper(cmd, "MGETDEL")) {
+                        const key_count = args.len - 1;
+                        var stack_buf: [8192]u8 = undefined;
+                        const need_heap = key_count * 80 > stack_buf.len;
+                        const heap_buf: ?[]u8 = if (need_heap) self.allocator.alloc(u8, 32 + key_count * 80) catch null else null;
+                        defer if (heap_buf) |hb| self.allocator.free(hb);
+                        const buf: []u8 = heap_buf orelse &stack_buf;
+                        var pos: usize = 0;
+                        const hdr = std.fmt.bufPrint(buf[pos..], "*{d}\r\n", .{key_count}) catch return false;
+                        pos += hdr.len;
+                        for (args[1..]) |user_key| {
+                            const ns = nsKey(conn.selected_db, user_key) orelse {
+                                @memcpy(buf[pos .. pos + 5], "$-1\r\n"); pos += 5; continue;
+                            };
+                            if (ckv.get(ns)) |owned| {
+                                if (pos + owned.data.len + 16 > buf.len) { owned.deinit(); @memcpy(buf[pos .. pos + 5], "$-1\r\n"); pos += 5; continue; }
+                                const vh = std.fmt.bufPrint(buf[pos..], "${d}\r\n", .{owned.data.len}) catch { owned.deinit(); continue; };
+                                pos += vh.len;
+                                @memcpy(buf[pos .. pos + owned.data.len], owned.data);
+                                pos += owned.data.len;
+                                buf[pos] = '\r'; buf[pos + 1] = '\n'; pos += 2;
+                                owned.deinit();
+                                _ = ckv.delete(ns);
+                            } else {
+                                @memcpy(buf[pos .. pos + 5], "$-1\r\n"); pos += 5;
+                            }
+                        }
+                        if (self.aof) |a| a.logCommand(args);
+                        conn.write_buf.appendSlice(buf[0..pos]) catch {};
+                        return true;
+                    }
+                },
+                'I' => if (args.len >= 2 and equalsAsciiUpper(cmd, "INCRTTL")) {
+                    // INCRTTL key [delta] [EX ttl] — increment + set TTL
+                    const ns = nsKey(conn.selected_db, args[1]) orelse return false;
+                    var delta: i64 = 1;
+                    var ttl: ?i64 = null;
+                    var i: usize = 2;
+                    while (i < args.len) : (i += 1) {
+                        if (i + 1 < args.len and equalsAsciiUpper(args[i], "EX")) {
+                            ttl = std.fmt.parseInt(i64, args[i + 1], 10) catch null;
+                            i += 1;
+                        } else {
+                            delta = std.fmt.parseInt(i64, args[i], 10) catch 1;
+                        }
+                    }
+                    const new_val = ckv.incrBy(ns, delta) catch |err| {
+                        if (err == error.NotAnInteger) {
+                            conn.write_buf.appendSlice("-ERR value is not an integer\r\n") catch {};
+                        } else {
+                            conn.write_buf.appendSlice("-ERR internal error\r\n") catch {};
+                        }
+                        return true;
+                    };
+                    if (ttl) |t| {
+                        // Re-set the value with TTL (preserve the integer)
+                        var val_buf: [24]u8 = undefined;
+                        const val_str = std.fmt.bufPrint(&val_buf, "{d}", .{new_val}) catch return false;
+                        ckv.setEx(ns, val_str, t) catch {};
+                    }
+                    if (self.aof) |a| a.logCommand(args);
+                    writeIntTo(&conn.write_buf, new_val);
+                    return true;
+                },
+                'S' => if (args.len >= 3 and equalsAsciiUpper(cmd, "SCANGET")) {
+                    // SCANGET cursor pattern [COUNT n] — SCAN + inline values
+                    // Returns [next_cursor, [k1, v1, k2, v2, ...]]
+                    // For now, simple prefix scan on CKV (no cursor state)
+                    const pattern = args[2];
+                    var max_count: usize = 10;
+                    if (args.len >= 5 and equalsAsciiUpper(args[3], "COUNT")) {
+                        max_count = std.fmt.parseInt(usize, args[4], 10) catch 10;
+                    }
+                    // Use CKV's stripe iteration
+                    var stack_buf: [16384]u8 = undefined;
+                    var pos: usize = 0;
+                    // Reserve space for outer array header (will be *2\r\n)
+                    @memcpy(stack_buf[pos .. pos + 4], "*2\r\n"); pos += 4;
+                    // Cursor (always 0 for now — full scan)
+                    @memcpy(stack_buf[pos .. pos + 4], "$1\r\n"); pos += 4;
+                    stack_buf[pos] = '0'; pos += 1;
+                    @memcpy(stack_buf[pos .. pos + 2], "\r\n"); pos += 2;
+                    // Collect matching key-value pairs
+                    var match_count: usize = 0;
+                    const pairs_start = pos;
+                    // Reserve array header for pairs (will patch)
+                    pos += 16; // reserve for "*N\r\n"
+                    const db_prefix_str = DB_PREFIXES[conn.selected_db];
+                    for (0..256) |si| {
+                        if (match_count >= max_count) break;
+                        const stripe = &ckv.stripes[si];
+                        ckv.readLockStripePublic(stripe);
+                        var it = stripe.map.iterator();
+                        while (it.next()) |entry| {
+                            if (match_count >= max_count) break;
+                            if (pos + 256 > stack_buf.len) break;
+                            const raw_key = entry.key_ptr.*;
+                            // Strip db prefix
+                            if (!std.mem.startsWith(u8, raw_key, db_prefix_str)) continue;
+                            const user_key = raw_key[db_prefix_str.len..];
+                            // Simple prefix match (pattern without glob)
+                            if (pattern.len > 0 and pattern[pattern.len - 1] == '*') {
+                                if (!std.mem.startsWith(u8, user_key, pattern[0 .. pattern.len - 1])) continue;
+                            } else if (!std.mem.eql(u8, user_key, pattern)) continue;
+                            const e = entry.value_ptr;
+                            if (e.flags.deleted) continue;
+                            if (e.flags.has_ttl and ckv.cached_now_ms > e.expires_at) continue;
+                            // Write key
+                            const kh = std.fmt.bufPrint(stack_buf[pos..], "${d}\r\n", .{user_key.len}) catch break;
+                            pos += kh.len;
+                            @memcpy(stack_buf[pos .. pos + user_key.len], user_key);
+                            pos += user_key.len;
+                            stack_buf[pos] = '\r'; stack_buf[pos + 1] = '\n'; pos += 2;
+                            // Write value
+                            const val = if (e.flags.is_inline) e.inline_buf[0..e.inline_len] else e.value;
+                            const vh = std.fmt.bufPrint(stack_buf[pos..], "${d}\r\n", .{val.len}) catch break;
+                            pos += vh.len;
+                            if (pos + val.len + 2 > stack_buf.len) break;
+                            @memcpy(stack_buf[pos .. pos + val.len], val);
+                            pos += val.len;
+                            stack_buf[pos] = '\r'; stack_buf[pos + 1] = '\n'; pos += 2;
+                            match_count += 1;
+                        }
+                        ckv.readUnlockStripePublic(stripe);
+                    }
+                    // Patch pairs array header
+                    const pairs_hdr = std.fmt.bufPrint(stack_buf[pairs_start..], "*{d}\r\n", .{match_count * 2}) catch return false;
+                    // If header is shorter than reserved, shift data
+                    if (pairs_hdr.len < 16) {
+                        const data_start = pairs_start + 16;
+                        const data_len = pos - data_start;
+                        const new_data_start = pairs_start + pairs_hdr.len;
+                        std.mem.copyForwards(u8, stack_buf[new_data_start .. new_data_start + data_len], stack_buf[data_start .. data_start + data_len]);
+                        pos = new_data_start + data_len;
+                    }
+                    conn.write_buf.appendSlice(stack_buf[0..pos]) catch {};
+                    return true;
+                },
                 'C' => if (equalsAsciiUpper(cmd, "COMMAND")) {
                     conn.write_buf.appendSlice(ct.resp_ok) catch {};
                     return true;
