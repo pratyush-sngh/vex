@@ -214,6 +214,7 @@ const WatchEntry = struct {
 const Connection = struct {
     fd: i32,
     selected_db: u8,
+    protocol_version: resp.ProtocolVersion,
     accum: std.array_list.Managed(u8),
     accum_pos: usize,    write_buf: std.array_list.Managed(u8),
     write_offset: usize,
@@ -253,6 +254,7 @@ const Connection = struct {
         conn.* = .{
             .fd = fd,
             .selected_db = 0,
+            .protocol_version = .resp2,
             .accum = std.array_list.Managed(u8).init(allocator),
             .accum_pos = 0,
             .write_buf = blk: {
@@ -885,6 +887,21 @@ pub const Worker = struct {
     fn dispatchCommand(self: *Worker, conn: *Connection, args: []const []const u8) void {
         if (args.len == 0) return;
 
+        // HELLO — connection-level protocol negotiation (must be before hot path)
+        {
+            const c = args[0];
+            if (c.len == 5 and
+                (c[0] | 0x20) == 'h' and
+                (c[1] | 0x20) == 'e' and
+                (c[2] | 0x20) == 'l' and
+                (c[3] | 0x20) == 'l' and
+                (c[4] | 0x20) == 'o')
+            {
+                self.handleHello(conn, args);
+                return;
+            }
+        }
+
         // ── Fast path: common case (authenticated, no pubsub, no transaction) ──
         // Skips ~15 branch comparisons for the hot path.
         if (conn.authenticated and !conn.pubsub_mode and conn.tx_queue == null) {
@@ -913,7 +930,7 @@ pub const Worker = struct {
 
         // ── Slow path: handles auth, pubsub, transactions, etc. ──
 
-        // AUTH gate: reject unauthenticated commands (except AUTH and PING)
+        // AUTH gate: reject unauthenticated commands (except AUTH, HELLO, and PING)
         if (!conn.authenticated) {
             const cmd = args[0];
             if (equalsAsciiUpper(cmd, "AUTH")) {
@@ -1264,7 +1281,7 @@ pub const Worker = struct {
             if (conn.client_name) |name| {
                 writeBulkTo(&conn.write_buf, name);
             } else {
-                conn.write_buf.appendSlice("$-1\r\n") catch {};
+                writeNullTo(&conn.write_buf, conn.protocol_version);
             }
         } else if (equalsAsciiUpper(args[1], "ID")) {
             writeIntTo(&conn.write_buf, @intCast(conn.client_id));
@@ -1484,6 +1501,131 @@ pub const Worker = struct {
         }
     }
 
+    // ── HELLO handler ─────────────────────────────────────────────────
+
+    fn handleHello(self: *Worker, conn: *Connection, args: []const []const u8) void {
+        var target_proto = conn.protocol_version;
+
+        var i: usize = 1;
+        // Parse optional protocol version
+        if (i < args.len) {
+            const proto_num = std.fmt.parseInt(u8, args[i], 10) catch {
+                conn.write_buf.appendSlice("-ERR Protocol version is not an integer or out of range\r\n") catch {};
+                return;
+            };
+            switch (proto_num) {
+                2 => target_proto = .resp2,
+                3 => target_proto = .resp3,
+                else => {
+                    conn.write_buf.appendSlice("-NOPROTO unsupported protocol version\r\n") catch {};
+                    return;
+                },
+            }
+            i += 1;
+        }
+
+        // Parse optional AUTH username password
+        while (i < args.len) {
+            if (args[i].len == 4 and equalsAsciiUpper(args[i], "AUTH")) {
+                if (i + 2 >= args.len) {
+                    conn.write_buf.appendSlice("-ERR Syntax error in HELLO option 'AUTH'\r\n") catch {};
+                    return;
+                }
+                // args[i+1] is username (ignored — vex uses password-only auth)
+                const password = args[i + 2];
+                if (self.requirepass) |pass| {
+                    if (password.len != pass.len or !constantTimeEql(password, pass)) {
+                        conn.write_buf.appendSlice("-ERR invalid password\r\n") catch {};
+                        return;
+                    }
+                    conn.authenticated = true;
+                }
+                i += 3;
+            } else if (args[i].len == 7 and equalsAsciiUpper(args[i], "SETNAME")) {
+                if (i + 1 >= args.len) {
+                    conn.write_buf.appendSlice("-ERR Syntax error in HELLO option 'SETNAME'\r\n") catch {};
+                    return;
+                }
+                if (conn.client_name) |old| self.allocator.free(old);
+                conn.client_name = self.allocator.dupe(u8, args[i + 1]) catch null;
+                i += 2;
+            } else {
+                conn.write_buf.appendSlice("-ERR Unrecognized HELLO option\r\n") catch {};
+                return;
+            }
+        }
+
+        conn.protocol_version = target_proto;
+
+        // Build response — 7 fields: server, version, proto, id, mode, role, modules
+        const proto_val = @intFromEnum(target_proto);
+        var buf: [512]u8 = undefined;
+        var pos: usize = 0;
+
+        if (target_proto == .resp3) {
+            // RESP3: map with 7 entries
+            const hdr = std.fmt.bufPrint(buf[pos..], "%7\r\n", .{}) catch return;
+            pos += hdr.len;
+        } else {
+            // RESP2: flat array with 14 elements (7 key-value pairs)
+            const hdr = std.fmt.bufPrint(buf[pos..], "*14\r\n", .{}) catch return;
+            pos += hdr.len;
+        }
+
+        // server -> vex
+        const fields = [_]struct { k: []const u8, v: []const u8 }{
+            .{ .k = "server", .v = "vex" },
+            .{ .k = "version", .v = "0.6.1" },
+        };
+        for (fields) |f| {
+            const kh = std.fmt.bufPrint(buf[pos..], "${d}\r\n", .{f.k.len}) catch return;
+            pos += kh.len;
+            @memcpy(buf[pos .. pos + f.k.len], f.k);
+            pos += f.k.len;
+            buf[pos] = '\r';
+            buf[pos + 1] = '\n';
+            pos += 2;
+            const vh = std.fmt.bufPrint(buf[pos..], "${d}\r\n", .{f.v.len}) catch return;
+            pos += vh.len;
+            @memcpy(buf[pos .. pos + f.v.len], f.v);
+            pos += f.v.len;
+            buf[pos] = '\r';
+            buf[pos + 1] = '\n';
+            pos += 2;
+        }
+
+        // proto -> integer
+        const pk = std.fmt.bufPrint(buf[pos..], "$5\r\nproto\r\n:{d}\r\n", .{proto_val}) catch return;
+        pos += pk.len;
+
+        // id -> integer
+        const ik = std.fmt.bufPrint(buf[pos..], "$2\r\nid\r\n:{d}\r\n", .{conn.client_id}) catch return;
+        pos += ik.len;
+
+        // mode -> standalone
+        const mk = "$4\r\nmode\r\n$10\r\nstandalone\r\n";
+        @memcpy(buf[pos .. pos + mk.len], mk);
+        pos += mk.len;
+
+        // role -> master
+        const rk = "$4\r\nrole\r\n$6\r\nmaster\r\n";
+        @memcpy(buf[pos .. pos + rk.len], rk);
+        pos += rk.len;
+
+        // modules -> empty array/set
+        if (target_proto == .resp3) {
+            const mod = "$7\r\nmodules\r\n~0\r\n";
+            @memcpy(buf[pos .. pos + mod.len], mod);
+            pos += mod.len;
+        } else {
+            const mod = "$7\r\nmodules\r\n*0\r\n";
+            @memcpy(buf[pos .. pos + mod.len], mod);
+            pos += mod.len;
+        }
+
+        conn.write_buf.appendSlice(buf[0..pos]) catch {};
+    }
+
     // ── Pub/Sub handlers ─────────────────────────────────────────────
 
     fn handleSubscribe(self: *Worker, conn: *Connection, args: []const []const u8, ps: *PubSubRegistry) void {
@@ -1495,7 +1637,8 @@ pub const Worker = struct {
         for (args[1..]) |channel| {
             ps.subscribe(channel, conn.fd) catch continue;
             // RESP push: *3\r\n$9\r\nsubscribe\r\n$<chanlen>\r\n<chan>\r\n:<count>\r\n
-            conn.write_buf.appendSlice("*3\r\n$9\r\nsubscribe\r\n") catch {};
+            const sub_hdr: []const u8 = if (conn.protocol_version == .resp3) ">3\r\n$9\r\nsubscribe\r\n" else "*3\r\n$9\r\nsubscribe\r\n";
+            conn.write_buf.appendSlice(sub_hdr) catch {};
             writeBulkTo(&conn.write_buf, channel);
             writeIntTo(&conn.write_buf, 1);
         }
@@ -1504,16 +1647,21 @@ pub const Worker = struct {
 
     fn handleUnsubscribe(self: *Worker, conn: *Connection, args: []const []const u8, ps: *PubSubRegistry) void {
         _ = self;
+        const unsub_hdr: []const u8 = if (conn.protocol_version == .resp3) ">3\r\n$11\r\nunsubscribe\r\n" else "*3\r\n$11\r\nunsubscribe\r\n";
         if (args.len < 2) {
             // Unsubscribe from all channels
             ps.unsubscribeAll(conn.fd);
             conn.pubsub_mode = false;
-            conn.write_buf.appendSlice("*3\r\n$11\r\nunsubscribe\r\n$-1\r\n:0\r\n") catch {};
+            if (conn.protocol_version == .resp3) {
+                conn.write_buf.appendSlice(">3\r\n$11\r\nunsubscribe\r\n_\r\n:0\r\n") catch {};
+            } else {
+                conn.write_buf.appendSlice("*3\r\n$11\r\nunsubscribe\r\n$-1\r\n:0\r\n") catch {};
+            }
             return;
         }
         for (args[1..]) |channel| {
             ps.unsubscribe(channel, conn.fd);
-            conn.write_buf.appendSlice("*3\r\n$11\r\nunsubscribe\r\n") catch {};
+            conn.write_buf.appendSlice(unsub_hdr) catch {};
             writeBulkTo(&conn.write_buf, channel);
             writeIntTo(&conn.write_buf, 0);
         }
@@ -1533,20 +1681,26 @@ pub const Worker = struct {
         defer subs.deinit();
         ps.getSubscribers(channel, &subs);
 
-        // Format the push message: *3\r\n$7\r\nmessage\r\n$<chanlen>\r\n<chan>\r\n$<msglen>\r\n<msg>\r\n
-        var push_buf = std.array_list.Managed(u8).init(self.allocator);
-        defer push_buf.deinit();
-        push_buf.appendSlice("*3\r\n$7\r\nmessage\r\n") catch {};
-        writeBulkTo(&push_buf, channel);
-        writeBulkTo(&push_buf, message);
+        // Format the push message body (channel + message bulk strings)
+        var body_buf = std.array_list.Managed(u8).init(self.allocator);
+        defer body_buf.deinit();
+        writeBulkTo(&body_buf, channel);
+        writeBulkTo(&body_buf, message);
 
-        // Write to all subscribers (direct write to their fds)
+        // Write to all subscribers — use >3 (push) for RESP3, *3 (array) for RESP2
         for (subs.items) |fd| {
             if (self.conns.get(fd)) |sub_conn| {
-                sub_conn.write_buf.appendSlice(push_buf.items) catch {};
+                const hdr: []const u8 = if (sub_conn.protocol_version == .resp3)
+                    ">3\r\n$7\r\nmessage\r\n"
+                else
+                    "*3\r\n$7\r\nmessage\r\n";
+                sub_conn.write_buf.appendSlice(hdr) catch {};
+                sub_conn.write_buf.appendSlice(body_buf.items) catch {};
             } else {
-                // Subscriber on different worker — write directly to fd
-                _ = std.c.write(fd, push_buf.items.ptr, push_buf.items.len);
+                // Subscriber on different worker — write directly to fd (RESP2 default)
+                const hdr = "*3\r\n$7\r\nmessage\r\n";
+                _ = std.c.write(fd, hdr.ptr, hdr.len);
+                _ = std.c.write(fd, body_buf.items.ptr, body_buf.items.len);
             }
         }
 
@@ -1599,6 +1753,7 @@ pub const Worker = struct {
                 &selected_db, self.keys_mode,
             );
             handler.ckv = self.ckv;
+            handler.protocol_version = conn.protocol_version;
             var list: std.ArrayList(u8) = .empty;
             defer list.deinit(self.allocator);
             var aw = std.Io.Writer.Allocating.fromArrayList(self.allocator, &list);
@@ -1610,6 +1765,7 @@ pub const Worker = struct {
             };
             handler.kvGetCleanup();
             conn.selected_db = selected_db.load(.monotonic);
+            conn.protocol_version = handler.protocol_version;
             conn.write_buf.appendSlice(aw.written()) catch {};
         }
 
@@ -1638,7 +1794,7 @@ pub const Worker = struct {
                     const stripe = ckv.getStripePublic(ns_key);
                     const entry_opt = stripe.map.getPtr(ns_key);
                     if (entry_opt == null) {
-                        conn.write_buf.appendSlice("$-1\r\n") catch {};
+                        writeNullTo(&conn.write_buf, conn.protocol_version);
                         return true;
                     }
                     const entry = entry_opt.?;
@@ -1647,7 +1803,7 @@ pub const Worker = struct {
                     if (entry.flags.deleted or
                         (entry.flags.has_ttl and ckv.cached_now_ms > entry.expires_at))
                     {
-                        conn.write_buf.appendSlice("$-1\r\n") catch {};
+                        writeNullTo(&conn.write_buf, conn.protocol_version);
                         return true;
                     }
 
@@ -1826,23 +1982,20 @@ pub const Worker = struct {
                             resp_buf = self.allocator.realloc(resp_buf, resp_buf.len * 2) catch break;
                         }
                         const ns = nsKey(conn.selected_db, user_key) orelse {
-                            @memcpy(resp_buf[pos .. pos + 5], "$-1\r\n");
-                            pos += 5;
+                            pos += writeNullBuf(resp_buf, pos, conn.protocol_version);
                             continue;
                         };
                         const stripe = ckv.getStripePublic(ns);
                         const entry_opt = stripe.map.getPtr(ns);
                         if (entry_opt == null) {
-                            @memcpy(resp_buf[pos .. pos + 5], "$-1\r\n");
-                            pos += 5;
+                            pos += writeNullBuf(resp_buf, pos, conn.protocol_version);
                             continue;
                         }
                         const entry = entry_opt.?;
                         if (entry.flags.deleted or
                             (entry.flags.has_ttl and ckv.cached_now_ms > entry.expires_at))
                         {
-                            @memcpy(resp_buf[pos .. pos + 5], "$-1\r\n");
-                            pos += 5;
+                            pos += writeNullBuf(resp_buf, pos, conn.protocol_version);
                             continue;
                         }
 
@@ -1975,7 +2128,7 @@ pub const Worker = struct {
                             if (hs.hget(ns, args[2])) |val| {
                                 writeBulkTo(&conn.write_buf, val);
                             } else {
-                                conn.write_buf.appendSlice("$-1\r\n") catch {};
+                                writeNullTo(&conn.write_buf, conn.protocol_version);
                             }
                             return true;
                         }
@@ -2017,8 +2170,7 @@ pub const Worker = struct {
                                     pos += val.len;
                                     buf[pos] = '\r'; buf[pos + 1] = '\n'; pos += 2;
                                 } else {
-                                    @memcpy(buf[pos .. pos + 5], "$-1\r\n");
-                                    pos += 5;
+                                    pos += writeNullBuf(buf, pos, conn.protocol_version);
                                 }
                             }
                             conn.write_buf.appendSlice(buf[0..pos]) catch {};
@@ -2069,7 +2221,10 @@ pub const Worker = struct {
                             defer if (heap_buf) |hb| self.allocator.free(hb);
                             const buf: []u8 = heap_buf orelse &stack_buf;
                             var pos: usize = 0;
-                            const arr_hdr = std.fmt.bufPrint(buf[pos..], "*{d}\r\n", .{pairs.len}) catch return false;
+                            const arr_hdr = if (conn.protocol_version == .resp3)
+                                std.fmt.bufPrint(buf[pos..], "%{d}\r\n", .{pairs.len / 2}) catch return false
+                            else
+                                std.fmt.bufPrint(buf[pos..], "*{d}\r\n", .{pairs.len}) catch return false;
                             pos += arr_hdr.len;
                             for (pairs) |item| {
                                 if (pos + item.len + 16 > buf.len) break;
@@ -2104,7 +2259,7 @@ pub const Worker = struct {
                                 if (self.aof) |a| a.logCommand(args);
                                 writeBulkTo(&conn.write_buf, v);
                             } else {
-                                conn.write_buf.appendSlice("$-1\r\n") catch {};
+                                writeNullTo(&conn.write_buf, conn.protocol_version);
                             }
                             return true;
                         }
@@ -2120,7 +2275,7 @@ pub const Worker = struct {
                             if (self.aof) |a| a.logCommand(args);
                             writeBulkTo(&conn.write_buf, v);
                         } else {
-                            conn.write_buf.appendSlice("$-1\r\n") catch {};
+                            writeNullTo(&conn.write_buf, conn.protocol_version);
                         }
                         return true;
                     }
@@ -2321,10 +2476,10 @@ pub const Worker = struct {
                         pos += hdr.len;
                         for (args[1..]) |user_key| {
                             const ns = nsKey(conn.selected_db, user_key) orelse {
-                                @memcpy(buf[pos .. pos + 5], "$-1\r\n"); pos += 5; continue;
+                                pos += writeNullBuf(buf, pos, conn.protocol_version); continue;
                             };
                             if (ckv.get(ns)) |owned| {
-                                if (pos + owned.data.len + 16 > buf.len) { owned.deinit(); @memcpy(buf[pos .. pos + 5], "$-1\r\n"); pos += 5; continue; }
+                                if (pos + owned.data.len + 16 > buf.len) { owned.deinit(); pos += writeNullBuf(buf, pos, conn.protocol_version); continue; }
                                 const vh = std.fmt.bufPrint(buf[pos..], "${d}\r\n", .{owned.data.len}) catch { owned.deinit(); continue; };
                                 pos += vh.len;
                                 @memcpy(buf[pos .. pos + owned.data.len], owned.data);
@@ -2333,7 +2488,7 @@ pub const Worker = struct {
                                 owned.deinit();
                                 _ = ckv.delete(ns);
                             } else {
-                                @memcpy(buf[pos .. pos + 5], "$-1\r\n"); pos += 5;
+                                pos += writeNullBuf(buf, pos, conn.protocol_version);
                             }
                         }
                         if (self.aof) |a| a.logCommand(args);
@@ -2501,6 +2656,7 @@ pub const Worker = struct {
         handler.hash_store = self.hash_store;
         handler.set_store = self.set_store;
         handler.sorted_set_store = self.sorted_set_store;
+        handler.protocol_version = conn.protocol_version;
 
         var list: std.ArrayList(u8) = .empty;
         defer list.deinit(self.allocator);
@@ -2510,6 +2666,7 @@ pub const Worker = struct {
         handler.execute(args, &aw.writer) catch return;
 
         conn.selected_db = selected_db.load(.monotonic);
+        conn.protocol_version = handler.protocol_version;
         conn.write_buf.appendSlice(aw.written()) catch return;
     }
 
@@ -2745,6 +2902,58 @@ fn writeBulkTo(list: *std.array_list.Managed(u8), data: []const u8) void {
     list.appendSlice(h) catch return;
     list.appendSlice(data) catch return;
     list.appendSlice("\r\n") catch return;
+}
+
+/// Write null into a pre-allocated buffer, returning bytes written (5 for RESP2, 3 for RESP3).
+fn writeNullBuf(buf: []u8, pos: usize, proto: resp.ProtocolVersion) usize {
+    switch (proto) {
+        .resp2 => {
+            @memcpy(buf[pos .. pos + 5], "$-1\r\n");
+            return 5;
+        },
+        .resp3 => {
+            @memcpy(buf[pos .. pos + 3], "_\r\n");
+            return 3;
+        },
+    }
+}
+
+/// Write null in the correct format for the connection's protocol version.
+fn writeNullTo(list: *std.array_list.Managed(u8), proto: resp.ProtocolVersion) void {
+    switch (proto) {
+        .resp2 => list.appendSlice("$-1\r\n") catch return,
+        .resp3 => list.appendSlice("_\r\n") catch return,
+    }
+}
+
+/// Write array header (RESP2) or map header (RESP3) for key-value pair collections.
+fn writeMapHeaderTo(list: *std.array_list.Managed(u8), pair_count: usize, proto: resp.ProtocolVersion) void {
+    var buf: [32]u8 = undefined;
+    switch (proto) {
+        .resp2 => {
+            const s = std.fmt.bufPrint(&buf, "*{d}\r\n", .{pair_count * 2}) catch return;
+            list.appendSlice(s) catch return;
+        },
+        .resp3 => {
+            const s = std.fmt.bufPrint(&buf, "%{d}\r\n", .{pair_count}) catch return;
+            list.appendSlice(s) catch return;
+        },
+    }
+}
+
+/// Write array header (RESP2) or set header (RESP3).
+fn writeSetHeaderTo(list: *std.array_list.Managed(u8), count: usize, proto: resp.ProtocolVersion) void {
+    var buf: [32]u8 = undefined;
+    switch (proto) {
+        .resp2 => {
+            const s = std.fmt.bufPrint(&buf, "*{d}\r\n", .{count}) catch return;
+            list.appendSlice(s) catch return;
+        },
+        .resp3 => {
+            const s = std.fmt.bufPrint(&buf, "~{d}\r\n", .{count}) catch return;
+            list.appendSlice(s) catch return;
+        },
+    }
 }
 
 /// Pre-computed RESP integer responses for 0-31 (covers most return values).

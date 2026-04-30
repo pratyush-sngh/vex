@@ -21,6 +21,7 @@ const ConnState = struct {
     write_seq: u64 = 1,
     write_mutex: std.Io.Mutex = .init,
     write_ready: std.Io.Condition = .init,
+    protocol_version: resp.ProtocolVersion = .resp2,
 
     fn init(io: std.Io) ConnState {
         return .{
@@ -1267,6 +1268,7 @@ fn executeInline(
     args: []const []const u8,
     allocator: Allocator,
     fd: posix.socket_t,
+    conn: *ConnState,
     selected_db: *std.atomic.Value(u8),
     io: std.Io,
     profile: ?*span.Profile,
@@ -1282,6 +1284,7 @@ fn executeInline(
         selected_db,
         rt.keys_mode,
     );
+    handler.protocol_version = conn.protocol_version;
 
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(allocator);
@@ -1294,6 +1297,7 @@ fn executeInline(
         return;
     };
     const exec_t1 = std.Io.Clock.Timestamp.now(io, .awake);
+    conn.protocol_version = handler.protocol_version;
     rt.unlockInline();
 
     if (profile) |p| p.recordExec(span.monotonicNs(exec_t0, exec_t1));
@@ -1313,6 +1317,7 @@ fn executeHotInline(
     rt: *EngineRuntime,
     args: []const []const u8,
     fd: posix.socket_t,
+    conn: *ConnState,
     selected_db: u8,
     allocator: Allocator,
     io: std.Io,
@@ -1360,7 +1365,13 @@ fn executeHotInline(
         defer if (val_copy) |vc| allocator.free(vc);
 
         const write_t0 = std.Io.Clock.Timestamp.now(io, .awake);
-        writeBulkPacked(fd, val_copy);
+        if (val_copy) |vc| {
+            writeBulkPacked(fd, vc);
+        } else if (conn.protocol_version == .resp3) {
+            writeAll(fd, "_\r\n");
+        } else {
+            writeAll(fd, "$-1\r\n");
+        }
         const write_t1 = std.Io.Clock.Timestamp.now(io, .awake);
         if (profile) |p| {
             p.recordWrite(span.monotonicNs(write_t0, write_t1));
@@ -1543,7 +1554,7 @@ fn enqueueArgs(
     }
 
     // Single engine: inline execution under OS mutex (no queue overhead)
-    executeInline(&runtimes[0], args, allocator, fd, selected_db, io, profile);
+    executeInline(&runtimes[0], args, allocator, fd, conn, selected_db, io, profile);
     return true;
 }
 
@@ -1594,6 +1605,10 @@ fn processOneCommand(
             consumeAccum(accum, eol + 2);
             return true;
         }
+        if (tryHandleHello(parts, fd, conn)) {
+            consumeAccum(accum, eol + 2);
+            return true;
+        }
 
         if (!enqueueArgs(parts, allocator, fd, conn, queues, queue_count, runtimes, kv_shards, selected_db, io, scale_mode, profile)) return false;
         consumeAccum(accum, eol + 2);
@@ -1625,6 +1640,11 @@ fn processOneCommand(
         return true;
     }
 
+    if (tryHandleHello(args.items, fd, conn)) {
+        consumeAccum(accum, parser.pos);
+        return true;
+    }
+
     if (!enqueueArgs(args.items, allocator, fd, conn, queues, queue_count, runtimes, kv_shards, selected_db, io, scale_mode, profile)) return false;
     consumeAccum(accum, parser.pos);
     return true;
@@ -1647,6 +1667,70 @@ fn tryHandleSelect(
     };
     selected_db.store(db, .monotonic);
     sendSimpleReply(fd, conn, queue_count, "+OK\r\n");
+    return true;
+}
+
+fn tryHandleHello(args: []const []const u8, fd: posix.socket_t, conn: *ConnState) bool {
+    if (args.len == 0) return false;
+    var cmd_buf: [64]u8 = undefined;
+    const cmd = toUpperLocal(args[0], &cmd_buf);
+    if (!std.mem.eql(u8, cmd, "HELLO")) return false;
+
+    var target_proto = conn.protocol_version;
+    var i: usize = 1;
+    if (i < args.len) {
+        const proto_num = std.fmt.parseInt(u8, args[i], 10) catch {
+            writeAll(fd, "-ERR Protocol version is not an integer or out of range\r\n");
+            return true;
+        };
+        switch (proto_num) {
+            2 => target_proto = .resp2,
+            3 => target_proto = .resp3,
+            else => {
+                writeAll(fd, "-NOPROTO unsupported protocol version\r\n");
+                return true;
+            },
+        }
+        i += 1;
+    }
+    // Skip AUTH/SETNAME sub-args
+    while (i < args.len) : (i += 1) {}
+
+    conn.protocol_version = target_proto;
+
+    // Build response
+    var buf: [512]u8 = undefined;
+    var pos: usize = 0;
+    if (target_proto == .resp3) {
+        const hdr = std.fmt.bufPrint(buf[pos..], "%7\r\n", .{}) catch return true;
+        pos += hdr.len;
+    } else {
+        const hdr = std.fmt.bufPrint(buf[pos..], "*14\r\n", .{}) catch return true;
+        pos += hdr.len;
+    }
+    const fields = [_]struct { k: []const u8, v: []const u8 }{
+        .{ .k = "server", .v = "vex" },
+        .{ .k = "version", .v = "0.6.1" },
+    };
+    for (fields) |f| {
+        const kh = std.fmt.bufPrint(buf[pos..], "${d}\r\n", .{f.k.len}) catch return true;
+        pos += kh.len;
+        @memcpy(buf[pos .. pos + f.k.len], f.k);
+        pos += f.k.len;
+        buf[pos] = '\r'; buf[pos + 1] = '\n'; pos += 2;
+        const vh = std.fmt.bufPrint(buf[pos..], "${d}\r\n", .{f.v.len}) catch return true;
+        pos += vh.len;
+        @memcpy(buf[pos .. pos + f.v.len], f.v);
+        pos += f.v.len;
+        buf[pos] = '\r'; buf[pos + 1] = '\n'; pos += 2;
+    }
+    const proto_val = @intFromEnum(target_proto);
+    const rest = std.fmt.bufPrint(buf[pos..], "$5\r\nproto\r\n:{d}\r\n$2\r\nid\r\n:0\r\n$4\r\nmode\r\n$10\r\nstandalone\r\n$4\r\nrole\r\n$6\r\nmaster\r\n$7\r\nmodules\r\n{s}", .{
+        proto_val,
+        if (target_proto == .resp3) "~0\r\n" else "*0\r\n",
+    }) catch return true;
+    pos += rest.len;
+    writeAll(fd, buf[0..pos]);
     return true;
 }
 
@@ -1698,8 +1782,9 @@ fn enqueueFastResp(
 
     const args = args_buf[0..@as(usize, @intCast(argc))];
 
-    // Handle SELECT inline (per-connection, not queued)
+    // Handle SELECT and HELLO inline (per-connection, not queued)
     if (tryHandleSelect(args, selected_db, fd, conn, queue_count)) return pos;
+    if (tryHandleHello(args, fd, conn)) return pos;
 
     // Multi-engine checks
     if (queue_count > 1) {
@@ -1716,9 +1801,9 @@ fn enqueueFastResp(
     if (queue_count == 1) {
         // Single engine: inline execution with hot-path or generic fallback
         const db = selected_db.load(.monotonic);
-        if (executeHotInline(&runtimes[0], args, fd, db, allocator, io, profile)) return pos;
+        if (executeHotInline(&runtimes[0], args, fd, conn, db, allocator, io, profile)) return pos;
         // Fall back to generic inline
-        executeInline(&runtimes[0], args, allocator, fd, selected_db, io, profile);
+        executeInline(&runtimes[0], args, allocator, fd, conn, selected_db, io, profile);
         return pos;
     }
 

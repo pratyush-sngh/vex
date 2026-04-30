@@ -42,6 +42,8 @@ pub const CommandHandler = struct {
     set_store: ?*SetStore,
     sorted_set_store: ?*SortedSetStore,
     data_dir: ?[]const u8,
+    /// RESP protocol version for this connection (2 or 3)
+    protocol_version: resp.ProtocolVersion = .resp2,
     /// ConcurrentKV for reactor mode — when set, KV ops route through CKV instead of plain KVStore
     ckv: ?*ConcurrentKV = null,
     /// Stashed OwnedValue from last kvGet — freed on next kvGet or cleanup
@@ -194,6 +196,7 @@ pub const CommandHandler = struct {
                 'L' => if (std.mem.eql(u8, cmd, "LPUSH")) return self.cmdLpush(args, w),
                 'R' => if (std.mem.eql(u8, cmd, "RPUSH")) return self.cmdRpush(args, w),
                 'H' => {
+                    if (std.mem.eql(u8, cmd, "HELLO")) return self.cmdHello(args, w);
                     if (std.mem.eql(u8, cmd, "HMSET")) return self.cmdHmset(args, w);
                     if (std.mem.eql(u8, cmd, "HMGET")) return self.cmdHmget(args, w);
                     if (std.mem.eql(u8, cmd, "HKEYS")) return self.cmdHkeys(args, w);
@@ -376,12 +379,12 @@ pub const CommandHandler = struct {
 
         // NX: only set if key does NOT exist
         if (nx and self.kvExists(key_ref.key)) {
-            try resp.serializeBulkString(w, null);
+            try resp.serializeNullValue(w, self.protocol_version);
             return;
         }
         // XX: only set if key DOES exist
         if (xx and !self.kvExists(key_ref.key)) {
-            try resp.serializeBulkString(w, null);
+            try resp.serializeNullValue(w, self.protocol_version);
             return;
         }
 
@@ -417,7 +420,7 @@ pub const CommandHandler = struct {
         };
         defer key_ref.deinit(self.allocator);
         const val = self.kvGet(key_ref.key);
-        try resp.serializeBulkString(w, val);
+        try resp.serializeBulkStringProto(w, val, self.protocol_version);
     }
 
     fn cmdDel(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
@@ -731,14 +734,14 @@ pub const CommandHandler = struct {
         for (args[1..]) |user_key| {
             var key_buf: [512]u8 = undefined;
             var key_ref = namespacedKeyRef(self, user_key, &key_buf) catch {
-                try resp.serializeBulkString(w, null);
+                try resp.serializeNullValue(w, self.protocol_version);
                 continue;
             };
             defer key_ref.deinit(self.allocator);
             if (self.kvGet(key_ref.key)) |val| {
                 try resp.serializeBulkString(w, val);
             } else {
-                try resp.serializeBulkString(w, null);
+                try resp.serializeNullValue(w, self.protocol_version);
             }
         }
     }
@@ -1069,7 +1072,7 @@ pub const CommandHandler = struct {
         }
         var key_buf: [512]u8 = undefined;
         var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch {
-            try resp.serializeBulkString(w, null);
+            try resp.serializeNullValue(w, self.protocol_version);
             return;
         };
         defer key_ref.deinit(self.allocator);
@@ -1084,7 +1087,7 @@ pub const CommandHandler = struct {
             self.logToAOF(args);
             try resp.serializeBulkString(w, copy);
         } else {
-            try resp.serializeBulkString(w, null);
+            try resp.serializeNullValue(w, self.protocol_version);
         }
     }
 
@@ -1096,13 +1099,13 @@ pub const CommandHandler = struct {
         }
         var key_buf: [512]u8 = undefined;
         var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch {
-            try resp.serializeBulkString(w, null);
+            try resp.serializeNullValue(w, self.protocol_version);
             return;
         };
         defer key_ref.deinit(self.allocator);
         const val = self.kvGet(key_ref.key);
         if (val == null) {
-            try resp.serializeBulkString(w, null);
+            try resp.serializeNullValue(w, self.protocol_version);
             return;
         }
         // Copy value before potential re-set
@@ -1302,26 +1305,26 @@ pub const CommandHandler = struct {
     fn cmdLpop(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
         if (args.len < 2) { try resp.serializeError(w, "wrong number of arguments for 'LPOP'"); return; }
         var key_buf: [512]u8 = undefined;
-        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeBulkString(w, null); return; };
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeNullValue(w, self.protocol_version); return; };
         defer key_ref.deinit(self.allocator);
         if (self.getListStore().lpop(key_ref.key)) |val| {
             self.logToAOF(args);
             try resp.serializeBulkString(w, val);
         } else {
-            try resp.serializeBulkString(w, null);
+            try resp.serializeNullValue(w, self.protocol_version);
         }
     }
 
     fn cmdRpop(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
         if (args.len < 2) { try resp.serializeError(w, "wrong number of arguments for 'RPOP'"); return; }
         var key_buf: [512]u8 = undefined;
-        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeBulkString(w, null); return; };
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeNullValue(w, self.protocol_version); return; };
         defer key_ref.deinit(self.allocator);
         if (self.getListStore().rpop(key_ref.key)) |val| {
             self.logToAOF(args);
             try resp.serializeBulkString(w, val);
         } else {
-            try resp.serializeBulkString(w, null);
+            try resp.serializeNullValue(w, self.protocol_version);
         }
     }
 
@@ -1352,10 +1355,10 @@ pub const CommandHandler = struct {
     fn cmdLindex(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
         if (args.len < 3) { try resp.serializeError(w, "wrong number of arguments for 'LINDEX'"); return; }
         var key_buf: [512]u8 = undefined;
-        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeBulkString(w, null); return; };
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeNullValue(w, self.protocol_version); return; };
         defer key_ref.deinit(self.allocator);
         const idx = std.fmt.parseInt(i64, args[2], 10) catch { try resp.serializeError(w, "value is not an integer"); return; };
-        try resp.serializeBulkString(w, self.getListStore().lindex(key_ref.key, idx));
+        try resp.serializeBulkStringProto(w, self.getListStore().lindex(key_ref.key, idx), self.protocol_version);
     }
 
     fn cmdLset(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
@@ -1402,9 +1405,9 @@ pub const CommandHandler = struct {
     fn cmdHgetFn(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
         if (args.len < 3) { try resp.serializeError(w, "wrong number of arguments for 'HGET'"); return; }
         var key_buf: [512]u8 = undefined;
-        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeBulkString(w, null); return; };
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeNullValue(w, self.protocol_version); return; };
         defer key_ref.deinit(self.allocator);
-        try resp.serializeBulkString(w, self.getHashStore().hget(key_ref.key, args[2]));
+        try resp.serializeBulkStringProto(w, self.getHashStore().hget(key_ref.key, args[2]), self.protocol_version);
     }
 
     fn cmdHdel(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
@@ -1420,11 +1423,11 @@ pub const CommandHandler = struct {
     fn cmdHgetall(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
         if (args.len < 2) { try resp.serializeError(w, "wrong number of arguments for 'HGETALL'"); return; }
         var key_buf: [512]u8 = undefined;
-        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeArrayHeader(w, 0); return; };
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeMapOrArrayHeader(w, 0, self.protocol_version); return; };
         defer key_ref.deinit(self.allocator);
-        const pairs = self.getHashStore().hgetall(key_ref.key, self.allocator) catch { try resp.serializeArrayHeader(w, 0); return; };
+        const pairs = self.getHashStore().hgetall(key_ref.key, self.allocator) catch { try resp.serializeMapOrArrayHeader(w, 0, self.protocol_version); return; };
         defer if (pairs.len > 0) self.allocator.free(pairs);
-        try resp.serializeArrayHeader(w, pairs.len);
+        try resp.serializeMapOrArrayHeader(w, pairs.len / 2, self.protocol_version);
         for (pairs) |s| try resp.serializeBulkString(w, s);
     }
 
@@ -1459,13 +1462,13 @@ pub const CommandHandler = struct {
         var key_buf: [512]u8 = undefined;
         var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch {
             try resp.serializeArrayHeader(w, args.len - 2);
-            for (args[2..]) |_| try resp.serializeBulkString(w, null);
+            for (args[2..]) |_| try resp.serializeNullValue(w, self.protocol_version);
             return;
         };
         defer key_ref.deinit(self.allocator);
         try resp.serializeArrayHeader(w, args.len - 2);
         for (args[2..]) |field| {
-            try resp.serializeBulkString(w, self.getHashStore().hget(key_ref.key, field));
+            try resp.serializeBulkStringProto(w, self.getHashStore().hget(key_ref.key, field), self.protocol_version);
         }
     }
 
@@ -1550,11 +1553,11 @@ pub const CommandHandler = struct {
     fn cmdSmembers(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
         if (args.len < 2) { try resp.serializeError(w, "wrong number of arguments for 'SMEMBERS'"); return; }
         var key_buf: [512]u8 = undefined;
-        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeArrayHeader(w, 0); return; };
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeSetOrArrayHeader(w, 0, self.protocol_version); return; };
         defer key_ref.deinit(self.allocator);
-        const members = self.getSetStore().smembers(key_ref.key, self.allocator) catch { try resp.serializeArrayHeader(w, 0); return; };
+        const members = self.getSetStore().smembers(key_ref.key, self.allocator) catch { try resp.serializeSetOrArrayHeader(w, 0, self.protocol_version); return; };
         defer if (members.len > 0) self.allocator.free(members);
-        try resp.serializeArrayHeader(w, members.len);
+        try resp.serializeSetOrArrayHeader(w, members.len, self.protocol_version);
         for (members) |m| try resp.serializeBulkString(w, m);
     }
 
@@ -1588,9 +1591,9 @@ pub const CommandHandler = struct {
             .sunion => ss.sunion(ns_keys.items, self.allocator),
             .sinter => ss.sinter(ns_keys.items, self.allocator),
             .sdiff => ss.sdiff(ns_keys.items, self.allocator),
-        } catch { try resp.serializeArrayHeader(w, 0); return; };
+        } catch { try resp.serializeSetOrArrayHeader(w, 0, self.protocol_version); return; };
         defer if (result.len > 0) self.allocator.free(result);
-        try resp.serializeArrayHeader(w, result.len);
+        try resp.serializeSetOrArrayHeader(w, result.len, self.protocol_version);
         for (result) |m| try resp.serializeBulkString(w, m);
     }
 
@@ -1623,14 +1626,14 @@ pub const CommandHandler = struct {
     fn cmdZscore(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
         if (args.len < 3) { try resp.serializeError(w, "wrong number of arguments for 'ZSCORE'"); return; }
         var key_buf: [512]u8 = undefined;
-        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeBulkString(w, null); return; };
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeNullValue(w, self.protocol_version); return; };
         defer key_ref.deinit(self.allocator);
         if (self.getSortedSetStore().zscore(key_ref.key, args[2])) |score| {
             var buf: [32]u8 = undefined;
-            const s = std.fmt.bufPrint(&buf, "{d:.6}", .{score}) catch { try resp.serializeBulkString(w, null); return; };
+            const s = std.fmt.bufPrint(&buf, "{d:.6}", .{score}) catch { try resp.serializeNullValue(w, self.protocol_version); return; };
             try resp.serializeBulkString(w, s);
         } else {
-            try resp.serializeBulkString(w, null);
+            try resp.serializeNullValue(w, self.protocol_version);
         }
     }
 
@@ -1645,13 +1648,13 @@ pub const CommandHandler = struct {
     fn cmdZrank(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
         if (args.len < 3) { try resp.serializeError(w, "wrong number of arguments for 'ZRANK'"); return; }
         var key_buf: [512]u8 = undefined;
-        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeBulkString(w, null); return; };
+        var key_ref = namespacedKeyRef(self, args[1], &key_buf) catch { try resp.serializeNullValue(w, self.protocol_version); return; };
         defer key_ref.deinit(self.allocator);
         const rank = self.getSortedSetStore().zrank(key_ref.key, args[2]);
         if (rank) |r| {
             try resp.serializeInteger(w, @intCast(r));
         } else {
-            try resp.serializeBulkString(w, null);
+            try resp.serializeNullValue(w, self.protocol_version);
         }
     }
 
@@ -1718,7 +1721,54 @@ pub const CommandHandler = struct {
                 return;
             }
         }
-        try resp.serializeBulkString(w, null);
+        try resp.serializeNullValue(w, self.protocol_version);
+    }
+
+    /// HELLO [protover] — RESP3 protocol negotiation
+    fn cmdHello(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
+        var target_proto = self.protocol_version;
+
+        if (args.len >= 2) {
+            const proto_num = std.fmt.parseInt(u8, args[1], 10) catch {
+                try resp.serializeError(w, "Protocol version is not an integer or out of range");
+                return;
+            };
+            switch (proto_num) {
+                2 => target_proto = .resp2,
+                3 => target_proto = .resp3,
+                else => {
+                    try resp.serializeErrorTyped(w, "NOPROTO", "unsupported protocol version");
+                    return;
+                },
+            }
+        }
+
+        self.protocol_version = target_proto;
+
+        // Response: 7 key-value pairs — server, version, proto, id, mode, role, modules
+        if (target_proto == .resp3) {
+            try resp.serializeMapHeader(w, 7);
+        } else {
+            try resp.serializeArrayHeader(w, 14);
+        }
+        try resp.serializeBulkString(w, "server");
+        try resp.serializeBulkString(w, "vex");
+        try resp.serializeBulkString(w, "version");
+        try resp.serializeBulkString(w, "0.6.1");
+        try resp.serializeBulkString(w, "proto");
+        try resp.serializeInteger(w, @intFromEnum(target_proto));
+        try resp.serializeBulkString(w, "id");
+        try resp.serializeInteger(w, 1); // placeholder
+        try resp.serializeBulkString(w, "mode");
+        try resp.serializeBulkString(w, "standalone");
+        try resp.serializeBulkString(w, "role");
+        try resp.serializeBulkString(w, "master");
+        try resp.serializeBulkString(w, "modules");
+        if (target_proto == .resp3) {
+            try resp.serializeSetHeader(w, 0);
+        } else {
+            try resp.serializeArrayHeader(w, 0);
+        }
     }
 
     fn cmdInfo(self: *CommandHandler, out: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -1809,7 +1859,7 @@ pub const CommandHandler = struct {
         };
         defer self.allocator.free(nk);
         const node = self.graph.getNode(nk) orelse {
-            try resp.serializeBulkString(w, null);
+            try resp.serializeNullValue(w, self.protocol_version);
             return;
         };
 
@@ -1943,7 +1993,7 @@ pub const CommandHandler = struct {
                 const user_key = stripGraphDbPrefix(self, n.key) orelse n.key;
                 try resp.serializeBulkString(w, user_key);
             } else {
-                try resp.serializeBulkString(w, null);
+                try resp.serializeNullValue(w, self.protocol_version);
             }
         }
     }
@@ -2011,7 +2061,7 @@ pub const CommandHandler = struct {
                 if (nid < keys.len) {
                     try resp.serializeBulkString(w, stripGraphDbPrefix(self, keys[nid]) orelse keys[nid]);
                 } else {
-                    try resp.serializeBulkString(w, null);
+                    try resp.serializeNullValue(w, self.protocol_version);
                 }
             }
             return;
@@ -2089,7 +2139,7 @@ pub const CommandHandler = struct {
                 const user_key = stripGraphDbPrefix(self, n.key) orelse n.key;
                 try resp.serializeBulkString(w, user_key);
             } else {
-                try resp.serializeBulkString(w, null);
+                try resp.serializeNullValue(w, self.protocol_version);
             }
         }
     }
@@ -2130,7 +2180,7 @@ pub const CommandHandler = struct {
                 const user_key = stripGraphDbPrefix(self, n.key) orelse n.key;
                 try resp.serializeBulkString(w, user_key);
             } else {
-                try resp.serializeBulkString(w, null);
+                try resp.serializeNullValue(w, self.protocol_version);
             }
         }
     }
@@ -2186,7 +2236,7 @@ pub const CommandHandler = struct {
         if (args.len < 3) { try resp.serializeError(w, "usage: GRAPH.GETVEC <key> <field>"); return; }
         const nk = graphNamespacedKey(self, args[1]) catch { try resp.serializeError(w, "internal error"); return; };
         defer self.allocator.free(nk);
-        const vec = self.graph.getVector(nk, args[2]) orelse { try resp.serializeBulkString(w, null); return; };
+        const vec = self.graph.getVector(nk, args[2]) orelse { try resp.serializeNullValue(w, self.protocol_version); return; };
         try resp.serializeBulkString(w, std.mem.sliceAsBytes(vec));
     }
 
@@ -2209,7 +2259,7 @@ pub const CommandHandler = struct {
         try resp.serializeArrayHeader(w, results.len * 2);
         for (results) |r| {
             const node = self.graph.getNodeById(r.node_id);
-            if (node) |n| { try resp.serializeBulkString(w, stripGraphDbPrefix(self, n.key) orelse n.key); } else { try resp.serializeBulkString(w, null); }
+            if (node) |n| { try resp.serializeBulkString(w, stripGraphDbPrefix(self, n.key) orelse n.key); } else { try resp.serializeNullValue(w, self.protocol_version); }
             var sb: [32]u8 = undefined;
             try resp.serializeBulkString(w, std.fmt.bufPrint(&sb, "{d:.4}", .{1.0 - r.distance}) catch "0");
         }
@@ -2374,8 +2424,8 @@ pub const CommandHandler = struct {
                 try resp.serializeBulkString(w, stripGraphDbPrefix(self, n.key) orelse n.key);
                 try resp.serializeBulkString(w, n.node_type);
             } else {
-                try resp.serializeBulkString(w, null);
-                try resp.serializeBulkString(w, null);
+                try resp.serializeNullValue(w, self.protocol_version);
+                try resp.serializeNullValue(w, self.protocol_version);
             }
         }
     }
@@ -2484,8 +2534,8 @@ pub const CommandHandler = struct {
                     try resp.serializeBulkString(w, n.node_type);
                 } else {
                     try resp.serializeArrayHeader(w, 2);
-                    try resp.serializeBulkString(w, null);
-                    try resp.serializeBulkString(w, null);
+                    try resp.serializeNullValue(w, self.protocol_version);
+                    try resp.serializeNullValue(w, self.protocol_version);
                 }
             }
         }
