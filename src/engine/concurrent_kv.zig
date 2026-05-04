@@ -65,7 +65,9 @@ pub const ConcurrentKV = struct {
             var iter = s.map.iterator();
             while (iter.next()) |entry| {
                 self.allocator.free(entry.key_ptr.*);
-                self.allocator.free(entry.value_ptr.value);
+                if (!entry.value_ptr.flags.is_inline) {
+                    self.allocator.free(entry.value_ptr.value);
+                }
             }
             s.map.deinit();
         }

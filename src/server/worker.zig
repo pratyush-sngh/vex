@@ -1074,7 +1074,7 @@ pub const Worker = struct {
         if (args[0].len == 4 and equalsAsciiUpper(args[0], "TIME")) {
             var ts: std.c.timespec = undefined;
             _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
-            conn.write_buf.appendSlice("*2\r\n") catch {};
+            conn.write_buf.appendSlice("*2\r\n") catch {}; // TIME always returns array (ordered pair)
             var buf: [32]u8 = undefined;
             const sec_s = std.fmt.bufPrint(&buf, "{d}", .{ts.sec}) catch "0";
             writeBulkTo(&conn.write_buf, sec_s);
@@ -1318,24 +1318,26 @@ pub const Worker = struct {
             conn.write_buf.appendSlice("-ERR wrong number of arguments for 'CONFIG'\r\n") catch {};
             return;
         }
+        const empty_hdr: []const u8 = if (conn.protocol_version == .resp3) "%0\r\n" else "*0\r\n";
         if (equalsAsciiUpper(args[1], "GET")) {
             if (args.len < 3) {
-                conn.write_buf.appendSlice("*0\r\n") catch {};
+                conn.write_buf.appendSlice(empty_hdr) catch {};
                 return;
             }
-            // Return known config keys, empty array for unknown
+            // Return known config keys, empty map/array for unknown
             const key = args[2];
             if (equalsAsciiUpper(key, "SAVE") or equalsAsciiUpper(key, "DATABASES") or
                 equalsAsciiUpper(key, "MAXMEMORY") or equalsAsciiUpper(key, "APPENDONLY"))
             {
-                conn.write_buf.appendSlice("*2\r\n") catch {};
+                const hdr: []const u8 = if (conn.protocol_version == .resp3) "%1\r\n" else "*2\r\n";
+                conn.write_buf.appendSlice(hdr) catch {};
                 writeBulkTo(&conn.write_buf, key);
                 writeBulkTo(&conn.write_buf, "");
             } else if (key.len == 1 and key[0] == '*') {
                 // CONFIG GET * — return empty (some clients do this on connect)
-                conn.write_buf.appendSlice("*0\r\n") catch {};
+                conn.write_buf.appendSlice(empty_hdr) catch {};
             } else {
-                conn.write_buf.appendSlice("*0\r\n") catch {};
+                conn.write_buf.appendSlice(empty_hdr) catch {};
             }
         } else if (equalsAsciiUpper(args[1], "SET")) {
             // Accept but ignore — Vex doesn't support runtime config changes
@@ -2207,7 +2209,8 @@ pub const Worker = struct {
                             const dsl = self.ds_locks orelse return false;
                             dsl.acquire(ns, self.id, &self.last_stripe);
                             const pairs = hs.hgetall(ns, self.allocator) catch {
-                                conn.write_buf.appendSlice("*0\r\n") catch {};
+                                const empty_hdr: []const u8 = if (conn.protocol_version == .resp3) "%0\r\n" else "*0\r\n";
+                                conn.write_buf.appendSlice(empty_hdr) catch {};
                                 return true;
                             };
                             defer if (pairs.len > 0) self.allocator.free(pairs);
@@ -2589,8 +2592,11 @@ pub const Worker = struct {
                         }
                         ckv.readUnlockStripePublic(stripe);
                     }
-                    // Patch pairs array header
-                    const pairs_hdr = std.fmt.bufPrint(stack_buf[pairs_start..], "*{d}\r\n", .{match_count * 2}) catch return false;
+                    // Patch pairs array/map header
+                    const pairs_hdr = if (conn.protocol_version == .resp3)
+                        std.fmt.bufPrint(stack_buf[pairs_start..], "%{d}\r\n", .{match_count}) catch return false
+                    else
+                        std.fmt.bufPrint(stack_buf[pairs_start..], "*{d}\r\n", .{match_count * 2}) catch return false;
                     // If header is shorter than reserved, shift data
                     if (pairs_hdr.len < 16) {
                         const data_start = pairs_start + 16;

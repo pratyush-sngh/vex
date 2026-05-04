@@ -1863,22 +1863,37 @@ pub const CommandHandler = struct {
             return;
         };
 
-        // Return as array: [key, type, prop_count, k1, v1, k2, v2, ...]
+        // RESP3: map {key, type, properties: {k1: v1, ...}}
+        // RESP2: flat array [key, type, prop_count, k1, v1, k2, v2, ...]
         const prop_count = self.graph.node_props.countProps(node.id);
         const pairs = self.graph.node_props.collectAll(node.id, self.allocator) catch {
             try resp.serializeError(w, "internal error");
             return;
         };
         defer self.allocator.free(pairs);
-        const total: usize = 3 + prop_count * 2;
-        try resp.serializeArrayHeader(w, total);
         const user_key = stripGraphDbPrefix(self, node.key) orelse node.key;
-        try resp.serializeBulkString(w, user_key);
-        try resp.serializeBulkString(w, node.node_type);
-        try resp.serializeInteger(w, @intCast(prop_count));
-        for (pairs) |pair| {
-            try resp.serializeBulkString(w, pair.key);
-            try resp.serializeBulkString(w, pair.value);
+        if (self.protocol_version == .resp3) {
+            try resp.serializeMapHeader(w, 3);
+            try resp.serializeBulkString(w, "key");
+            try resp.serializeBulkString(w, user_key);
+            try resp.serializeBulkString(w, "type");
+            try resp.serializeBulkString(w, node.node_type);
+            try resp.serializeBulkString(w, "properties");
+            try resp.serializeMapHeader(w, prop_count);
+            for (pairs) |pair| {
+                try resp.serializeBulkString(w, pair.key);
+                try resp.serializeBulkString(w, pair.value);
+            }
+        } else {
+            const total: usize = 3 + prop_count * 2;
+            try resp.serializeArrayHeader(w, total);
+            try resp.serializeBulkString(w, user_key);
+            try resp.serializeBulkString(w, node.node_type);
+            try resp.serializeInteger(w, @intCast(prop_count));
+            for (pairs) |pair| {
+                try resp.serializeBulkString(w, pair.key);
+                try resp.serializeBulkString(w, pair.value);
+            }
         }
     }
 
@@ -2073,6 +2088,7 @@ pub const CommandHandler = struct {
         const hdr = std.fmt.bufPrint(buf[pos..], "*{d}\r\n", .{ids.len}) catch unreachable;
         pos += hdr.len;
 
+        const null_bytes: []const u8 = if (self.protocol_version == .resp3) "_\r\n" else "$-1\r\n";
         for (ids) |nid| {
             // Grow buffer if needed
             if (pos + 64 > buf.len) {
@@ -2088,8 +2104,8 @@ pub const CommandHandler = struct {
                 @memcpy(buf[pos .. pos + user_key.len], user_key);
                 pos += user_key.len;
             } else {
-                @memcpy(buf[pos .. pos + 5], "$-1\r\n");
-                pos += 5;
+                @memcpy(buf[pos .. pos + null_bytes.len], null_bytes);
+                pos += null_bytes.len;
             }
             buf[pos] = '\r';
             buf[pos + 1] = '\n';
@@ -2208,7 +2224,7 @@ pub const CommandHandler = struct {
             const from_node = self.graph.getNodeById(from_id) orelse continue;
             if (stripGraphDbPrefix(self, from_node.key) != null) edges += 1;
         }
-        try resp.serializeArrayHeader(w, 4);
+        try resp.serializeMapOrArrayHeader(w, 2, self.protocol_version);
         try resp.serializeBulkString(w, "nodes");
         try resp.serializeInteger(w, @intCast(nodes));
         try resp.serializeBulkString(w, "edges");
@@ -2256,7 +2272,7 @@ pub const CommandHandler = struct {
         @import("../engine/vector_store.zig").VectorStore.normalize(qa);
         const results = idx.search(qa, k, &self.graph.node_alive) catch { try resp.serializeError(w, "search failed"); return; };
         defer self.allocator.free(results);
-        try resp.serializeArrayHeader(w, results.len * 2);
+        try resp.serializeMapOrArrayHeader(w, results.len, self.protocol_version);
         for (results) |r| {
             const node = self.graph.getNodeById(r.node_id);
             if (node) |n| { try resp.serializeBulkString(w, stripGraphDbPrefix(self, n.key) orelse n.key); } else { try resp.serializeNullValue(w, self.protocol_version); }
@@ -2292,7 +2308,7 @@ pub const CommandHandler = struct {
             try resp.serializeBulkString(w, stripGraphDbPrefix(self, r.key) orelse r.key);
             var sb: [32]u8 = undefined;
             try resp.serializeBulkString(w, std.fmt.bufPrint(&sb, "{d:.4}", .{r.score}) catch "0");
-            try resp.serializeArrayHeader(w, r.props.len * 2);
+            try resp.serializeMapOrArrayHeader(w, r.props.len, self.protocol_version);
             for (r.props) |p| { try resp.serializeBulkString(w, p.key); try resp.serializeBulkString(w, p.value); }
             try resp.serializeArrayHeader(w, r.neighbor_keys.len);
             for (r.neighbor_keys) |nk| { try resp.serializeBulkString(w, stripGraphDbPrefix(self, nk) orelse nk); }
@@ -2362,7 +2378,7 @@ pub const CommandHandler = struct {
                     defer self.allocator.free(nk);
                     _ = self.graph.upsertNode(nk, type_str.?) catch continue;
                     if (obj.get("metadata")) |meta_val| {
-                        if (meta_val == .object) self.applyNodeMetadataFromObject(nk, meta_val.object);
+                        if (meta_val == .object) self.applyNodeMetadataFromObject(nk, meta_val.object) catch {};
                     }
                 }
             }
@@ -2388,7 +2404,7 @@ pub const CommandHandler = struct {
                     // Upsert edge
                     const eid = self.graph.findEdge(from, to, etype_str.?) orelse (self.graph.addEdge(from, to, etype_str.?, 1.0) catch continue);
                     if (obj.get("metadata")) |meta_val| {
-                        if (meta_val == .object) self.applyEdgeMetadataFromObject(eid, meta_val.object);
+                        if (meta_val == .object) self.applyEdgeMetadataFromObject(eid, meta_val.object) catch {};
                     }
                 }
             }
@@ -2475,8 +2491,8 @@ pub const CommandHandler = struct {
         const results = query.impact(self.graph, self.allocator, nk, opts) catch |err| { try resp.serializeError(w, @errorName(err)); return; };
         defer self.allocator.free(results);
 
-        // Serialize as flat array: [type_name, count, type_name, count, ...]
-        try resp.serializeArrayHeader(w, results.len * 2);
+        // Serialize as map (RESP3) or flat array (RESP2): [type_name, count, ...]
+        try resp.serializeMapOrArrayHeader(w, results.len, self.protocol_version);
         for (results) |r| {
             try resp.serializeBulkString(w, r.type_name);
             try resp.serializeInteger(w, @intCast(r.count));
@@ -2547,29 +2563,29 @@ pub const CommandHandler = struct {
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, json_str, .{}) catch return error.InvalidJSON;
         defer parsed.deinit();
         if (parsed.value != .object) return error.InvalidJSON;
-        self.applyNodeMetadataFromObject(key, parsed.value.object);
+        try self.applyNodeMetadataFromObject(key, parsed.value.object);
     }
 
     fn applyJsonMetadataToEdge(self: *CommandHandler, eid: graph_mod.EdgeId, json_str: []const u8) !void {
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, json_str, .{}) catch return error.InvalidJSON;
         defer parsed.deinit();
         if (parsed.value != .object) return error.InvalidJSON;
-        self.applyEdgeMetadataFromObject(eid, parsed.value.object);
+        try self.applyEdgeMetadataFromObject(eid, parsed.value.object);
     }
 
-    fn applyNodeMetadataFromObject(self: *CommandHandler, key: []const u8, obj: std.json.ObjectMap) void {
+    fn applyNodeMetadataFromObject(self: *CommandHandler, key: []const u8, obj: std.json.ObjectMap) !void {
         var iter = obj.iterator();
         while (iter.next()) |entry| {
             const val_str = if (entry.value_ptr.* == .string) entry.value_ptr.*.string else continue;
-            self.graph.setNodeProperty(key, entry.key_ptr.*, val_str) catch continue;
+            try self.graph.setNodeProperty(key, entry.key_ptr.*, val_str);
         }
     }
 
-    fn applyEdgeMetadataFromObject(self: *CommandHandler, eid: graph_mod.EdgeId, obj: std.json.ObjectMap) void {
+    fn applyEdgeMetadataFromObject(self: *CommandHandler, eid: graph_mod.EdgeId, obj: std.json.ObjectMap) !void {
         var iter = obj.iterator();
         while (iter.next()) |entry| {
             const val_str = if (entry.value_ptr.* == .string) entry.value_ptr.*.string else continue;
-            self.graph.setEdgeProperty(eid, entry.key_ptr.*, val_str) catch continue;
+            try self.graph.setEdgeProperty(eid, entry.key_ptr.*, val_str);
         }
     }
 

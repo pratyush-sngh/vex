@@ -88,52 +88,52 @@ Pure engine speed, measured in Zig with `clock_gettime(MONOTONIC)`. 100K operati
 
 | Operation | Latency |
 |---|---|
-| GET (hit) | **22 ns** |
-| EXISTS | 19 ns |
-| SET (insert) | 71 ns |
-| SET (update) | 66 ns |
-| DEL (tombstone) | 32 ns |
-| SET (reuse tombstone) | 42 ns |
+| GET (hit) | **30 ns** |
+| EXISTS | 30 ns |
+| SET (insert) | 93 ns |
+| SET (update) | 93 ns |
+| DEL (tombstone) | 67 ns |
+| SET (reuse tombstone) | 52 ns |
 
 ### Lists — Quicklist (`zig build bench-ds -Doptimize=ReleaseFast`)
 
 | Operation | Latency | Notes |
 |---|---|---|
-| RPUSH | **34 ns** | O(1) append to tail block |
-| LPUSH | **26 ns** | O(1) prepend to head block |
-| LPOP | **19 ns** | O(1) pop from head block |
-| RPOP | **14 ns** | O(1) trailer-based reverse pop |
-| LLEN | 4 ns | |
-| LINDEX | varies | O(blocks) — scan through block chain |
+| RPUSH | **44 ns** | O(1) append to tail block |
+| LPUSH | **24 ns** | O(1) prepend to head block |
+| LPOP | **4 ns** | O(1) pop from head block |
+| RPOP | **5 ns** | O(1) trailer-based reverse pop |
+| LLEN | 6 ns | |
+| LINDEX | 601 ns | O(blocks) — scan through block chain |
 
 ### Hashes
 
 | Operation | Latency |
 |---|---|
-| HGET | **28 ns** |
-| HSET | 87 ns |
-| HDEL | 51 ns |
+| HGET | **31 ns** |
+| HSET | 80 ns |
+| HDEL | 55 ns |
 | HLEN | 3 ns |
 
 ### Sets
 
 | Operation | Latency |
 |---|---|
-| SISMEMBER | **24 ns** |
-| SADD | 52 ns |
-| SREM | 32 ns |
+| SISMEMBER | **29 ns** |
+| SADD | 53 ns |
+| SREM | 39 ns |
 | SCARD | 3 ns |
 
 ### Sorted Sets
 
 | Operation | Latency | Notes |
 |---|---|---|
-| ZSCORE | **68 ns** | O(1) HashMap lookup |
-| ZADD | 143 ns | |
-| ZREM | 37 ns | |
+| ZSCORE | **28 ns** | O(1) HashMap lookup |
+| ZADD | 71 ns | |
+| ZREM | 39 ns | |
 | ZCARD | 3 ns | |
-| ZRANGE(top 10) | **8.8 us** | Lazy sorted cache (was 8,472 us — 963x faster) |
-| ZRANK | **0.5 us** | Lazy sorted cache (was 8,456 us — 16,912x faster) |
+| ZRANGE(top 10) | **8.7 us** | Lazy sorted cache |
+| ZRANK | **0.6 us** | Lazy sorted cache |
 
 ### Graph Engine (50K nodes / 500K edges)
 

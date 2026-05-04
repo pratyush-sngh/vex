@@ -89,8 +89,7 @@ pub fn main(_: std.process.Init) !void {
         {
             const t0 = nowNs();
             var popped: usize = 0;
-            while (ls.lpop("bench:list")) |v| {
-                allocator.free(v);
+            while (ls.lpop("bench:list")) |_| {
                 popped += 1;
             }
             const ns = nowNs() - t0;
@@ -111,8 +110,7 @@ pub fn main(_: std.process.Init) !void {
         {
             const t0 = nowNs();
             var popped: usize = 0;
-            while (ls.rpop("bench:list2")) |v| {
-                allocator.free(v);
+            while (ls.rpop("bench:list2")) |_| {
                 popped += 1;
             }
             const ns = nowNs() - t0;

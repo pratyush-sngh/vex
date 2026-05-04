@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const StringIntern = @import("string_intern.zig").StringIntern;
+const string_intern = @import("string_intern.zig");
+const StringIntern = string_intern.StringIntern;
 
 /// Shared sparse property storage for graph entities (nodes and edges).
 ///
@@ -16,7 +17,7 @@ pub const PropertyStore = struct {
     pub fn init(allocator: Allocator) PropertyStore {
         return .{
             .map = std.AutoHashMap(u64, []const u8).init(allocator),
-            .key_intern = StringIntern.init(allocator),
+            .key_intern = StringIntern.initWithCapacity(allocator, string_intern.MAX_PROPERTY_KEYS),
             .allocator = allocator,
         };
     }
