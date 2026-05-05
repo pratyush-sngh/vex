@@ -1,7 +1,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const StringIntern = @import("string_intern.zig").StringIntern;
-const TypeMask = @import("string_intern.zig").TypeMask;
+const string_intern = @import("string_intern.zig");
+const StringIntern = string_intern.StringIntern;
+const TypeMask = string_intern.TypeMask;
 const PropertyStore = @import("property_store.zig").PropertyStore;
 pub const VectorStore = @import("vector_store.zig").VectorStore;
 pub const HnswIndex = @import("hnsw.zig").HnswIndex;
@@ -134,7 +135,7 @@ pub const GraphEngine = struct {
             .base_out = CSR.empty(),
             .base_in = CSR.empty(),
             .delta_edges = std.array_list.Managed(DeltaEdge).init(allocator),
-            .type_intern = StringIntern.init(allocator),
+            .type_intern = StringIntern.initWithCapacity(allocator, string_intern.MAX_PROPERTY_KEYS),
             .node_props = PropertyStore.init(allocator),
             .edge_props = PropertyStore.init(allocator),
             .vec_store = null,
@@ -418,8 +419,11 @@ pub const GraphEngine = struct {
         const type_id = self.type_intern.find(edge_type) orelse return null;
 
         // Early exit: check if from_node has any outgoing edges of this type
-        const type_bit = StringIntern.mask(type_id);
-        if (self.node_out_type_mask.items[from_id] & type_bit == 0) return null;
+        // Bitmask optimization only covers first 64 types
+        if (type_id < 64) {
+            const type_bit = StringIntern.mask(type_id);
+            if (self.node_out_type_mask.items[from_id] & type_bit == 0) return null;
+        }
 
         // Check base CSR outgoing edges
         const targets = self.base_out.neighbors(from_id);
@@ -474,10 +478,12 @@ pub const GraphEngine = struct {
         try self.edge_alive.resize(eid + 1, true);
         self.edge_alive.set(eid);
 
-        // Update node type masks
-        const type_bit = StringIntern.mask(type_id);
-        self.node_out_type_mask.items[from_id] |= type_bit;
-        self.node_in_type_mask.items[to_id] |= type_bit;
+        // Update node type masks (bitmask only covers first 64 types)
+        if (type_id < 64) {
+            const type_bit = StringIntern.mask(type_id);
+            self.node_out_type_mask.items[from_id] |= type_bit;
+            self.node_in_type_mask.items[to_id] |= type_bit;
+        }
 
         if (weight != 1.0) self.flags.uniform_weights = false;
         if (self.type_intern.count() > 1) self.flags.is_untyped = false;

@@ -326,7 +326,7 @@ pub fn load(
         if (alive) {
             graph.edge_alive.set(eid);
             // Update type masks
-            if (from < graph.node_out_type_mask.items.len) {
+            if (type_id < 64 and from < graph.node_out_type_mask.items.len) {
                 const bit = @import("../engine/string_intern.zig").StringIntern.mask(type_id);
                 graph.node_out_type_mask.items[from] |= bit;
                 if (to < graph.node_in_type_mask.items.len) {

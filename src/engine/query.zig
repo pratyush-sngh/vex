@@ -58,9 +58,9 @@ pub fn traverse(
     var result = std.array_list.Managed(NodeId).init(allocator);
     errdefer result.deinit();
 
-    // Resolve type filter to bitmask once
+    // Resolve type filter to bitmask once (bitmask only covers first 64 types)
     const edge_type_mask: TypeMask = if (opts.edge_type_filter) |filter|
-        if (g.type_intern.find(filter)) |id| StringIntern.mask(id) else 0
+        if (g.type_intern.find(filter)) |id| (if (id < 64) StringIntern.mask(id) else 0) else 0
     else
         0;
     const node_type_id: ?u16 = if (opts.node_type_filter) |filter|
@@ -768,8 +768,8 @@ fn expandFrontierSeq(
                     if (visited.isSet(nid)) continue;
 
                     if (edge_type_mask != 0) {
-                        const emask = StringIntern.mask(g.edge_type_id.items[eidx]);
-                        if (edge_type_mask & emask == 0) continue;
+                        const etid = g.edge_type_id.items[eidx];
+                        if (etid >= 64 or edge_type_mask & StringIntern.mask(etid) == 0) continue;
                     }
                     if (node_type_id) |ntid| {
                         if (g.node_type_id.items[nid] != ntid) continue;
@@ -795,8 +795,8 @@ fn expandFrontierSeq(
                 if (visited.isSet(nid)) continue;
 
                 if (edge_type_mask != 0) {
-                    const emask = StringIntern.mask(g.edge_type_id.items[de.eidx]);
-                    if (edge_type_mask & emask == 0) continue;
+                    const etid = g.edge_type_id.items[de.eidx];
+                    if (etid >= 64 or edge_type_mask & StringIntern.mask(etid) == 0) continue;
                 }
                 if (node_type_id) |ntid| {
                     if (g.node_type_id.items[nid] != ntid) continue;
@@ -937,7 +937,7 @@ pub fn impact(
     var edge_type_mask: TypeMask = 0;
     if (opts.edge_type_filters) |filters| {
         for (filters) |f| {
-            if (g.type_intern.find(f)) |id| edge_type_mask |= StringIntern.mask(id);
+            if (g.type_intern.find(f)) |id| { if (id < 64) edge_type_mask |= StringIntern.mask(id); }
         }
         if (edge_type_mask == 0) {
             const empty = try allocator.alloc(ImpactResult, 0);
@@ -1009,8 +1009,8 @@ pub fn impact(
                         if (!g.node_alive.isSet(nid)) continue;
                         if (visited.isSet(nid)) continue;
                         if (edge_type_mask != 0) {
-                            const emask = StringIntern.mask(g.edge_type_id.items[eidx]);
-                            if (edge_type_mask & emask == 0) continue;
+                            const etid = g.edge_type_id.items[eidx];
+                            if (etid >= 64 or edge_type_mask & StringIntern.mask(etid) == 0) continue;
                         }
                         visited.set(nid);
                         next.set(nid);
@@ -1032,8 +1032,8 @@ pub fn impact(
                     if (!g.node_alive.isSet(nid)) continue;
                     if (visited.isSet(nid)) continue;
                     if (edge_type_mask != 0) {
-                        const emask = StringIntern.mask(g.edge_type_id.items[de.eidx]);
-                        if (edge_type_mask & emask == 0) continue;
+                        const etid = g.edge_type_id.items[de.eidx];
+                        if (etid >= 64 or edge_type_mask & StringIntern.mask(etid) == 0) continue;
                     }
                     visited.set(nid);
                     next.set(nid);
@@ -1097,7 +1097,7 @@ pub fn findPaths(
     var edge_type_mask: TypeMask = 0;
     if (opts.edge_type_filters) |filters| {
         for (filters) |f| {
-            if (g.type_intern.find(f)) |id| edge_type_mask |= StringIntern.mask(id);
+            if (g.type_intern.find(f)) |id| { if (id < 64) edge_type_mask |= StringIntern.mask(id); }
         }
         if (edge_type_mask == 0) {
             const empty = try allocator.alloc([]NodeId, 0);
@@ -1179,8 +1179,8 @@ pub fn findPaths(
                     if (!g.node_alive.isSet(nid)) continue;
                     if (on_path.isSet(nid)) continue;
                     if (edge_type_mask != 0) {
-                        const emask = StringIntern.mask(g.edge_type_id.items[eidx]);
-                        if (edge_type_mask & emask == 0) continue;
+                        const etid = g.edge_type_id.items[eidx];
+                        if (etid >= 64 or edge_type_mask & StringIntern.mask(etid) == 0) continue;
                     }
                     try child_buf.append(nid);
                 }
@@ -1194,8 +1194,8 @@ pub fn findPaths(
                 if (!g.node_alive.isSet(de.to)) continue;
                 if (on_path.isSet(de.to)) continue;
                 if (edge_type_mask != 0) {
-                    const emask = StringIntern.mask(g.edge_type_id.items[de.eidx]);
-                    if (edge_type_mask & emask == 0) continue;
+                    const etid = g.edge_type_id.items[de.eidx];
+                    if (etid >= 64 or edge_type_mask & StringIntern.mask(etid) == 0) continue;
                 }
                 try child_buf.append(de.to);
             }
