@@ -4,8 +4,9 @@ const Allocator = std.mem.Allocator;
 /// Bitmask type for up to 64 interned types.
 pub const TypeMask = u64;
 pub const MAX_INTERNED: u16 = 64;
-/// Property keys can have many more unique names than node/edge types.
-pub const MAX_PROPERTY_KEYS: u16 = 4096;
+/// Property keys and type names can have many unique names.
+/// u16 max (65535) effectively uncapped for practical use.
+pub const MAX_PROPERTY_KEYS: u16 = std.math.maxInt(u16);
 
 /// Deduplicating string interner. Assigns each unique string a dense u16 ID
 /// (0..N-1). IDs double as bit positions in a TypeMask for fast bitmask
