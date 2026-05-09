@@ -102,9 +102,6 @@ pub const GraphEngine = struct {
     vec_store: ?VectorStore,
     vec_indices: ?std.StringHashMap(*HnswIndex),
 
-    // ─── Contraction Hierarchies (built during compact for weighted graphs) ──
-    ch_index: ?*@import("contraction.zig").CHIndex,
-
     // ─── Compaction state ───────────────────
     needs_compact: bool,
     /// Monotonically increasing mutation counter. Incremented on every
@@ -143,7 +140,6 @@ pub const GraphEngine = struct {
             .edge_props = PropertyStore.init(allocator),
             .vec_store = null,
             .vec_indices = null,
-            .ch_index = null,
             .needs_compact = false,
             .mutation_seq = 0,
             .all_base_edges_alive = true,
@@ -182,10 +178,6 @@ pub const GraphEngine = struct {
             vi.deinit();
         }
         if (self.vec_store) |*vs| vs.deinit();
-        if (self.ch_index) |ch| {
-            ch.deinit();
-            self.allocator.destroy(ch);
-        }
     }
 
     // ─── Node Operations ──────────────────────────────────────────────
@@ -656,29 +648,6 @@ pub const GraphEngine = struct {
         self.delta_edges.clearRetainingCapacity();
         self.all_base_edges_alive = true;
         self.needs_compact = false;
-
-        // Build Contraction Hierarchies for weighted graphs (>1000 nodes)
-        const contraction = @import("contraction.zig");
-        if (self.ch_index) |old| {
-            old.deinit();
-            self.allocator.destroy(old);
-            self.ch_index = null;
-        }
-        const node_count = self.node_keys.items.len;
-        if (!self.flags.uniform_weights and node_count >= 1000) {
-            const ch = try self.allocator.create(contraction.CHIndex);
-            ch.* = try contraction.build(
-                self.allocator,
-                &self.base_out,
-                &self.base_in,
-                self.edge_weight.items,
-                self.node_alive,
-                self.edge_alive,
-                @intCast(self.node_keys.items.len),
-                self.mutation_seq,
-            );
-            self.ch_index = ch;
-        }
     }
 
     // ─── View Types ───────────────────────────────────────────────────

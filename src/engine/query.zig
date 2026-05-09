@@ -476,19 +476,7 @@ pub fn weightedShortestPath(
         return PathResult{ .nodes = path, .total_weight = 0 };
     }
 
-    // Fast path: use Contraction Hierarchies if available and fresh
-    if (g.ch_index) |ch| {
-        if (ch.mutation_seq == g.mutation_seq and g.delta_edges.items.len == 0) {
-            const contraction = @import("contraction.zig");
-            const result = contraction.query(ch, allocator, from_id, to_id) catch |err| switch (err) {
-                error.PathNotFound => return error.PathNotFound,
-                else => return err, // fall through to Dijkstra on alloc failures
-            };
-            return PathResult{ .nodes = result.path, .total_weight = result.weight };
-        }
-    }
-
-    // Fallback: Bidirectional Dijkstra
+    // Bidirectional Dijkstra: expand from both ends, meet in the middle.
     // Explores ~2 * sqrt(N) nodes instead of N.
 
     // Forward search state (from source, outgoing edges)
