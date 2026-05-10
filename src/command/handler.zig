@@ -2160,7 +2160,7 @@ pub const CommandHandler = struct {
         }
     }
 
-    /// GRAPH.WPATH <from_key> <to_key>  (weighted shortest path via Dijkstra)
+    /// GRAPH.WPATH <from_key> <to_key>  (weighted shortest path — CH-accelerated when available)
     fn cmdGraphWPath(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
         if (args.len < 3) {
             try resp.serializeError(w, "usage: GRAPH.WPATH <from> <to>");
@@ -2177,6 +2177,29 @@ pub const CommandHandler = struct {
             return;
         };
         defer self.allocator.free(to);
+
+        // Try CH-accelerated path if available and fresh
+        const ch_result = self.tryCHQuery(from, to);
+        if (ch_result) |r| {
+            const result = r;
+            defer self.allocator.free(result.nodes);
+            try resp.serializeArrayHeader(w, result.nodes.len + 1);
+            var weight_buf: [32]u8 = undefined;
+            const weight_str = std.fmt.bufPrint(&weight_buf, "{d:.2}", .{result.weight}) catch "0";
+            try resp.serializeBulkString(w, weight_str);
+            for (result.nodes) |nid| {
+                const node = self.graph.getNodeById(nid);
+                if (node) |n| {
+                    const user_key = stripGraphDbPrefix(self, n.key) orelse n.key;
+                    try resp.serializeBulkString(w, user_key);
+                } else {
+                    try resp.serializeNullValue(w, self.protocol_version);
+                }
+            }
+            return;
+        }
+
+        // Fall back to Dijkstra
         var result = query.weightedShortestPath(self.graph, self.allocator, from, to) catch |err| {
             try resp.serializeError(w, @errorName(err));
             return;
@@ -2201,7 +2224,22 @@ pub const CommandHandler = struct {
         }
     }
 
-    /// GRAPH.STATS
+    const CHResult = struct { weight: f64, nodes: []graph_mod.NodeId };
+
+    /// Try CH-accelerated query. Returns null if CH is unavailable or stale.
+    fn tryCHQuery(self: *CommandHandler, from_key: []const u8, to_key: []const u8) ?CHResult {
+        const ch_data = &(self.graph.ch orelse return null);
+        // Stale check: CH was built at a different mutation_seq
+        if (ch_data.mutation_seq != self.graph.mutation_seq) return null;
+        var qe = &(self.graph.ch_query_engine orelse return null);
+
+        const from_id = self.graph.resolveKey(from_key) orelse return null;
+        const to_id = self.graph.resolveKey(to_key) orelse return null;
+
+        const r = qe.query(ch_data, from_id, to_id) catch return null;
+        return CHResult{ .weight = r.weight, .nodes = r.nodes };
+    }
+
     /// GRAPH.COMPACT -- rebuild CSR from delta edges for fast traversals
     fn cmdGraphCompact(self: *CommandHandler, w: *std.Io.Writer) !void {
         self.graph.compact() catch |err| {

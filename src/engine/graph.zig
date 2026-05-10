@@ -6,6 +6,7 @@ const TypeMask = string_intern.TypeMask;
 const PropertyStore = @import("property_store.zig").PropertyStore;
 pub const VectorStore = @import("vector_store.zig").VectorStore;
 pub const HnswIndex = @import("hnsw.zig").HnswIndex;
+pub const ch_mod = @import("ch.zig");
 
 pub const NodeId = u32;
 pub const EdgeId = u32;
@@ -115,6 +116,10 @@ pub const GraphEngine = struct {
     /// Call compact() after bulk loading completes.
     bulk_loading: bool,
 
+    // ─── Contraction Hierarchies (built on compact) ──
+    ch: ?ch_mod.CHData,
+    ch_query_engine: ?ch_mod.CHQueryEngine,
+
     pub fn init(allocator: Allocator) GraphEngine {
         return .{
             .allocator = allocator,
@@ -144,6 +149,8 @@ pub const GraphEngine = struct {
             .mutation_seq = 0,
             .all_base_edges_alive = true,
             .bulk_loading = false,
+            .ch = null,
+            .ch_query_engine = null,
         };
     }
 
@@ -178,6 +185,8 @@ pub const GraphEngine = struct {
             vi.deinit();
         }
         if (self.vec_store) |*vs| vs.deinit();
+        if (self.ch_query_engine) |*qe| qe.deinit();
+        if (self.ch) |*c| c.deinit();
     }
 
     // ─── Node Operations ──────────────────────────────────────────────
@@ -648,6 +657,45 @@ pub const GraphEngine = struct {
         self.delta_edges.clearRetainingCapacity();
         self.all_base_edges_alive = true;
         self.needs_compact = false;
+
+        // Rebuild CH if graph is small enough for practical build time
+        self.rebuildCH();
+    }
+
+    /// Build (or rebuild) Contraction Hierarchies for accelerated WPATH queries.
+    /// Only builds for graphs <= 5000 nodes (larger graphs fall back to Dijkstra).
+    pub fn rebuildCH(self: *GraphEngine) void {
+        const max_ch_nodes: usize = 5000;
+        if (self.node_keys.items.len > max_ch_nodes) {
+            // Too large — free existing CH and skip
+            if (self.ch_query_engine) |*qe| {
+                qe.deinit();
+                self.ch_query_engine = null;
+            }
+            if (self.ch) |*c| {
+                c.deinit();
+                self.ch = null;
+            }
+            return;
+        }
+
+        // Free old CH
+        if (self.ch_query_engine) |*qe| {
+            qe.deinit();
+            self.ch_query_engine = null;
+        }
+        if (self.ch) |*c| {
+            c.deinit();
+            self.ch = null;
+        }
+
+        // Build new CH
+        self.ch = ch_mod.build(self, self.allocator) catch return;
+        self.ch_query_engine = ch_mod.CHQueryEngine.init(self.allocator, &self.ch.?) catch {
+            self.ch.?.deinit();
+            self.ch = null;
+            return;
+        };
     }
 
     // ─── View Types ───────────────────────────────────────────────────
@@ -758,6 +806,9 @@ test "graph_v2 compact moves delta to base" {
     try std.testing.expectEqual(@as(usize, 1), g.base_out.neighbors(0).len);
     try std.testing.expectEqual(@as(NodeId, 1), g.base_out.neighbors(0)[0]);
     try std.testing.expect(g.all_base_edges_alive);
+    // CH should be built after compact (small graph)
+    try std.testing.expect(g.ch != null);
+    try std.testing.expect(g.ch_query_engine != null);
 }
 
 test "graph_v2 type interning" {
