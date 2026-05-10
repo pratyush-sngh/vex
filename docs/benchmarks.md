@@ -139,15 +139,26 @@ Pure engine speed, measured in Zig with `clock_gettime(MONOTONIC)`. 100K operati
 
 | Operation | Latency | Notes |
 |---|---|---|
-| ADDNODE | 56 ns | |
-| SETPROP | **78 ns** | O(1) HashMap + per-entity index |
-| GETNODE | **198 ns** | O(1) countProps + O(k) collectAll |
-| ADDEDGE | 53 ns | |
-| COMPACT | 2.2 ms | CSR rebuild |
-| Neighbors | **35 ns** | CSR O(1) lookup |
-| BFS Traverse (depth 4) | **4.5 us** | avg 95 nodes visited |
-| Shortest Path | **30 us** | Bidirectional BFS |
-| Weighted Path | **149 us** | Bidirectional Dijkstra |
+| ADDNODE | 165 ns | |
+| SETPROP | **140 ns** | O(1) HashMap + per-entity index |
+| GETNODE | **173 ns** | O(1) countProps + O(k) collectAll |
+| ADDEDGE | 64 ns | |
+| COMPACT | 1.9 ms | CSR rebuild |
+| Neighbors | **32 ns** | CSR O(1) lookup |
+| BFS Traverse (depth 4) | **4.4 us** | avg 95 nodes visited |
+| Shortest Path | **31 us** | Bidirectional BFS |
+| Weighted Path | **46 us** | Bidirectional Dijkstra (flat arrays) |
+
+### Contraction Hierarchies (2500-node 50×50 grid, `bench-graph`)
+
+| Metric | Value | Notes |
+|---|---|---|
+| CH Build | 324 ms | One-time preprocessing |
+| Dijkstra (bidir) | 46.0 us/op | Flat-array bidirectional Dijkstra |
+| **CH Query** | **14.9 us/op** | Reusable query engine, touched-list reset |
+| **Speedup** | **3.1x** | CH vs bidirectional Dijkstra |
+
+CH preprocesses the graph into a hierarchy of shortcuts. Queries search only upward in rank from both endpoints. Speedup grows with graph size and path length — road networks with millions of nodes see 100-1000x.
 
 ---
 
@@ -279,6 +290,8 @@ See [Architecture](architecture.md) for detailed explanation. Summary:
 | Pre-alloc outside lock | HSET/SADD: heap alloc before lock acquire, pointer swap under lock |
 | Unix Domain Sockets | 3-4x faster than TCP for local connections |
 | Bidirectional BFS | sqrt(N) explored vs N for shortest path |
+| Flat-array Dijkstra | O(1) indexed dist/parent vs HashMap overhead |
+| Contraction Hierarchies | Preprocessed shortcut overlay, 3x faster weighted path queries |
 | CSR adjacency | Cache-friendly graph traversal |
 | Zero-copy RESP parse | No memcpy for complete commands |
 | Comptime dispatch | O(1) command routing |
