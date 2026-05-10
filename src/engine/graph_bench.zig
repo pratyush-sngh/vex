@@ -169,5 +169,101 @@ pub fn main(_: std.process.Init) !void {
         std.debug.print("  WPATH:        {d:.1} us/op  ({d} ops, found={d})\n", .{ usPerOp(ns, OPS), OPS, found });
     }
 
+    // ─── CH Test: 50x50 grid graph (road-network-like structure) ───
+    std.debug.print("\n--- CH Test (2500 nodes, 50x50 grid, 4 edges/node) ---\n", .{});
+    {
+        const ch_mod = @import("ch.zig");
+        const GRID = 50; // 50x50 = 2500 nodes
+        const CH_N = GRID * GRID;
+        var g2 = GraphEngine.init(allocator);
+        defer g2.deinit();
+        const ch_keys = try allocator.alloc([]const u8, CH_N);
+        defer {
+            for (ch_keys) |k| allocator.free(k);
+            allocator.free(ch_keys);
+        }
+        for (0..CH_N) |i| {
+            ch_keys[i] = std.fmt.allocPrint(allocator, "g:{d:0>5}", .{i}) catch continue;
+            _ = g2.addNode(ch_keys[i], "t") catch continue;
+        }
+        // Grid edges: connect (r,c) to (r+1,c) and (r,c+1) with varied weights
+        for (0..GRID) |r| {
+            for (0..GRID) |c_idx| {
+                const id = r * GRID + c_idx;
+                if (r + 1 < GRID) {
+                    const down = (r + 1) * GRID + c_idx;
+                    const w: f64 = @as(f64, @floatFromInt((id * 3 + 1) % 5 + 1));
+                    _ = g2.addEdge(ch_keys[id], ch_keys[down], "e", w) catch continue;
+                    _ = g2.addEdge(ch_keys[down], ch_keys[id], "e", w) catch continue;
+                }
+                if (c_idx + 1 < GRID) {
+                    const right = r * GRID + c_idx + 1;
+                    const w: f64 = @as(f64, @floatFromInt((id * 7 + 3) % 5 + 1));
+                    _ = g2.addEdge(ch_keys[id], ch_keys[right], "e", w) catch continue;
+                    _ = g2.addEdge(ch_keys[right], ch_keys[id], "e", w) catch continue;
+                }
+            }
+        }
+        try g2.compact();
+
+        // Build CH
+        const t_build = nowNs();
+        var ch = ch_mod.build(&g2, allocator) catch {
+            std.debug.print("  CH build failed\n", .{});
+            std.debug.print("\n=== Done ===\n\n", .{});
+            return;
+        };
+        defer ch.deinit();
+        const build_ms = @as(f64, @floatFromInt(nowNs() - t_build)) / 1_000_000.0;
+        std.debug.print("  CH build:     {d:.1} ms\n", .{build_ms});
+
+        // Dijkstra baseline — query distant node pairs (corners, etc.)
+        const Q = 200;
+        {
+            const t0 = nowNs();
+            var found: usize = 0;
+            for (0..Q) |i| {
+                // Pick pairs that are far apart on the grid
+                const sr: usize = (i * 3) % GRID;
+                const sc: usize = (i * 7) % GRID;
+                const tr: usize = (GRID - 1) - (i * 5) % GRID;
+                const tc: usize = (GRID - 1) - (i * 11) % GRID;
+                const s = ch_keys[sr * GRID + sc];
+                const t = ch_keys[tr * GRID + tc];
+                var r = query.weightedShortestPath(&g2, allocator, s, t) catch continue;
+                found += 1;
+                r.deinit(allocator);
+            }
+            const ns = nowNs() - t0;
+            std.debug.print("  Dijkstra:     {d:.1} us/op  ({d} queries, found={d})\n", .{ usPerOp(ns, Q), Q, found });
+        }
+
+        // CH queries (reusable engine — amortized alloc, touched-list reset)
+        {
+            var qe = ch_mod.CHQueryEngine.init(allocator, &ch) catch {
+                std.debug.print("  CH query engine init failed\n", .{});
+                std.debug.print("\n=== Done ===\n\n", .{});
+                return;
+            };
+            defer qe.deinit();
+
+            const t0 = nowNs();
+            var found: usize = 0;
+            for (0..Q) |i| {
+                const sr: usize = (i * 3) % GRID;
+                const sc: usize = (i * 7) % GRID;
+                const tr: usize = (GRID - 1) - (i * 5) % GRID;
+                const tc: usize = (GRID - 1) - (i * 11) % GRID;
+                const s: u32 = @intCast(sr * GRID + sc);
+                const t: u32 = @intCast(tr * GRID + tc);
+                const r = qe.query(&ch, s, t) catch continue;
+                found += 1;
+                allocator.free(r.nodes);
+            }
+            const ns = nowNs() - t0;
+            std.debug.print("  CH query:     {d:.1} us/op  ({d} queries, found={d})\n", .{ usPerOp(ns, Q), Q, found });
+        }
+    }
+
     std.debug.print("\n=== Done ===\n\n", .{});
 }

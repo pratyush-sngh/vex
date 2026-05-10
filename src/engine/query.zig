@@ -476,55 +476,75 @@ pub fn weightedShortestPath(
         return PathResult{ .nodes = path, .total_weight = 0 };
     }
 
-    // Bidirectional Dijkstra: expand from both ends, meet in the middle.
-    // Explores ~2 * sqrt(N) nodes instead of N.
+    const n = g.node_keys.items.len;
+    const INF = std.math.inf(f64);
 
-    // Forward search state (from source, outgoing edges)
-    var fwd_dist = std.AutoHashMap(NodeId, f64).init(allocator);
-    defer fwd_dist.deinit();
-    var fwd_parent = std.AutoHashMap(NodeId, NodeId).init(allocator);
-    defer fwd_parent.deinit();
+    // Flat arrays for O(1) dist/parent access
+    const fwd_dist = try allocator.alloc(f64, n);
+    defer allocator.free(fwd_dist);
+    const fwd_parent = try allocator.alloc(NodeId, n);
+    defer allocator.free(fwd_parent);
+    const bwd_dist = try allocator.alloc(f64, n);
+    defer allocator.free(bwd_dist);
+    const bwd_parent = try allocator.alloc(NodeId, n);
+    defer allocator.free(bwd_parent);
+
+    @memset(fwd_dist, INF);
+    @memset(bwd_dist, INF);
+    @memset(fwd_parent, graph_mod.INVALID_ID);
+    @memset(bwd_parent, graph_mod.INVALID_ID);
+
     var fwd_pq = DijkPQ.initContext({});
     defer fwd_pq.deinit(allocator);
-
-    // Backward search state (from target, incoming edges)
-    var bwd_dist = std.AutoHashMap(NodeId, f64).init(allocator);
-    defer bwd_dist.deinit();
-    var bwd_parent = std.AutoHashMap(NodeId, NodeId).init(allocator);
-    defer bwd_parent.deinit();
     var bwd_pq = DijkPQ.initContext({});
     defer bwd_pq.deinit(allocator);
 
-    try fwd_dist.put(from_id, 0);
-    try fwd_parent.put(from_id, graph_mod.INVALID_ID);
+    fwd_dist[from_id] = 0;
+    bwd_dist[to_id] = 0;
     try fwd_pq.push(allocator, .{ .id = from_id, .dist = 0 });
-
-    try bwd_dist.put(to_id, 0);
-    try bwd_parent.put(to_id, graph_mod.INVALID_ID);
     try bwd_pq.push(allocator, .{ .id = to_id, .dist = 0 });
 
     const all_alive = g.all_base_edges_alive;
-    var best_total: f64 = std.math.inf(f64);
-    var meeting_node: ?NodeId = null;
+    var best_total: f64 = INF;
+    var meeting_node: NodeId = graph_mod.INVALID_ID;
 
     while (fwd_pq.items.len > 0 or bwd_pq.items.len > 0) {
-        // Termination: both frontiers have min-dist > best known path
-        const fwd_min = if (fwd_pq.peek()) |item| item.dist else std.math.inf(f64);
-        const bwd_min = if (bwd_pq.peek()) |item| item.dist else std.math.inf(f64);
+        const fwd_min = if (fwd_pq.peek()) |item| item.dist else INF;
+        const bwd_min = if (bwd_pq.peek()) |item| item.dist else INF;
         if (fwd_min + bwd_min >= best_total) break;
 
-        // Expand the side with smaller minimum distance
         if (fwd_min <= bwd_min) {
             if (fwd_pq.pop()) |current| {
-                const cd = fwd_dist.get(current.id) orelse continue;
+                const cd = fwd_dist[current.id];
                 if (current.dist > cd) continue;
                 if (cd >= best_total) continue;
 
                 // Relax forward edges (outgoing)
-                dijkRelaxForward(g, current.id, cd, &fwd_dist, &fwd_parent, &fwd_pq, allocator, all_alive) catch {};
+                const targets = g.base_out.neighbors(current.id);
+                const eidxs = g.base_out.edgeIndices(current.id);
+                for (targets, eidxs) |nid, eidx| {
+                    if (!all_alive and !g.edge_alive.isSet(eidx)) continue;
+                    const nd = cd + g.edge_weight.items[eidx];
+                    if (nd < fwd_dist[nid]) {
+                        fwd_dist[nid] = nd;
+                        fwd_parent[nid] = current.id;
+                        fwd_pq.push(allocator, .{ .id = nid, .dist = nd }) catch {};
+                    }
+                }
+                for (g.delta_edges.items) |de| {
+                    if (de.from != current.id) continue;
+                    if (!g.edge_alive.isSet(de.eidx)) continue;
+                    const nd = cd + g.edge_weight.items[de.eidx];
+                    if (nd < fwd_dist[de.to]) {
+                        fwd_dist[de.to] = nd;
+                        fwd_parent[de.to] = current.id;
+                        fwd_pq.push(allocator, .{ .id = de.to, .dist = nd }) catch {};
+                    }
+                }
 
-                // Check if backward search already reached this node
-                if (bwd_dist.get(current.id)) |bd| {
+                // Check meeting
+                const bd = bwd_dist[current.id];
+                if (bd < INF) {
                     const total = cd + bd;
                     if (total < best_total) {
                         best_total = total;
@@ -534,15 +554,36 @@ pub fn weightedShortestPath(
             }
         } else {
             if (bwd_pq.pop()) |current| {
-                const cd = bwd_dist.get(current.id) orelse continue;
+                const cd = bwd_dist[current.id];
                 if (current.dist > cd) continue;
                 if (cd >= best_total) continue;
 
                 // Relax backward edges (incoming)
-                dijkRelaxBackward(g, current.id, cd, &bwd_dist, &bwd_parent, &bwd_pq, allocator, all_alive) catch {};
+                const targets = g.base_in.neighbors(current.id);
+                const eidxs = g.base_in.edgeIndices(current.id);
+                for (targets, eidxs) |nid, eidx| {
+                    if (!all_alive and !g.edge_alive.isSet(eidx)) continue;
+                    const nd = cd + g.edge_weight.items[eidx];
+                    if (nd < bwd_dist[nid]) {
+                        bwd_dist[nid] = nd;
+                        bwd_parent[nid] = current.id;
+                        bwd_pq.push(allocator, .{ .id = nid, .dist = nd }) catch {};
+                    }
+                }
+                for (g.delta_edges.items) |de| {
+                    if (de.to != current.id) continue;
+                    if (!g.edge_alive.isSet(de.eidx)) continue;
+                    const nd = cd + g.edge_weight.items[de.eidx];
+                    if (nd < bwd_dist[de.from]) {
+                        bwd_dist[de.from] = nd;
+                        bwd_parent[de.from] = current.id;
+                        bwd_pq.push(allocator, .{ .id = de.from, .dist = nd }) catch {};
+                    }
+                }
 
-                // Check if forward search already reached this node
-                if (fwd_dist.get(current.id)) |fd| {
+                // Check meeting
+                const fd = fwd_dist[current.id];
+                if (fd < INF) {
                     const total = fd + cd;
                     if (total < best_total) {
                         best_total = total;
@@ -553,7 +594,8 @@ pub fn weightedShortestPath(
         }
     }
 
-    const mid = meeting_node orelse return error.PathNotFound;
+    if (meeting_node == graph_mod.INVALID_ID) return error.PathNotFound;
+    const mid = meeting_node;
 
     // Reconstruct: forward path (from → mid) + backward path (mid → to)
     var path = std.array_list.Managed(NodeId).init(allocator);
@@ -564,101 +606,30 @@ pub fn weightedShortestPath(
         var cur = mid;
         while (cur != from_id) {
             try path.append(cur);
-            cur = fwd_parent.get(cur) orelse return error.PathNotFound;
+            cur = fwd_parent[cur];
+            if (cur == graph_mod.INVALID_ID) return error.PathNotFound;
         }
         try path.append(from_id);
         std.mem.reverse(NodeId, path.items);
     }
 
-    // Backward half: trace from mid forward to to via bwd_parent (skip mid, already added)
+    // Backward half: trace from mid forward to to via bwd_parent
     {
-        var cur = bwd_parent.get(mid) orelse {
-            // mid == to_id, no backward chain needed
-            return PathResult{ .nodes = try path.toOwnedSlice(), .total_weight = best_total };
-        };
-        if (cur == graph_mod.INVALID_ID) {
+        const next = bwd_parent[mid];
+        if (next == graph_mod.INVALID_ID) {
             return PathResult{ .nodes = try path.toOwnedSlice(), .total_weight = best_total };
         }
+        var cur = next;
         while (cur != to_id) {
             try path.append(cur);
-            cur = bwd_parent.get(cur) orelse return error.PathNotFound;
+            const p = bwd_parent[cur];
+            if (p == graph_mod.INVALID_ID) return error.PathNotFound;
+            cur = p;
         }
         try path.append(to_id);
     }
 
     return PathResult{ .nodes = try path.toOwnedSlice(), .total_weight = best_total };
-}
-
-/// Relax outgoing edges from a node (forward Dijkstra step).
-fn dijkRelaxForward(
-    g: *const GraphEngine,
-    node_id: NodeId,
-    current_dist: f64,
-    dist: *std.AutoHashMap(NodeId, f64),
-    parent: *std.AutoHashMap(NodeId, NodeId),
-    pq: *DijkPQ,
-    allocator: Allocator,
-    all_alive: bool,
-) !void {
-    const targets = g.base_out.neighbors(node_id);
-    const eidxs = g.base_out.edgeIndices(node_id);
-    for (targets, eidxs) |nid, eidx| {
-        if (!all_alive and !g.edge_alive.isSet(eidx)) continue;
-        const nd = current_dist + g.edge_weight.items[eidx];
-        const existing = dist.get(nid);
-        if (existing == null or nd < existing.?) {
-            try dist.put(nid, nd);
-            try parent.put(nid, node_id);
-            try pq.push(allocator, .{ .id = nid, .dist = nd });
-        }
-    }
-    for (g.delta_edges.items) |de| {
-        if (de.from != node_id) continue;
-        if (!g.edge_alive.isSet(de.eidx)) continue;
-        const nd = current_dist + g.edge_weight.items[de.eidx];
-        const existing = dist.get(de.to);
-        if (existing == null or nd < existing.?) {
-            try dist.put(de.to, nd);
-            try parent.put(de.to, node_id);
-            try pq.push(allocator, .{ .id = de.to, .dist = nd });
-        }
-    }
-}
-
-/// Relax incoming edges from a node (backward Dijkstra step).
-fn dijkRelaxBackward(
-    g: *const GraphEngine,
-    node_id: NodeId,
-    current_dist: f64,
-    dist: *std.AutoHashMap(NodeId, f64),
-    parent: *std.AutoHashMap(NodeId, NodeId),
-    pq: *DijkPQ,
-    allocator: Allocator,
-    all_alive: bool,
-) !void {
-    const targets = g.base_in.neighbors(node_id);
-    const eidxs = g.base_in.edgeIndices(node_id);
-    for (targets, eidxs) |nid, eidx| {
-        if (!all_alive and !g.edge_alive.isSet(eidx)) continue;
-        const nd = current_dist + g.edge_weight.items[eidx];
-        const existing = dist.get(nid);
-        if (existing == null or nd < existing.?) {
-            try dist.put(nid, nd);
-            try parent.put(nid, node_id);
-            try pq.push(allocator, .{ .id = nid, .dist = nd });
-        }
-    }
-    for (g.delta_edges.items) |de| {
-        if (de.to != node_id) continue;
-        if (!g.edge_alive.isSet(de.eidx)) continue;
-        const nd = current_dist + g.edge_weight.items[de.eidx];
-        const existing = dist.get(de.from);
-        if (existing == null or nd < existing.?) {
-            try dist.put(de.from, nd);
-            try parent.put(de.from, node_id);
-            try pq.push(allocator, .{ .id = de.from, .dist = nd });
-        }
-    }
 }
 
 /// Get direct neighbors of a node.
