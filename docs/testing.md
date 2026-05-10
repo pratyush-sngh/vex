@@ -23,7 +23,7 @@ zig build test -Doptimize=ReleaseFast
 
 ## Test Coverage
 
-**167 tests total (166 passed, 1 skipped in debug mode)**
+**168 tests total (167 passed, 1 skipped in debug mode)**
 
 | Module | Tests | What's Covered |
 |--------|-------|----------------|
@@ -36,8 +36,9 @@ zig build test -Doptimize=ReleaseFast
 | **vector_store.zig** | 10 | Dual-tier store, f16 quantization, mmap save/load, lazy init, multi-field isolation |
 | **hnsw.zig** | 6 | HNSW insert/search, recall accuracy, distance calculations, layer management |
 | **rag.zig** | 2 | RAG search with graph expansion, vector+BFS integration |
-| **graph.zig** | 14 | Add nodes/edges, duplicate node error, node properties, remove node, remove edge, compact, type interning, type mask filtering, uniform weights flag, edge properties, all_base_edges_alive flag, vector field integration |
-| **query.zig** | 12 | BFS traverse outgoing, shortest path, weighted shortest path (Dijkstra), neighbors, edge type filter, traverse after compact, traverse with delta only, shortest path via delta, parallel BFS, LIMIT, impact analysis, list_by_type |
+| **graph.zig** | 14 | Add nodes/edges, duplicate node error, node properties, remove node, remove edge, compact (+ CH auto-build), type interning, type mask filtering, uniform weights flag, edge properties, all_base_edges_alive flag, vector field integration |
+| **ch.zig** | 2 | CH basic correctness (5-node weighted graph vs Dijkstra), CH larger graph validation (100-node, 50 random queries vs Dijkstra) |
+| **query.zig** | 12 | BFS traverse outgoing, shortest path, weighted shortest path (flat-array Dijkstra), neighbors, edge type filter, traverse after compact, traverse with delta only, shortest path via delta, parallel BFS, LIMIT, impact analysis, list_by_type |
 | **handler.zig** | 19 | PING, SET/GET, GRAPH.ADDNODE, SELECT namespace isolation, MGET/MSET, INCR/DECR/INCRBY/DECRBY, EXPIRE/PERSIST/TTL, APPEND, BGSAVE without persistence, bgsave_in_progress flag, lists, hashes, sets, sorted sets, vector commands, UPSERT, RENAME, TYPE, GETEX/GETDEL |
 | **resp.zig** | 4 | Parse RESP array, null bulk string, serialize round-trip, inline command parse |
 | **aof.zig** | 4 | Write and replay, truncate, replay missing file, group commit buffer |

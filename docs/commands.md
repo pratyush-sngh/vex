@@ -208,7 +208,7 @@ See [Pub/Sub](pubsub.md) for full details.
 | `GRAPH.TRAVERSE key [DEPTH n] [DIR d] [EDGETYPE t] [NODETYPE t]` | BFS traversal with filters |
 | `GRAPH.PATH from to [MAXDEPTH n]` | Shortest unweighted path (bidirectional BFS) |
 | `GRAPH.WPATH from to` | Shortest weighted path (bidirectional Dijkstra, CH-accelerated after COMPACT) |
-| `GRAPH.COMPACT` | Rebuild CSR from delta edges (improves traverse speed 3x) |
+| `GRAPH.COMPACT` | Rebuild CSR + Contraction Hierarchies (improves traverse 3x, WPATH 3x via CH) |
 | `GRAPH.UPSERT_NODE key type [prop value ...]` | Create or update a node with metadata |
 | `GRAPH.UPSERT_EDGE from to type [WEIGHT w] [prop value ...]` | Create or update an edge with metadata |
 | `GRAPH.INGEST json` | Bulk ingest nodes and edges from JSON |

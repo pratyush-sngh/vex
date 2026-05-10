@@ -18,9 +18,9 @@ Redis is single-threaded. To scale, you add more instances. Vex does the same --
 
 - **20-40% faster than Redis** on pipelined workloads with equal resources (4 cores, `redis-benchmark`, median of 30 runs)
 - **Beats Dragonfly** at 4 cores (+16% to +201%) -- shared-nothing routing overhead loses to striped locks at moderate core counts
-- **22x faster shortest path than Memgraph** via bidirectional BFS + CSR adjacency
+- **22x faster shortest path than Memgraph** via bidirectional BFS + CSR adjacency + Contraction Hierarchies
 - **Redis-compatible** -- works with `redis-cli`, redis-py, Jedis, go-redis, ioredis, any Redis client
-- **Built-in graph engine** -- TRAVERSE, PATH, NEIGHBORS on the same data store
+- **Built-in graph engine** -- TRAVERSE, PATH, WPATH (CH-accelerated), NEIGHBORS on the same data store
 - **Zero dependencies** -- pure Zig standard library, single binary
 - **Vector search + GRAPH.RAG** -- HNSW ANN search on graph nodes, semantic search → graph traversal in one command
 - **Production features** -- TLS, MULTI/EXEC, pub/sub, WATCH, LRU eviction, BGSAVE, clustering with automatic failover
@@ -42,7 +42,7 @@ Redis is single-threaded. To scale, you add more instances. Vex does the same --
 | **[Deployment](docs/deployment.md)** | Production checklist, systemd, Docker, tuning |
 | **[Vector Search & GRAPH.RAG](docs/vector-search.md)** | HNSW vector search, f16 mmap storage, RAG pipeline examples |
 | **[Vector Benchmarks](docs/vector-benchmarks.md)** | Benchmark design: Vex vs Redis+RediSearch vs Qdrant vs Weaviate |
-| **[Testing](docs/testing.md)** | 158 tests, coverage table, test patterns |
+| **[Testing](docs/testing.md)** | 168 tests, coverage table, test patterns |
 
 ---
 
@@ -60,7 +60,7 @@ redis-cli -p 6380
 ```bash
 zig build                                          # Build
 zig build run -- --reactor                        # Reactor mode (recommended)
-zig build test                                     # Run tests (107 tests)
+zig build test                                     # Run tests (168 tests)
 redis-cli -p 6380                                  # Connect
 ```
 

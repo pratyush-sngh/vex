@@ -111,7 +111,8 @@ src/
 │   ├── kv.zig              # KV store: TTL, tombstone DEL, LRU eviction, memoryUsage
 │   ├── concurrent_kv.zig   # 256-stripe rwlock KV (parallel reads)
 │   ├── graph.zig           # CSR graph engine (SoA, bitflags, auto-compact)
-│   ├── query.zig           # Bidirectional BFS, frontier traverse, Dijkstra
+│   ├── query.zig           # Bidirectional BFS, frontier traverse, Dijkstra (flat-array)
+│   ├── ch.zig              # Contraction Hierarchies (build + query engine)
 │   ├── string_intern.zig   # Type string pooling (u16 IDs, bitmask filtering)
 │   ├── property_store.zig  # Sparse property storage for nodes/edges
 │   ├── vector_store.zig    # Dual-tier vector store (f32 write buffer + f16 mmap)
