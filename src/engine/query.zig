@@ -153,7 +153,7 @@ pub fn traverse(
                 };
 
                 var ctxs: [MAX_BFS_THREADS]ExpandCtx = undefined;
-                var threads: [MAX_BFS_THREADS]?std.Thread = .{null} ** MAX_BFS_THREADS;
+                var threads: [MAX_BFS_THREADS]?std.Thread = @splat(null);
                 var spawned: usize = 0;
 
                 for (0..num_threads) |t| {
@@ -1046,7 +1046,7 @@ pub fn impact(
     const has_delta = g.delta_edges.items.len > 0;
 
     // Count by type_id (max 64 interned types)
-    var counts: [64]u32 = [_]u32{0} ** 64;
+    var counts: [64]u32 = @splat(0);
     var total: u32 = 0;
 
     var current = &frontier_a;

@@ -55,7 +55,7 @@ pub const AOF = struct {
     /// The direct_fd is used for async io_uring writes; the original file handle stays for sync fallback.
     pub fn enableDirectIO(self: *AOF, allocator: Allocator) void {
         if (!is_linux) return;
-        const path_z = allocator.dupeZ(u8, self.path) catch return;
+        const path_z = allocator.dupeSentinel(u8, self.path, 0) catch return;
         defer allocator.free(path_z);
         const fd = c.open(path_z.ptr, .{ .ACCMODE = .WRONLY, .APPEND = true, .DIRECT = true }, @as(c.mode_t, 0o644));
         if (fd < 0) return; // O_DIRECT not supported (e.g. tmpfs)
@@ -318,9 +318,9 @@ pub const AOF = struct {
 
         // Close current file, rename tmp over it, reopen
         self.file.close(self.io);
-        const old_path_z = allocator.dupeZ(u8, self.path) catch return;
+        const old_path_z = allocator.dupeSentinel(u8, self.path, 0) catch return;
         defer allocator.free(old_path_z);
-        const tmp_path_z = allocator.dupeZ(u8, tmp_path) catch return;
+        const tmp_path_z = allocator.dupeSentinel(u8, tmp_path, 0) catch return;
         defer allocator.free(tmp_path_z);
         _ = c.rename(tmp_path_z, old_path_z);
 

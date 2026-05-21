@@ -192,14 +192,14 @@ pub const HnswIndex = struct {
     /// Writes to {dir_path}/{field_name}.vhi.tmp then atomically renames.
     pub fn serialize(self: *const HnswIndex, dir_path: []const u8, field_name: []const u8) !void {
         var tmp_buf: [512]u8 = undefined;
-        const tmp_path = std.fmt.bufPrintZ(&tmp_buf, "{s}/{s}.vhi.tmp", .{ dir_path, field_name }) catch return error.PathTooLong;
+        const tmp_path = std.fmt.bufPrintSentinel(&tmp_buf, "{s}/{s}.vhi.tmp", .{ dir_path, field_name }, 0) catch return error.PathTooLong;
 
         const fd = std.c.open(tmp_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
         if (fd < 0) return error.FileOpenFailed;
         defer _ = std.c.close(fd);
 
         // ── Header (40 bytes) ──
-        var header: [VHI_HEADER_SIZE]u8 = [_]u8{0} ** VHI_HEADER_SIZE;
+        var header: [VHI_HEADER_SIZE]u8 = @splat(0);
         @memcpy(header[0..4], &VHI_MAGIC);
         header[4] = VHI_VERSION;
         header[5] = self.max_level;
@@ -276,7 +276,7 @@ pub const HnswIndex = struct {
 
         // ── Atomic rename ──
         var final_buf: [512]u8 = undefined;
-        const final_path = std.fmt.bufPrintZ(&final_buf, "{s}/{s}.vhi", .{ dir_path, field_name }) catch return error.PathTooLong;
+        const final_path = std.fmt.bufPrintSentinel(&final_buf, "{s}/{s}.vhi", .{ dir_path, field_name }, 0) catch return error.PathTooLong;
         _ = std.c.rename(tmp_path, final_path);
     }
 
@@ -284,7 +284,7 @@ pub const HnswIndex = struct {
     /// Returns error if file is missing, corrupt, or version mismatch.
     pub fn deserialize(allocator: Allocator, dir_path: []const u8, field_name: []const u8, vectors: *const VectorStore, field_id: u16) !HnswIndex {
         var path_buf: [512]u8 = undefined;
-        const path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}.vhi", .{ dir_path, field_name }) catch return error.PathTooLong;
+        const path = std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}.vhi", .{ dir_path, field_name }, 0) catch return error.PathTooLong;
 
         const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
         if (fd < 0) return error.FileNotFound;

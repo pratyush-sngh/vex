@@ -341,7 +341,7 @@ pub const GraphEngine = struct {
         const vec_dir = std.fmt.bufPrint(&vec_dir_buf, "{s}/vectors", .{data_dir}) catch return;
 
         // Track which fields were loaded from .vhi vs need rebuild
-        var loaded_from_vhi: [64]bool = [_]bool{false} ** 64;
+        var loaded_from_vhi: [64]bool = @splat(false);
 
         // Try loading .vhi for each field; fall back to empty index for rebuild
         for (0..field_count) |fi| {
@@ -418,7 +418,7 @@ pub const GraphEngine = struct {
             }
         };
 
-        var threads: [64]?std.Thread = .{null} ** 64;
+        var threads: [64]?std.Thread = @splat(null);
         var thread_count: usize = 0;
 
         for (0..field_count) |fi| {

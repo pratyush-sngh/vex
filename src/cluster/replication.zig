@@ -743,7 +743,7 @@ fn resolveHost(allocator: Allocator, host: []const u8) ?u32 {
     if (parseIpv4(host)) |ip| return ip;
 
     // DNS resolution via getaddrinfo
-    const host_z = allocator.dupeZ(u8, host) catch return null;
+    const host_z = allocator.dupeSentinel(u8, host, 0) catch return null;
     defer allocator.free(host_z);
 
     var hints: std.c.addrinfo = std.mem.zeroes(std.c.addrinfo);

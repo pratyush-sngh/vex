@@ -108,10 +108,10 @@ pub const VectorStore = struct {
         return .{
             .map = std.AutoHashMap(u64, []f32).init(allocator),
             .field_intern = StringIntern.init(allocator),
-            .field_dims = [_]u32{0} ** 64,
+            .field_dims = @splat(0),
             .field_dims_set = 0,
             .allocator = allocator,
-            .mmap_fields = [_]?MmapField{null} ** 64,
+            .mmap_fields = @splat(null),
             .deleted_from_mmap = std.AutoHashMap(u64, void).init(allocator),
             .data_dir = null,
         };
@@ -233,7 +233,7 @@ pub const VectorStore = struct {
         const vec_dir = std.fmt.bufPrint(&dir_buf, "{s}/vectors", .{data_dir}) catch return;
 
         // Create directory via libc
-        const dir_z = self.allocator.dupeZ(u8, vec_dir) catch return;
+        const dir_z = self.allocator.dupeSentinel(u8, vec_dir, 0) catch return;
         defer self.allocator.free(dir_z);
         _ = std.c.mkdir(dir_z, 0o755);
 
@@ -255,7 +255,7 @@ pub const VectorStore = struct {
         };
 
         var ctxs: [64]SaveCtx = undefined;
-        var threads: [64]?std.Thread = .{null} ** 64;
+        var threads: [64]?std.Thread = @splat(null);
         var thread_count: usize = 0;
 
         for (0..field_count) |fi| {
@@ -328,14 +328,14 @@ pub const VectorStore = struct {
 
         // Write .vvf file atomically
         var path_buf: [512]u8 = undefined;
-        const tmp_path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}.vvf.tmp", .{ vec_dir, field_name }) catch return;
+        const tmp_path = std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}.vvf.tmp", .{ vec_dir, field_name }, 0) catch return;
 
         const fd = std.c.open(tmp_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
         if (fd < 0) return error.FileOpenFailed;
         defer _ = std.c.close(fd);
 
         // Write header
-        var header: [VVF_HEADER_SIZE]u8 = [_]u8{0} ** VVF_HEADER_SIZE;
+        var header: [VVF_HEADER_SIZE]u8 = @splat(0);
         @memcpy(header[0..4], &VVF_MAGIC);
         header[4] = VVF_VERSION;
         header[5] = DTYPE_F16;
@@ -371,7 +371,7 @@ pub const VectorStore = struct {
 
         // Atomic rename
         var final_buf: [512]u8 = undefined;
-        const final_path = std.fmt.bufPrintZ(&final_buf, "{s}/{s}.vvf", .{ vec_dir, field_name }) catch return;
+        const final_path = std.fmt.bufPrintSentinel(&final_buf, "{s}/{s}.vvf", .{ vec_dir, field_name }, 0) catch return;
         _ = std.c.rename(tmp_path, final_path);
     }
 
@@ -410,7 +410,7 @@ pub const VectorStore = struct {
 
     fn loadFieldByName(self: *VectorStore, field_name: []const u8, vec_dir: []const u8, field_id: u16) !void {
         var path_buf: [512]u8 = undefined;
-        const path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}.vvf", .{ vec_dir, field_name }) catch return error.PathTooLong;
+        const path = std.fmt.bufPrintSentinel(&path_buf, "{s}/{s}.vvf", .{ vec_dir, field_name }, 0) catch return error.PathTooLong;
 
         const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
         if (fd < 0) return error.FileNotFound;

@@ -1129,7 +1129,7 @@ pub const Server = struct {
             if (uds_ctx) |c| self.allocator.destroy(c);
             // Clean up socket file
             if (self.unixsocket) |sock_path| {
-                const path_z = self.allocator.dupeZ(u8, sock_path) catch null;
+                const path_z = self.allocator.dupeSentinel(u8, sock_path, 0) catch null;
                 if (path_z) |p| {
                     _ = std.c.unlink(p);
                     self.allocator.free(p);

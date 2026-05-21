@@ -159,7 +159,7 @@ fn loadLib(name: [*:0]const u8) ?*anyopaque {
     };
     for (suffixes) |suffix| {
         var buf: [256]u8 = undefined;
-        const full = std.fmt.bufPrintZ(&buf, "lib{s}{s}", .{ std.mem.span(name), std.mem.span(suffix) }) catch continue;
+        const full = std.fmt.bufPrintSentinel(&buf, "lib{s}{s}", .{ std.mem.span(name), std.mem.span(suffix) }, 0) catch continue;
         if (std.c.dlopen(full, .{ .LAZY = true })) |handle| return handle;
     }
     // Try bare name

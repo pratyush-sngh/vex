@@ -29,7 +29,7 @@ pub fn MpscQueue(comptime T: type, comptime CAPACITY: usize) type {
         buf: [CAPACITY]T = undefined,
         head: std.atomic.Value(usize) = std.atomic.Value(usize).init(0), // consumer reads from here
         tail: std.atomic.Value(usize) = std.atomic.Value(usize).init(0), // producers write here
-        slot_ready: [CAPACITY]std.atomic.Value(u8) = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(0)} ** CAPACITY,
+        slot_ready: [CAPACITY]std.atomic.Value(u8) = @splat(std.atomic.Value(u8).init(0)),
 
         /// Try to enqueue an item. Returns false if queue is full.
         pub fn push(self: *Self, item: T) bool {

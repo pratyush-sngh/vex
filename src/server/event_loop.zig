@@ -105,9 +105,9 @@ pub const EventLoop = struct {
             .notify_read_fd = efd,
             .notify_write_fd = efd,
             .events_buf = {},
-            .fd_data = [_]usize{0} ** FD_TABLE_SIZE,
-            .fd_active = [_]bool{false} ** FD_TABLE_SIZE,
-            .fd_want_write = [_]bool{false} ** FD_TABLE_SIZE,
+            .fd_data = @splat(0),
+            .fd_active = @splat(false),
+            .fd_want_write = @splat(false),
         };
 
         self.submitPollAdd(efd, @as(u32, linux.POLL.IN)) catch {
@@ -147,9 +147,9 @@ pub const EventLoop = struct {
             .notify_read_fd = efd,
             .notify_write_fd = efd,
             .events_buf = {},
-            .fd_data = [_]usize{0} ** FD_TABLE_SIZE,
-            .fd_active = [_]bool{false} ** FD_TABLE_SIZE,
-            .fd_want_write = [_]bool{false} ** FD_TABLE_SIZE,
+            .fd_data = @splat(0),
+            .fd_active = @splat(false),
+            .fd_want_write = @splat(false),
         };
     }
 

@@ -250,9 +250,9 @@ pub fn main(init: std.process.Init) !void {
     var tls_ctx: ?TlsContext = null;
     if (config.tls_cert) |cert| {
         if (config.tls_key) |key| {
-            const cert_z = try allocator.dupeZ(u8, cert);
+            const cert_z = try allocator.dupeSentinel(u8, cert, 0);
             defer allocator.free(cert_z);
-            const key_z = try allocator.dupeZ(u8, key);
+            const key_z = try allocator.dupeSentinel(u8, key, 0);
             defer allocator.free(key_z);
             tls_ctx = TlsContext.init(cert_z, key_z) catch |err| blk: {
                 log("warning: TLS init failed: {s} (running without TLS)", .{@errorName(err)});
