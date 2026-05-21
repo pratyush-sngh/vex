@@ -74,12 +74,16 @@ pub fn traverse(
         if (g.type_intern.find(filter)) |id| (if (id < 64) StringIntern.mask(id) else 0) else 0
     else
         0;
+    const has_edge_filter = opts.edge_type_filter != null;
+    // Resolve edge type ID for fallback filtering when type_id >= 64
+    const edge_type_id_exact: ?u16 = if (opts.edge_type_filter) |filter| g.type_intern.find(filter) else null;
     const node_type_id: ?u16 = if (opts.node_type_filter) |filter|
         g.type_intern.find(filter)
     else
         null;
 
-    if (opts.edge_type_filter != null and edge_type_mask == 0) {
+    if (has_edge_filter and edge_type_id_exact == null) {
+        // Edge type doesn't exist in the graph at all — only return start node
         try result.append(start_id);
         return result.toOwnedSlice();
     }
@@ -119,7 +123,7 @@ pub fn traverse(
 
         if (num_threads <= 1) {
             // Sequential path — same as before
-            expandFrontierSeq(g, frontier_nodes.items, &visited, next, all_alive, has_delta, csrs, edge_type_mask, node_type_id, opts.direction);
+            expandFrontierSeq(g, frontier_nodes.items, &visited, next, all_alive, has_delta, csrs, edge_type_mask, node_type_id, opts.direction, has_edge_filter, edge_type_id_exact);
         } else {
             // Parallel path — thread-local next bitsets, merge with OR
             var local_nexts: [MAX_BFS_THREADS]std.DynamicBitSet = undefined;
@@ -132,7 +136,7 @@ pub fn traverse(
 
             if (inited < num_threads) {
                 // Allocation failed — fall back to sequential
-                expandFrontierSeq(g, frontier_nodes.items, &visited, next, all_alive, has_delta, csrs, edge_type_mask, node_type_id, opts.direction);
+                expandFrontierSeq(g, frontier_nodes.items, &visited, next, all_alive, has_delta, csrs, edge_type_mask, node_type_id, opts.direction, has_edge_filter, edge_type_id_exact);
             } else {
                 const chunk = (frontier_count + num_threads - 1) / num_threads;
                 const ExpandCtx = struct {
@@ -146,9 +150,11 @@ pub fn traverse(
                     edge_type_mask: TypeMask,
                     node_type_id: ?u16,
                     direction: Direction,
+                    has_edge_filter: bool,
+                    edge_type_id_exact: ?u16,
 
                     fn run(ctx: *@This()) void {
-                        expandFrontierSeq(ctx.g, ctx.nodes, ctx.visited, ctx.local_next, ctx.all_alive, ctx.has_delta, ctx.csrs, ctx.edge_type_mask, ctx.node_type_id, ctx.direction);
+                        expandFrontierSeq(ctx.g, ctx.nodes, ctx.visited, ctx.local_next, ctx.all_alive, ctx.has_delta, ctx.csrs, ctx.edge_type_mask, ctx.node_type_id, ctx.direction, ctx.has_edge_filter, ctx.edge_type_id_exact);
                     }
                 };
 
@@ -172,6 +178,8 @@ pub fn traverse(
                         .edge_type_mask = edge_type_mask,
                         .node_type_id = node_type_id,
                         .direction = opts.direction,
+                        .has_edge_filter = has_edge_filter,
+                        .edge_type_id_exact = edge_type_id_exact,
                     };
 
                     if (t == 0) {
@@ -818,9 +826,11 @@ fn expandFrontierSeq(
     edge_type_mask: TypeMask,
     node_type_id: ?u16,
     direction: Direction,
+    has_edge_filter: bool,
+    edge_type_id_exact: ?u16,
 ) void {
     for (frontier_nodes) |node_id| {
-        // Early exit: check node's edge type mask
+        // Early exit: check node's edge type mask (only when bitmask is usable)
         if (edge_type_mask != 0) {
             const node_mask = switch (direction) {
                 .outgoing => g.node_out_type_mask.items[node_id],
@@ -835,7 +845,7 @@ fn expandFrontierSeq(
             const targets = csr.neighbors(node_id);
             if (targets.len == 0) continue;
 
-            if (all_alive and edge_type_mask == 0 and node_type_id == null) {
+            if (all_alive and !has_edge_filter and node_type_id == null) {
                 for (targets) |nid| {
                     if (!g.node_alive.isSet(nid)) continue;
                     if (visited.isSet(nid)) continue;
@@ -848,9 +858,15 @@ fn expandFrontierSeq(
                     if (!g.node_alive.isSet(nid)) continue;
                     if (visited.isSet(nid)) continue;
 
-                    if (edge_type_mask != 0) {
+                    if (has_edge_filter) {
                         const etid = g.edge_type_id.items[eidx];
-                        if (etid >= 64 or edge_type_mask & StringIntern.mask(etid) == 0) continue;
+                        if (edge_type_mask != 0) {
+                            // Fast bitmask check for type_id < 64
+                            if (etid >= 64 or edge_type_mask & StringIntern.mask(etid) == 0) continue;
+                        } else if (edge_type_id_exact) |exact| {
+                            // Fallback: direct type_id comparison for type_id >= 64
+                            if (etid != exact) continue;
+                        }
                     }
                     if (node_type_id) |ntid| {
                         if (g.node_type_id.items[nid] != ntid) continue;
@@ -875,9 +891,13 @@ fn expandFrontierSeq(
                 if (!g.node_alive.isSet(nid)) continue;
                 if (visited.isSet(nid)) continue;
 
-                if (edge_type_mask != 0) {
+                if (has_edge_filter) {
                     const etid = g.edge_type_id.items[de.eidx];
-                    if (etid >= 64 or edge_type_mask & StringIntern.mask(etid) == 0) continue;
+                    if (edge_type_mask != 0) {
+                        if (etid >= 64 or edge_type_mask & StringIntern.mask(etid) == 0) continue;
+                    } else if (edge_type_id_exact) |exact| {
+                        if (etid != exact) continue;
+                    }
                 }
                 if (node_type_id) |ntid| {
                     if (g.node_type_id.items[nid] != ntid) continue;
@@ -1016,14 +1036,24 @@ pub fn impact(
 
     // Resolve edge type filters to bitmask
     var edge_type_mask: TypeMask = 0;
+    var edge_type_ids: [64]u16 = undefined;
+    var edge_type_ids_len: usize = 0;
     if (opts.edge_type_filters) |filters| {
         for (filters) |f| {
-            if (g.type_intern.find(f)) |id| { if (id < 64) edge_type_mask |= StringIntern.mask(id); }
+            if (g.type_intern.find(f)) |id| {
+                if (id < 64) {
+                    edge_type_mask |= StringIntern.mask(id);
+                } else {
+                    edge_type_ids[edge_type_ids_len] = id;
+                    edge_type_ids_len += 1;
+                }
+            }
         }
-        if (edge_type_mask == 0) {
-            const empty = try allocator.alloc(ImpactResult, 0);
-            return empty;
-        }
+    }
+    const has_edge_filter = opts.edge_type_filters != null;
+    if (has_edge_filter and edge_type_mask == 0 and edge_type_ids_len == 0) {
+        const empty = try allocator.alloc(ImpactResult, 0);
+        return empty;
     }
 
     // Resolve node type filters
@@ -1070,7 +1100,7 @@ pub fn impact(
                 const targets = csr.neighbors(node_id);
                 if (targets.len == 0) continue;
 
-                if (all_alive and edge_type_mask == 0) {
+                if (all_alive and !has_edge_filter) {
                     for (targets) |nid| {
                         if (!g.node_alive.isSet(nid)) continue;
                         if (visited.isSet(nid)) continue;
@@ -1089,9 +1119,17 @@ pub fn impact(
                         if (!g.edge_alive.isSet(eidx)) continue;
                         if (!g.node_alive.isSet(nid)) continue;
                         if (visited.isSet(nid)) continue;
-                        if (edge_type_mask != 0) {
+                        if (has_edge_filter) {
                             const etid = g.edge_type_id.items[eidx];
-                            if (etid >= 64 or edge_type_mask & StringIntern.mask(etid) == 0) continue;
+                            if (edge_type_mask != 0) {
+                                if (etid >= 64 or edge_type_mask & StringIntern.mask(etid) == 0) continue;
+                            } else {
+                                var matched = false;
+                                for (edge_type_ids[0..edge_type_ids_len]) |eid| {
+                                    if (etid == eid) { matched = true; break; }
+                                }
+                                if (!matched) continue;
+                            }
                         }
                         visited.set(nid);
                         next.set(nid);
@@ -1112,9 +1150,17 @@ pub fn impact(
                     const nid = de.to;
                     if (!g.node_alive.isSet(nid)) continue;
                     if (visited.isSet(nid)) continue;
-                    if (edge_type_mask != 0) {
+                    if (has_edge_filter) {
                         const etid = g.edge_type_id.items[de.eidx];
-                        if (etid >= 64 or edge_type_mask & StringIntern.mask(etid) == 0) continue;
+                        if (edge_type_mask != 0) {
+                            if (etid >= 64 or edge_type_mask & StringIntern.mask(etid) == 0) continue;
+                        } else {
+                            var matched = false;
+                            for (edge_type_ids[0..edge_type_ids_len]) |eid| {
+                                if (etid == eid) { matched = true; break; }
+                            }
+                            if (!matched) continue;
+                        }
                     }
                     visited.set(nid);
                     next.set(nid);
@@ -1176,14 +1222,24 @@ pub fn findPaths(
     };
 
     var edge_type_mask: TypeMask = 0;
+    var edge_type_ids: [64]u16 = undefined;
+    var edge_type_ids_len: usize = 0;
     if (opts.edge_type_filters) |filters| {
         for (filters) |f| {
-            if (g.type_intern.find(f)) |id| { if (id < 64) edge_type_mask |= StringIntern.mask(id); }
+            if (g.type_intern.find(f)) |id| {
+                if (id < 64) {
+                    edge_type_mask |= StringIntern.mask(id);
+                } else {
+                    edge_type_ids[edge_type_ids_len] = id;
+                    edge_type_ids_len += 1;
+                }
+            }
         }
-        if (edge_type_mask == 0) {
-            const empty = try allocator.alloc([]NodeId, 0);
-            return empty;
-        }
+    }
+    const has_edge_filter = opts.edge_type_filters != null;
+    if (has_edge_filter and edge_type_mask == 0 and edge_type_ids_len == 0) {
+        const empty = try allocator.alloc([]NodeId, 0);
+        return empty;
     }
 
     var results = std.array_list.Managed([]NodeId).init(allocator);
@@ -1247,7 +1303,7 @@ pub fn findPaths(
 
         for (csrs) |csr| {
             const targets = csr.neighbors(entry.node_id);
-            if (all_alive and edge_type_mask == 0) {
+            if (all_alive and !has_edge_filter) {
                 for (targets) |nid| {
                     if (!g.node_alive.isSet(nid)) continue;
                     if (on_path.isSet(nid)) continue;
@@ -1259,9 +1315,17 @@ pub fn findPaths(
                     if (!g.edge_alive.isSet(eidx)) continue;
                     if (!g.node_alive.isSet(nid)) continue;
                     if (on_path.isSet(nid)) continue;
-                    if (edge_type_mask != 0) {
+                    if (has_edge_filter) {
                         const etid = g.edge_type_id.items[eidx];
-                        if (etid >= 64 or edge_type_mask & StringIntern.mask(etid) == 0) continue;
+                        if (edge_type_mask != 0) {
+                            if (etid >= 64 or edge_type_mask & StringIntern.mask(etid) == 0) continue;
+                        } else {
+                            var matched = false;
+                            for (edge_type_ids[0..edge_type_ids_len]) |eid| {
+                                if (etid == eid) { matched = true; break; }
+                            }
+                            if (!matched) continue;
+                        }
                     }
                     try child_buf.append(nid);
                 }
@@ -1274,9 +1338,17 @@ pub fn findPaths(
                 if (!g.edge_alive.isSet(de.eidx)) continue;
                 if (!g.node_alive.isSet(de.to)) continue;
                 if (on_path.isSet(de.to)) continue;
-                if (edge_type_mask != 0) {
+                if (has_edge_filter) {
                     const etid = g.edge_type_id.items[de.eidx];
-                    if (etid >= 64 or edge_type_mask & StringIntern.mask(etid) == 0) continue;
+                    if (edge_type_mask != 0) {
+                        if (etid >= 64 or edge_type_mask & StringIntern.mask(etid) == 0) continue;
+                    } else {
+                        var matched = false;
+                        for (edge_type_ids[0..edge_type_ids_len]) |eid| {
+                            if (etid == eid) { matched = true; break; }
+                        }
+                        if (!matched) continue;
+                    }
                 }
                 try child_buf.append(de.to);
             }
