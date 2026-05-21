@@ -13,12 +13,13 @@ Vex uses a dual persistence model similar to Redis RDB+AOF.
 | Snapshot | `vex.zdb` | Binary format with CRC-32 checksum. Full KV + graph state |
 | AOF | `vex.aof` | Append-only file. Every write command in binary format |
 | Vectors | `vectors/*.vvf` | Per-field f16 vector embeddings (mmap'd on load) |
+| HNSW Index | `vectors/*.vhi` | Serialized HNSW graph (skip rebuild on startup) |
 
 ### Lifecycle
 
-1. **Startup**: loads snapshot (`vex.zdb`), replays AOF (`vex.aof`), and mmap's vector files (`vectors/*.vvf`) with parallel HNSW rebuild
+1. **Startup**: (1) loads snapshot (`vex.zdb`), (2) replays AOF (`vex.aof`), (3) loads vectors (mmap `.vvf` files + deserialize `.vhi` index or rebuild HNSW if `.vhi` missing)
 2. **Runtime**: write commands are buffered in memory and flushed to AOF per event loop tick (group commit)
-3. **SAVE/BGSAVE**: writes a new snapshot, truncates AOF
+3. **SAVE/BGSAVE**: writes a new snapshot, truncates AOF, saves `.vvf` + `.vhi` files
 4. **BGREWRITEAOF**: compacts AOF by serializing current state to a new file, atomic rename
 5. **Shutdown**: SIGTERM/SIGINT triggers a final snapshot + AOF flush
 
@@ -53,6 +54,8 @@ CRC-32 (u32, IEEE 802.3)
 ```
 
 The CRC-32 checksum covers all bytes before it. If the checksum doesn't match on load, Vex reports `ChecksumMismatch` and refuses to load the corrupted snapshot.
+
+**prop_mask rebuild**: `node_prop_mask` and `edge_prop_mask` are not stored in the snapshot format. During load, they are rebuilt by iterating each node/edge's property keys and setting the corresponding bits via the key intern table.
 
 ---
 
@@ -150,26 +153,73 @@ data-dir/
 ├── vex.aof          # Append-only file
 └── vectors/
     ├── field_0.vvf  # Embeddings for field 0
-    └── field_1.vvf  # Embeddings for field 1
+    ├── field_0.vhi  # HNSW index for field 0
+    ├── field_1.vvf  # Embeddings for field 1
+    └── field_1.vhi  # HNSW index for field 1
 ```
 
 ### .vvf Format
 
+20-byte header followed by vector data:
+
 ```
-VVF_MAGIC (4 bytes)
+MAGIC "VXVF" (4 bytes)
 VERSION (1 byte)
 DTYPE (1 byte: 0=f32, 1=f16)
-DIMENSION (u32)
-[vector data: dimension * dtype_size * count bytes]
+DIMENSION (u32, 4 bytes)
+COUNT (u32, 4 bytes)
+RESERVED (6 bytes)
+[vector data: (4 + dimension * dtype_size) * count bytes]
 ```
+
+On load, the file is validated: `entry_stride * count + header_size` must fit within the actual file size. A mismatch indicates corruption and the load is rejected.
 
 ### Lifecycle
 
 - **First SETVEC**: VectorStore is lazily initialized (zero cost when vectors unused)
 - **Runtime**: new vectors are written to an in-memory f32 buffer
-- **SAVE/BGSAVE**: vectors are quantized to f16 and written to `.vvf` files
+- **SAVE/BGSAVE**: vectors are quantized to f16 and written to `.vvf` files; HNSW indices serialized to `.vhi` files
 - **Shutdown**: final vector save triggered alongside KV snapshot
-- **Startup**: `.vvf` files are mmap'd for zero-copy reads; HNSW index is rebuilt in parallel (per-field threads)
+- **Startup**: `.vvf` files are mmap'd for zero-copy reads; `.vhi` files are deserialized to restore HNSW indices instantly (falls back to parallel rebuild if `.vhi` is missing or corrupt)
+
+---
+
+## HNSW Index Persistence (.vhi files)
+
+HNSW indices are serialized to `.vhi` (Vex HNSW Index) files during SAVE/BGSAVE and deserialized on startup, skipping the expensive index rebuild.
+
+```
+data-dir/
+└── vectors/
+    ├── field_0.vvf  # Vector data
+    ├── field_0.vhi  # HNSW index for field 0
+    ├── field_1.vvf
+    └── field_1.vhi
+```
+
+### .vhi Format
+
+40-byte header followed by graph structure:
+
+```
+MAGIC "VXHI" (4 bytes)
+VERSION (1 byte)
+MAX_LEVEL (1 byte)
+M (u16)
+M_MAX0 (u16)
+EF_CONSTRUCTION (u16)
+DIMENSIONS (u32)
+ENTRY_POINT (u32)
+COUNT (u32)
+CAPACITY (u32)
+HIGHER_LAYER_COUNT (u16)
+RNG_STATE (u64)
+--- layer 0 neighbors (per node: u16 count + up to M_max0 * u32 neighbor IDs)
+--- node levels (per node: u8)
+--- higher layers (per layer per node: u16 count + up to M * u32 neighbor IDs)
+```
+
+Writes use atomic `.vhi.tmp` + rename to prevent partial files on crash. On load, magic and version are validated; mismatches fall back to HNSW rebuild from vectors.
 
 ---
 

@@ -264,6 +264,15 @@ src/
 
 ## Changelog
 
+### v0.7.1
+- HNSW index persistence (`.vhi` files — skip rebuild on cold start)
+- Fix vector persistence (`.vvf` files now saved during SAVE/BGSAVE)
+- Fix AOF flush in scaled mode (writes were buffered but never flushed to disk)
+- Fix prop_mask rebuild on snapshot load
+- VVF bounds validation for corruption detection
+- Migrate to Zig 0.17
+- Centralize version string
+
 ### v0.6.0 -- Vector Search, GRAPH.RAG & Performance
 GRAPH.SETVEC/GETVEC/VECSEARCH for storing and searching embeddings on graph nodes. GRAPH.RAG combines vector ANN search + graph BFS expansion in a single command — purpose-built for agentic AI and RAG pipelines. HNSW index (M=16, ef=200/50), cosine similarity, graph-native NodeId results. io_uring recv/send for TCP I/O, SQPOLL + async AOF fsync + Direct I/O. Batch commands (MGET/MSET/HMGET/HMSET/HGETALL), RESP serialization optimization, parallel BFS frontier expansion, parallel vector field load/save.
 
@@ -287,7 +296,6 @@ Redis-compatible KV + graph DB with multi-reactor architecture.
 ## Roadmap
 
 ### v0.7 -- LLM Ecosystem ([details](docs/llm-ecosystem.md))
-- HNSW index persistence (`.vhi` files, mmap on load, skip rebuild on startup)
 - `GRAPH.RAG` v2 -- subgraph returns (nodes + edges + scores, not flat list)
 - `GRAPH.COOCCUR` -- auto-create edges between entities sharing context
 - `CACHE.SEMSET/SEMGET/SEMINVAL/SEMCLEAR/SEMSTATS` -- semantic LLM response cache

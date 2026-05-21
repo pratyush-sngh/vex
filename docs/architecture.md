@@ -65,7 +65,8 @@ The KV store is split into 256 independent stripes, each with its own `pthread_r
 - **Lazy initialization**: VectorStore is null until the first `GRAPH.SETVEC` — zero overhead when unused
 - **GRAPH.RAG**: single command combining vector ANN search + graph BFS expansion
 - **Cosine similarity** with f16→f32 conversion on the query path
-- **Parallel field save/load**: per-field threads for HNSW rebuild on startup and BGSAVE
+- **HNSW persistence**: indices serialized to `.vhi` files and deserialized on startup (skipping rebuild); falls back to full rebuild if `.vhi` is missing
+- **Parallel field save/load**: per-field threads for HNSW serialize/deserialize on startup and BGSAVE
 
 ### Collection Stores
 
@@ -89,6 +90,7 @@ The KV store is split into 256 independent stripes, each with its own `pthread_r
 - **Direct I/O** (Linux): O_DIRECT AOF writes bypass page cache, 4KB-aligned staging buffer
 - **Per-worker AOF shards**: each reactor worker gets its own AOF file, reducing mutex contention
 - **BGSAVE**: background thread with read locks (non-blocking)
+- **HNSW snapshots**: `.vhi` files store serialized HNSW graphs alongside `.vvf` vector data
 - **Tombstone DEL**: ~25ns (flag set) vs ~140ns (full remove + free)
 
 ---
@@ -116,7 +118,7 @@ src/
 │   ├── string_intern.zig   # Type string pooling (u16 IDs, bitmask filtering)
 │   ├── property_store.zig  # Sparse property storage for nodes/edges
 │   ├── vector_store.zig    # Dual-tier vector store (f32 write buffer + f16 mmap)
-│   ├── hnsw.zig            # HNSW approximate nearest neighbor index
+│   ├── hnsw.zig            # HNSW approximate nearest neighbor index (serialize/deserialize to .vhi)
 │   ├── rag.zig             # RAG: vector search + graph BFS expansion
 │   ├── list.zig            # List data structure (LPUSH/RPUSH/LPOP/RPOP/LRANGE)
 │   ├── hash.zig            # Hash data structure (HSET/HGET/HDEL/HGETALL)

@@ -286,15 +286,18 @@ data/
 ├── vex.aof              # append-only log (unchanged)
 └── vectors/
     ├── embedding.vvf    # mmap'd vector file for "embedding" field
-    └── image_vec.vvf    # separate file per vector field
+    ├── embedding.vhi    # serialized HNSW index for "embedding" field
+    ├── image_vec.vvf    # separate file per vector field
+    └── image_vec.vhi    # separate HNSW index per vector field
 ```
 
-- **SAVE/BGSAVE**: writes .vvf files (merge write buffer + existing mmap → sorted f16 → atomic rename)
-- **Startup**: mmap .vvf files → rebuild HNSW indices from stored vectors
+- **SAVE/BGSAVE**: writes .vvf files (merge write buffer + existing mmap → sorted f16 → atomic rename) and .vhi files (serialized HNSW indices)
+- **Startup**: mmap .vvf files → load HNSW from `.vhi` (instant), fall back to rebuild from `.vvf` if missing. Write-buffer vectors from AOF replay are re-inserted into the deserialized index
 - **Crash safety**: .vvf.tmp written first, atomic rename. Crash during save leaves old .vvf intact
+- **Bounds validation**: on load, `.vvf` file size is validated against the header entry count to detect truncation or corruption
 - **Backward compatible**: no changes to .zdb format. Servers without vectors load fine
 
-HNSW indices are **rebuilt from vectors on load** (~2-5s for 100K vectors). Not persisted separately.
+HNSW indices are **serialized to `.vhi` files** during SAVE and deserialized on startup. The `.vhi` format: 40-byte header (magic, version, M, node count, entry point), followed by layer 0 neighbors, node levels, then higher-layer neighbor lists. If `.vhi` is missing or corrupt, falls back to rebuild from `.vvf` vectors (~2-5s for 100K vectors).
 
 ---
 
