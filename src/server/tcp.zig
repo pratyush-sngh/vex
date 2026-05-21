@@ -271,6 +271,8 @@ fn engineMain(shared: *EngineShared) void {
                 p.recordJobOverhead(total_ns);
             }
         }
+        // Flush AOF after each batch
+        if (shared.rt.aof) |a| a.flush();
     }
 }
 
@@ -1298,6 +1300,7 @@ fn executeInline(
     };
     const exec_t1 = std.Io.Clock.Timestamp.now(io, .awake);
     conn.protocol_version = handler.protocol_version;
+    if (rt.aof) |a| a.flush();
     rt.unlockInline();
 
     if (profile) |p| p.recordExec(span.monotonicNs(exec_t0, exec_t1));
@@ -1419,6 +1422,7 @@ fn executeHotInline(
                 const a_args = [_][]const u8{ "SET", args[1], args[2] };
                 a.logCommand(&a_args);
             }
+            a.flush();
         }
         const exec_t1 = std.Io.Clock.Timestamp.now(io, .awake);
         rt.unlockInline();
@@ -1447,6 +1451,7 @@ fn executeHotInline(
             if (rt.aof) |a| {
                 const a_args = [_][]const u8{ "DEL", args[1] };
                 a.logCommand(&a_args);
+                a.flush();
             }
         }
         const exec_t1 = std.Io.Clock.Timestamp.now(io, .awake);
@@ -1710,7 +1715,7 @@ fn tryHandleHello(args: []const []const u8, fd: posix.socket_t, conn: *ConnState
     }
     const fields = [_]struct { k: []const u8, v: []const u8 }{
         .{ .k = "server", .v = "vex" },
-        .{ .k = "version", .v = "0.6.1" },
+        .{ .k = "version", .v = @import("../root.zig").VERSION },
     };
     for (fields) |f| {
         const kh = std.fmt.bufPrint(buf[pos..], "${d}\r\n", .{f.k.len}) catch return true;

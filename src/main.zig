@@ -610,10 +610,9 @@ fn printBanner(port: u16, kv_keys: usize, graph_nodes: usize, aof_replayed: u64)
         \\    \_/   |_____| /_/\_\
         \\
         \\   KV + Graph Database
-        \\   Redis Protocol Compatible | v0.1.0
-        \\
     ;
-    std.debug.print("{s}", .{banner});
+    std.debug.print("{s}\n", .{banner});
+    std.debug.print("   Redis Protocol Compatible | v{s}\n", .{@import("root.zig").VERSION});
     std.debug.print("   Listening on port {d}\n", .{port});
     std.debug.print("   Connect with: redis-cli -p {d}\n", .{port});
 

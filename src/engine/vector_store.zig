@@ -449,6 +449,14 @@ pub const VectorStore = struct {
         const elem_size: u32 = if (dtype == DTYPE_F16) 2 else 4;
         const entry_stride = 4 + dim * elem_size;
 
+        // Validate data fits within file
+        const data_size = @as(u64, entry_stride) * @as(u64, count);
+        if (data_size + VVF_HEADER_SIZE > file_len) {
+            _ = munmap(@ptrCast(ptr), file_len);
+            _ = std.c.close(fd);
+            return error.CorruptedData;
+        }
+
         // Allocate scratch buffers
         const scratch0 = try self.allocator.alloc(f32, dim);
         const scratch1 = try self.allocator.alloc(f32, dim);

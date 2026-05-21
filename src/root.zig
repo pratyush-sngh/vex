@@ -1,3 +1,5 @@
+pub const VERSION = "0.7.0";
+
 pub const kv = @import("engine/kv.zig");
 pub const graph = @import("engine/graph.zig");
 pub const snapshot = @import("storage/snapshot.zig");

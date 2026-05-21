@@ -1577,7 +1577,7 @@ pub const Worker = struct {
         // server -> vex
         const fields = [_]struct { k: []const u8, v: []const u8 }{
             .{ .k = "server", .v = "vex" },
-            .{ .k = "version", .v = "0.6.1" },
+            .{ .k = "version", .v = @import("../root.zig").VERSION },
         };
         for (fields) |f| {
             const kh = std.fmt.bufPrint(buf[pos..], "${d}\r\n", .{f.k.len}) catch return;

@@ -295,14 +295,25 @@ pub const GraphEngine = struct {
         return vs.get(id, field);
     }
 
-    /// Save all vector fields to .vvf files. No-op if vectors not initialized.
+    /// Save all vector fields to .vvf files and HNSW indices to .vhi files.
+    /// No-op if vectors not initialized.
     pub fn saveVectors(self: *GraphEngine, data_dir: []const u8) !void {
         var vs = &(self.vec_store orelse return);
         try vs.saveAllFields(data_dir);
+
+        // Save HNSW indices alongside vectors
+        var vi = &(self.vec_indices orelse return);
+        var dir_buf: [512]u8 = undefined;
+        const vec_dir = std.fmt.bufPrint(&dir_buf, "{s}/vectors", .{data_dir}) catch return;
+        var it = vi.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.*.serialize(vec_dir, entry.key_ptr.*) catch continue;
+        }
     }
 
-    /// Load vector files from data_dir/vectors/ and rebuild HNSW indices.
-    /// Lazily initializes vector infrastructure if .vvf files exist.
+    /// Load vector files from data_dir/vectors/ and restore HNSW indices.
+    /// Tries .vhi files first (instant load), falls back to rebuild from .vvf.
+    /// After loading from .vhi, re-inserts any write-buffer vectors (AOF replay).
     pub fn loadVectors(self: *GraphEngine, data_dir: []const u8) !void {
         self.ensureVecInit();
         var vs = &self.vec_store.?;
@@ -322,25 +333,77 @@ pub const GraphEngine = struct {
             return;
         }
 
-        // Rebuild HNSW indices from loaded mmap data — parallel per field
         var vi = &self.vec_indices.?;
         const field_count = vs.field_intern.count();
 
-        // Pre-create indices (must be sequential — vi HashMap is not thread-safe)
+        // Build vector directory path
+        var vec_dir_buf: [512]u8 = undefined;
+        const vec_dir = std.fmt.bufPrint(&vec_dir_buf, "{s}/vectors", .{data_dir}) catch return;
+
+        // Track which fields were loaded from .vhi vs need rebuild
+        var loaded_from_vhi: [64]bool = [_]bool{false} ** 64;
+
+        // Try loading .vhi for each field; fall back to empty index for rebuild
         for (0..field_count) |fi| {
             if (vs.mmap_fields[fi] == null) continue;
             const field_id: u16 = @intCast(fi);
             const field_name = vs.field_intern.resolve(field_id);
             const dim = vs.field_dims[fi];
+
+            // Try .vhi first
+            if (HnswIndex.deserialize(self.allocator, vec_dir, field_name, vs, field_id)) |idx_val| {
+                if (idx_val.dim == dim) {
+                    // Replace any existing index (from AOF replay) with deserialized one
+                    const idx = self.allocator.create(HnswIndex) catch {
+                        var tmp = idx_val;
+                        tmp.deinit();
+                        continue;
+                    };
+                    idx.* = idx_val;
+
+                    if (vi.getPtr(field_name)) |val_ptr| {
+                        val_ptr.*.deinit();
+                        self.allocator.destroy(val_ptr.*);
+                        val_ptr.* = idx;
+                    } else {
+                        const owned_field = self.allocator.dupe(u8, field_name) catch {
+                            idx.deinit();
+                            self.allocator.destroy(idx);
+                            continue;
+                        };
+                        vi.put(owned_field, idx) catch {
+                            self.allocator.free(owned_field);
+                            idx.deinit();
+                            self.allocator.destroy(idx);
+                            continue;
+                        };
+                    }
+                    loaded_from_vhi[fi] = true;
+                    continue;
+                } else {
+                    // Dim mismatch — discard and fall through to rebuild
+                    var tmp = idx_val;
+                    tmp.deinit();
+                }
+            } else |_| {}
+
+            // No .vhi or failed — create empty index for rebuild
             if (!vi.contains(field_name)) {
-                const idx = try self.allocator.create(HnswIndex);
+                const idx = self.allocator.create(HnswIndex) catch continue;
                 idx.* = HnswIndex.init(self.allocator, dim, vs, field_id);
-                const owned_field = try self.allocator.dupe(u8, field_name);
-                try vi.put(owned_field, idx);
+                const owned_field = self.allocator.dupe(u8, field_name) catch {
+                    self.allocator.destroy(idx);
+                    continue;
+                };
+                vi.put(owned_field, idx) catch {
+                    self.allocator.free(owned_field);
+                    self.allocator.destroy(idx);
+                    continue;
+                };
             }
         }
 
-        // Spawn threads for HNSW insertion (each field is independent)
+        // Rebuild from mmap for fields that DON'T have .vhi
         const BuildCtx = struct {
             idx: *HnswIndex,
             node_ids: []u32,
@@ -360,8 +423,9 @@ pub const GraphEngine = struct {
 
         for (0..field_count) |fi| {
             if (vs.mmap_fields[fi] == null) continue;
+            if (loaded_from_vhi[fi]) continue; // Skip — loaded from .vhi
             const field_name = vs.field_intern.resolve(@intCast(fi));
-            const idx = vi.get(field_name).?;
+            const idx = vi.get(field_name) orelse continue;
 
             const mf = &vs.mmap_fields[fi].?;
             var node_ids = std.array_list.Managed(u32).init(self.allocator);
@@ -391,6 +455,19 @@ pub const GraphEngine = struct {
         // Join all builder threads
         for (threads[0..thread_count]) |t| {
             if (t) |thread| thread.join();
+        }
+
+        // For fields loaded from .vhi, re-insert write-buffer vectors (from AOF replay).
+        // These are vectors added since the last SAVE — the .vhi reflects state at save time.
+        var map_it = vs.map.iterator();
+        while (map_it.next()) |kv| {
+            const fid: u16 = @intCast(kv.key_ptr.* & 0xFFFF);
+            if (fid >= field_count or !loaded_from_vhi[fid]) continue;
+            const nid: u32 = @intCast(kv.key_ptr.* >> 16);
+            const fname = vs.field_intern.resolve(fid);
+            if (vi.get(fname)) |idx| {
+                idx.insert(nid) catch continue;
+            }
         }
     }
 

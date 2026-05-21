@@ -2,6 +2,16 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const VectorStore = @import("vector_store.zig").VectorStore;
 
+// libc mmap/munmap for .vhi deserialization (matches vector_store.zig pattern)
+extern "c" fn mmap(addr: ?*anyopaque, len: usize, prot: c_int, flags: c_int, fd: c_int, offset: i64) ?*anyopaque;
+extern "c" fn munmap(addr: ?*anyopaque, len: usize) c_int;
+const MAP_FAILED: *anyopaque = @ptrFromInt(std.math.maxInt(usize));
+
+const VHI_MAGIC = [4]u8{ 'V', 'X', 'H', 'I' };
+const VHI_VERSION: u8 = 1;
+const VHI_HEADER_SIZE: usize = 40;
+const VHI_NULL_NEIGHBORS: u16 = 0xFFFF;
+
 /// Hierarchical Navigable Small World graph for approximate nearest neighbor search.
 /// One instance per vector field. References VectorStore for distance computation.
 ///
@@ -174,6 +184,241 @@ pub const HnswIndex = struct {
         }
 
         return try results.toOwnedSlice();
+    }
+
+    // ── Persistence (.vhi files) ──────────────────────────────────
+
+    /// Serialize the HNSW index to a .vhi file for cold-start skip.
+    /// Writes to {dir_path}/{field_name}.vhi.tmp then atomically renames.
+    pub fn serialize(self: *const HnswIndex, dir_path: []const u8, field_name: []const u8) !void {
+        var tmp_buf: [512]u8 = undefined;
+        const tmp_path = std.fmt.bufPrintZ(&tmp_buf, "{s}/{s}.vhi.tmp", .{ dir_path, field_name }) catch return error.PathTooLong;
+
+        const fd = std.c.open(tmp_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
+        if (fd < 0) return error.FileOpenFailed;
+        defer _ = std.c.close(fd);
+
+        // ── Header (40 bytes) ──
+        var header: [VHI_HEADER_SIZE]u8 = [_]u8{0} ** VHI_HEADER_SIZE;
+        @memcpy(header[0..4], &VHI_MAGIC);
+        header[4] = VHI_VERSION;
+        header[5] = self.max_level;
+        std.mem.writeInt(u16, header[6..8], self.M, .little);
+        std.mem.writeInt(u16, header[8..10], self.M_max0, .little);
+        std.mem.writeInt(u16, header[10..12], self.ef_construction, .little);
+        std.mem.writeInt(u16, header[12..14], self.ef_search, .little);
+        std.mem.writeInt(u32, header[14..18], self.dim, .little);
+        std.mem.writeInt(u32, header[18..22], self.entry_point orelse 0xFFFFFFFF, .little);
+        std.mem.writeInt(u32, header[22..26], self.node_count, .little);
+        std.mem.writeInt(u32, header[26..30], self.capacity, .little);
+        std.mem.writeInt(u16, header[30..32], @intCast(self.higher_layers.items.len), .little);
+        std.mem.writeInt(u64, header[32..40], self.rng_state, .little);
+        _ = std.c.write(fd, &header, VHI_HEADER_SIZE);
+
+        // ── Layer 0 neighbors ──
+        // Allocate per-node buffer once: u16 count + up to M_max0 * u32 neighbors
+        const max_nbuf = 2 + @as(usize, self.M_max0) * 4;
+        const node_buf = self.allocator.alloc(u8, max_nbuf) catch return error.OutOfMemory;
+        defer self.allocator.free(node_buf);
+
+        for (0..self.capacity) |i| {
+            const maybe_neighbors: ?[]u32 = if (i < self.neighbors_l0.items.len) self.neighbors_l0.items[i] else null;
+            if (maybe_neighbors) |neighbors| {
+                std.mem.writeInt(u16, node_buf[0..2], @intCast(neighbors.len), .little);
+                for (0..neighbors.len) |j| {
+                    std.mem.writeInt(u32, node_buf[2 + j * 4 ..][0..4], neighbors[j], .little);
+                }
+                _ = std.c.write(fd, node_buf.ptr, 2 + neighbors.len * 4);
+            } else {
+                std.mem.writeInt(u16, node_buf[0..2], VHI_NULL_NEIGHBORS, .little);
+                _ = std.c.write(fd, node_buf.ptr, 2);
+            }
+        }
+
+        // ── Node levels (capacity bytes, buffered in 4K chunks) ──
+        var lvl_buf: [4096]u8 = undefined;
+        var lvl_idx: usize = 0;
+        for (0..self.capacity) |i| {
+            lvl_buf[lvl_idx] = if (i < self.node_levels.items.len) self.node_levels.items[i] else 0;
+            lvl_idx += 1;
+            if (lvl_idx == lvl_buf.len) {
+                _ = std.c.write(fd, &lvl_buf, lvl_idx);
+                lvl_idx = 0;
+            }
+        }
+        if (lvl_idx > 0) {
+            _ = std.c.write(fd, &lvl_buf, lvl_idx);
+        }
+
+        // ── Higher layers ──
+        const hl_buf = self.allocator.alloc(u8, 2 + @as(usize, self.M) * 4) catch return error.OutOfMemory;
+        defer self.allocator.free(hl_buf);
+
+        for (self.higher_layers.items) |*layer| {
+            var count_buf: [4]u8 = undefined;
+            std.mem.writeInt(u32, &count_buf, @intCast(layer.count()), .little);
+            _ = std.c.write(fd, &count_buf, 4);
+
+            var it = layer.iterator();
+            while (it.next()) |entry| {
+                var nid_buf: [4]u8 = undefined;
+                std.mem.writeInt(u32, &nid_buf, entry.key_ptr.*, .little);
+                _ = std.c.write(fd, &nid_buf, 4);
+
+                const neighbors = entry.value_ptr.*;
+                std.mem.writeInt(u16, hl_buf[0..2], @intCast(neighbors.len), .little);
+                for (0..neighbors.len) |j| {
+                    std.mem.writeInt(u32, hl_buf[2 + j * 4 ..][0..4], neighbors[j], .little);
+                }
+                _ = std.c.write(fd, hl_buf.ptr, 2 + neighbors.len * 4);
+            }
+        }
+
+        // ── Atomic rename ──
+        var final_buf: [512]u8 = undefined;
+        const final_path = std.fmt.bufPrintZ(&final_buf, "{s}/{s}.vhi", .{ dir_path, field_name }) catch return error.PathTooLong;
+        _ = std.c.rename(tmp_path, final_path);
+    }
+
+    /// Deserialize an HNSW index from a .vhi file.
+    /// Returns error if file is missing, corrupt, or version mismatch.
+    pub fn deserialize(allocator: Allocator, dir_path: []const u8, field_name: []const u8, vectors: *const VectorStore, field_id: u16) !HnswIndex {
+        var path_buf: [512]u8 = undefined;
+        const path = std.fmt.bufPrintZ(&path_buf, "{s}/{s}.vhi", .{ dir_path, field_name }) catch return error.PathTooLong;
+
+        const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+        if (fd < 0) return error.FileNotFound;
+        defer _ = std.c.close(fd);
+
+        // Get file size
+        const size = std.c.lseek(fd, 0, std.c.SEEK.END);
+        if (size < 0) return error.StatFailed;
+        _ = std.c.lseek(fd, 0, std.c.SEEK.SET);
+        const file_len: usize = @intCast(size);
+        if (file_len < VHI_HEADER_SIZE) return error.FileTooSmall;
+
+        // mmap for parsing
+        const raw_ptr = mmap(null, file_len, 1, 1, fd, 0); // PROT_READ=1, MAP_SHARED=1
+        if (raw_ptr == null or raw_ptr == MAP_FAILED) return error.MmapFailed;
+        const ptr: [*]const u8 = @ptrCast(raw_ptr.?);
+        defer _ = munmap(@constCast(@ptrCast(ptr)), file_len);
+
+        // ── Validate header ──
+        if (!std.mem.eql(u8, ptr[0..4], &VHI_MAGIC)) return error.InvalidMagic;
+        if (ptr[4] != VHI_VERSION) return error.UnsupportedVersion;
+
+        const max_level = ptr[5];
+        const M = std.mem.readInt(u16, ptr[6..8], .little);
+        const M_max0 = std.mem.readInt(u16, ptr[8..10], .little);
+        const ef_construction = std.mem.readInt(u16, ptr[10..12], .little);
+        const ef_search = std.mem.readInt(u16, ptr[12..14], .little);
+        const dim = std.mem.readInt(u32, ptr[14..18], .little);
+        const entry_point_raw = std.mem.readInt(u32, ptr[18..22], .little);
+        const entry_point: ?u32 = if (entry_point_raw == 0xFFFFFFFF) null else entry_point_raw;
+        const node_count = std.mem.readInt(u32, ptr[22..26], .little);
+        const capacity = std.mem.readInt(u32, ptr[26..30], .little);
+        const num_higher_layers = std.mem.readInt(u16, ptr[30..32], .little);
+        const rng_state = std.mem.readInt(u64, ptr[32..40], .little);
+
+        // ── Parse Layer 0 neighbors ──
+        var neighbors_l0 = std.array_list.Managed(?[]u32).init(allocator);
+        var node_levels_list = std.array_list.Managed(u8).init(allocator);
+        errdefer {
+            for (neighbors_l0.items) |maybe_list| {
+                if (maybe_list) |list| allocator.free(list);
+            }
+            neighbors_l0.deinit();
+            node_levels_list.deinit();
+        }
+
+        var off: usize = VHI_HEADER_SIZE;
+        for (0..capacity) |_| {
+            if (off + 2 > file_len) return error.UnexpectedEof;
+            const count = std.mem.readInt(u16, ptr[off..][0..2], .little);
+            off += 2;
+            if (count == VHI_NULL_NEIGHBORS) {
+                try neighbors_l0.append(null);
+            } else {
+                const nbytes = @as(usize, count) * 4;
+                if (off + nbytes > file_len) return error.UnexpectedEof;
+                const neighbors = try allocator.alloc(u32, count);
+                errdefer allocator.free(neighbors);
+                for (0..count) |j| {
+                    neighbors[j] = std.mem.readInt(u32, ptr[off + j * 4 ..][0..4], .little);
+                }
+                off += nbytes;
+                try neighbors_l0.append(neighbors);
+            }
+        }
+
+        // ── Parse node levels ──
+        if (off + capacity > file_len) return error.UnexpectedEof;
+        for (0..capacity) |_| {
+            try node_levels_list.append(ptr[off]);
+            off += 1;
+        }
+
+        // ── Parse higher layers ──
+        var higher_layers = std.array_list.Managed(std.AutoHashMap(u32, []u32)).init(allocator);
+        errdefer {
+            for (higher_layers.items) |*layer| {
+                var it = layer.iterator();
+                while (it.next()) |entry| allocator.free(entry.value_ptr.*);
+                layer.deinit();
+            }
+            higher_layers.deinit();
+        }
+
+        for (0..num_higher_layers) |_| {
+            if (off + 4 > file_len) return error.UnexpectedEof;
+            const entry_count = std.mem.readInt(u32, ptr[off..][0..4], .little);
+            off += 4;
+
+            var layer = std.AutoHashMap(u32, []u32).init(allocator);
+            errdefer {
+                var it = layer.iterator();
+                while (it.next()) |entry| allocator.free(entry.value_ptr.*);
+                layer.deinit();
+            }
+            for (0..entry_count) |_| {
+                if (off + 6 > file_len) return error.UnexpectedEof;
+                const nid = std.mem.readInt(u32, ptr[off..][0..4], .little);
+                off += 4;
+                const nc = std.mem.readInt(u16, ptr[off..][0..2], .little);
+                off += 2;
+
+                const nbytes = @as(usize, nc) * 4;
+                if (off + nbytes > file_len) return error.UnexpectedEof;
+                const neighbors = try allocator.alloc(u32, nc);
+                errdefer allocator.free(neighbors);
+                for (0..nc) |j| {
+                    neighbors[j] = std.mem.readInt(u32, ptr[off + j * 4 ..][0..4], .little);
+                }
+                off += nbytes;
+                try layer.put(nid, neighbors);
+            }
+            try higher_layers.append(layer);
+        }
+
+        return HnswIndex{
+            .allocator = allocator,
+            .dim = dim,
+            .M = M,
+            .M_max0 = M_max0,
+            .ef_construction = ef_construction,
+            .ef_search = ef_search,
+            .ml = 1.0 / @log(@as(f32, @floatFromInt(M))),
+            .max_level = max_level,
+            .entry_point = entry_point,
+            .node_count = node_count,
+            .capacity = capacity,
+            .neighbors_l0 = neighbors_l0,
+            .node_levels = node_levels_list,
+            .higher_layers = higher_layers,
+            .vectors = vectors,
+            .field_id = field_id,
+            .rng_state = rng_state,
+        };
     }
 
     // ── Internal ────────────────────────────────────────────────────
@@ -563,4 +808,65 @@ test "sorted candidates binary search insert" {
     try std.testing.expectEqual(@as(u32, 1), sc.items[0].node_id);
     try std.testing.expectEqual(@as(u32, 2), sc.items[1].node_id);
     try std.testing.expectEqual(@as(u32, 3), sc.items[2].node_id);
+}
+
+test "hnsw serialize deserialize round-trip" {
+    const allocator = std.testing.allocator;
+
+    // Clean up test files
+    defer {
+        _ = std.c.unlink("/tmp/vex_hnsw_test/emb.vhi");
+        _ = std.c.unlink("/tmp/vex_hnsw_test/emb.vhi.tmp");
+        _ = std.c.rmdir("/tmp/vex_hnsw_test");
+    }
+    _ = std.c.mkdir("/tmp/vex_hnsw_test", 0o755);
+
+    var vs = VectorStore.init(allocator);
+    defer vs.deinit();
+
+    const vecs = [_][3]f32{
+        .{ 1.0, 0.0, 0.0 }, .{ 0.9, 0.1, 0.0 }, .{ 0.0, 1.0, 0.0 },
+        .{ 0.0, 0.0, 1.0 }, .{ 0.5, 0.5, 0.0 }, .{ 0.7, 0.7, 0.0 },
+        .{ 0.1, 0.9, 0.0 }, .{ 0.0, 0.1, 0.9 }, .{ 0.8, 0.2, 0.0 },
+        .{ 0.3, 0.3, 0.3 },
+    };
+    for (vecs, 0..) |v, i| try vs.set(@intCast(i), "emb", &v);
+
+    // Build original index
+    var idx = HnswIndex.init(allocator, 3, &vs, 0);
+    defer idx.deinit();
+    for (0..10) |i| try idx.insert(@intCast(i));
+
+    // Search on original
+    var query = [_]f32{ 1.0, 0.0, 0.0 };
+    VectorStore.normalize(&query);
+    const orig_results = try idx.search(&query, 3, null);
+    defer allocator.free(orig_results);
+
+    // Serialize
+    try idx.serialize("/tmp/vex_hnsw_test", "emb");
+
+    // Deserialize into a new index
+    var idx2 = try HnswIndex.deserialize(allocator, "/tmp/vex_hnsw_test", "emb", &vs, 0);
+    defer idx2.deinit();
+
+    // Verify metadata
+    try std.testing.expectEqual(idx.dim, idx2.dim);
+    try std.testing.expectEqual(idx.node_count, idx2.node_count);
+    try std.testing.expectEqual(idx.capacity, idx2.capacity);
+    try std.testing.expectEqual(idx.max_level, idx2.max_level);
+    try std.testing.expectEqual(idx.entry_point, idx2.entry_point);
+    try std.testing.expectEqual(idx.M, idx2.M);
+    try std.testing.expectEqual(idx.M_max0, idx2.M_max0);
+    try std.testing.expectEqual(idx.rng_state, idx2.rng_state);
+
+    // Search on deserialized — should return same results
+    const deser_results = try idx2.search(&query, 3, null);
+    defer allocator.free(deser_results);
+
+    try std.testing.expectEqual(orig_results.len, deser_results.len);
+    for (0..orig_results.len) |i| {
+        try std.testing.expectEqual(orig_results[i].node_id, deser_results[i].node_id);
+        try std.testing.expectApproxEqAbs(orig_results[i].distance, deser_results[i].distance, 0.001);
+    }
 }

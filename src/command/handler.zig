@@ -1,5 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const vex_root = @import("../root.zig");
 const resp = @import("../server/resp.zig");
 const KVStore = @import("../engine/kv.zig").KVStore;
 const graph_mod = @import("../engine/graph.zig");
@@ -1758,7 +1759,7 @@ pub const CommandHandler = struct {
         try resp.serializeBulkString(w, "server");
         try resp.serializeBulkString(w, "vex");
         try resp.serializeBulkString(w, "version");
-        try resp.serializeBulkString(w, "0.6.1");
+        try resp.serializeBulkString(w, vex_root.VERSION);
         try resp.serializeBulkString(w, "proto");
         try resp.serializeInteger(w, @intFromEnum(target_proto));
         try resp.serializeBulkString(w, "id");
