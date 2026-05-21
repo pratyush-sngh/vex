@@ -47,6 +47,7 @@ pub const EngineRuntime = struct {
     graph: *GraphEngine,
     aof: ?*AOF,
     keys_mode: KeysMode,
+    data_dir: ?[]const u8,
     profile: ?*span.Profile,
     /// Lightweight spinlock for inline single-engine execution (bypass queue).
     inline_mutex: std.atomic.Mutex = .unlocked,
@@ -227,6 +228,7 @@ fn engineMain(shared: *EngineShared) void {
                         &job_db,
                         shared.rt.keys_mode,
                     );
+                    handler.data_dir = shared.rt.data_dir;
 
                     var list: std.ArrayList(u8) = .empty;
                     defer list.deinit(shared.rt.allocator);
@@ -788,6 +790,7 @@ pub const Server = struct {
     repl_follower: ?*@import("../cluster/replication.zig").ReplicationFollower,
     repl_leader: ?*@import("../cluster/replication.zig").ReplicationLeader,
     unixsocket: ?[]const u8,
+    data_dir: ?[]const u8,
     active_connections: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     pub fn init(
@@ -810,6 +813,7 @@ pub const Server = struct {
         repl_follower: ?*@import("../cluster/replication.zig").ReplicationFollower,
         repl_leader: ?*@import("../cluster/replication.zig").ReplicationLeader,
         unixsocket: ?[]const u8,
+        data_dir: ?[]const u8,
     ) !Server {
         const resolved = try std.Io.net.IpAddress.resolve(io, host, port);
         const bind_address: std.Io.net.IpAddress = switch (resolved) {
@@ -839,6 +843,7 @@ pub const Server = struct {
             .repl_follower = repl_follower,
             .repl_leader = repl_leader,
             .unixsocket = unixsocket,
+            .data_dir = data_dir,
         };
     }
 
@@ -907,6 +912,7 @@ pub const Server = struct {
                 .graph = self.graph,
                 .aof = if (i == 0) self.aof else if (shard_aofs) |arr| &arr[i - 1] else null,
                 .keys_mode = self.keys_mode,
+                .data_dir = self.data_dir,
                 .profile = self.profile,
             };
             shared_arr[i] = .{
@@ -1090,6 +1096,7 @@ pub const Server = struct {
                 &sorted_set_store,
                 &ds_locks,
                 &watch_map,
+                self.data_dir,
             );
         }
 
@@ -1286,6 +1293,7 @@ fn executeInline(
         selected_db,
         rt.keys_mode,
     );
+    handler.data_dir = rt.data_dir;
     handler.protocol_version = conn.protocol_version;
 
     var list: std.ArrayList(u8) = .empty;

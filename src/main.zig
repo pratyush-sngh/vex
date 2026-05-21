@@ -358,6 +358,7 @@ pub fn main(init: std.process.Init) !void {
         if (repl_follower) |*rf| rf else null,
         if (repl_leader) |*rl| rl else null,
         config.unixsocket,
+        if (config.no_persistence) null else config.data_dir,
     );
     if (config.reactor) {
         server.runReactor(config.workers, &shutdown_requested) catch |err| {

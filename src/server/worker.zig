@@ -346,6 +346,7 @@ pub const Worker = struct {
     sorted_set_store: ?*SortedSetStore,
     ds_locks: ?*DsStripeLocks, // striped rwlocks for list/hash/set/zset stores
     watch_map: ?*WatchMap,
+    data_dir: ?[]const u8,
     new_fds: [MAX_NEW_FDS]i32,
     new_fd_head: std.atomic.Value(usize),
     new_fd_tail: std.atomic.Value(usize),
@@ -380,6 +381,7 @@ pub const Worker = struct {
         sorted_set_store: ?*SortedSetStore,
         ds_locks: ?*DsStripeLocks,
         watch_map: ?*WatchMap,
+        data_dir: ?[]const u8,
     ) !Worker {
         return .{
             .id = id,
@@ -409,6 +411,7 @@ pub const Worker = struct {
             .sorted_set_store = sorted_set_store,
             .ds_locks = ds_locks,
             .watch_map = watch_map,
+            .data_dir = data_dir,
             .new_fds = @splat(-1),
             .new_fd_head = std.atomic.Value(usize).init(0),
             .new_fd_tail = std.atomic.Value(usize).init(0),
@@ -1755,6 +1758,7 @@ pub const Worker = struct {
                 &selected_db, self.keys_mode,
             );
             handler.ckv = self.ckv;
+            handler.data_dir = self.data_dir;
             handler.protocol_version = conn.protocol_version;
             var list: std.ArrayList(u8) = .empty;
             defer list.deinit(self.allocator);
@@ -2658,6 +2662,7 @@ pub const Worker = struct {
             self.keys_mode,
         );
         handler.ckv = self.ckv;
+        handler.data_dir = self.data_dir;
         handler.list_store = self.list_store;
         handler.hash_store = self.hash_store;
         handler.set_store = self.set_store;
