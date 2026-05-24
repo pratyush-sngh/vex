@@ -1,6 +1,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const VectorStore = @import("vector_store.zig").VectorStore;
+const atomic_io = @import("../storage/atomic_io.zig");
+const vex_log = @import("../log.zig");
 
 // libc mmap/munmap for .vhi deserialization (matches vector_store.zig pattern)
 extern "c" fn mmap(addr: ?*anyopaque, len: usize, prot: c_int, flags: c_int, fd: c_int, offset: i64) ?*anyopaque;
@@ -274,10 +276,24 @@ pub const HnswIndex = struct {
             }
         }
 
+        // fsync the tmp file before rename so the data is durable on disk
+        // (otherwise the rename's directory entry may land before the data).
+        atomic_io.fsyncFile(fd) catch |err| {
+            vex_log.warn("hnsw: fsync tmp .vhi failed: {s}", .{@errorName(err)});
+        };
+
         // ── Atomic rename ──
         var final_buf: [512]u8 = undefined;
         const final_path = std.fmt.bufPrintSentinel(&final_buf, "{s}/{s}.vhi", .{ dir_path, field_name }, 0) catch return error.PathTooLong;
-        _ = std.c.rename(tmp_path, final_path);
+        if (std.c.rename(tmp_path, final_path) != 0) {
+            vex_log.warn("hnsw: rename to .vhi failed", .{});
+            return error.RenameFailed;
+        }
+
+        // fsync the parent directory so the rename itself survives a power loss.
+        atomic_io.fsyncDir(self.allocator, final_path) catch |err| {
+            vex_log.warn("hnsw: fsync dir failed: {s}", .{@errorName(err)});
+        };
     }
 
     /// Deserialize an HNSW index from a .vhi file.

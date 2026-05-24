@@ -510,22 +510,67 @@ pub const AOF = struct {
             tmp_aof.logCommand(&args);
         }
 
-        // Atomic rename: replace old AOF with rewritten one
+        // Atomic rename: replace old AOF with rewritten one.
+        // Critical section: hold self.mutex so no concurrent flush can sneak
+        // in between merging the in-flight group_buf and the rename. The
+        // in-flight bytes get appended to the tmp file before rename so
+        // logCommand calls that happened during the rewrite aren't lost.
         _ = c.pthread_mutex_lock(&self.mutex);
         defer _ = c.pthread_mutex_unlock(&self.mutex);
 
-        // Close current file, rename tmp over it, reopen
+        // 1. Append any in-flight self.group_buf to the tmp file. Without
+        //    this, mutations recorded during the long rewrite phase would
+        //    be silently dropped when we rename tmp over self.path.
+        if (self.group_buf_inited and self.group_buf.items.len > 0) {
+            var tmp_fw = std.Io.File.writer(tmp_file, self.io, &self.file_write_buf);
+            const tmp_len = tmp_file.length(self.io) catch 0;
+            tmp_fw.seekTo(tmp_len) catch {
+                vex_log.warn("aof rewrite: seek tmp failed", .{});
+            };
+            const w = &tmp_fw.interface;
+            w.writeAll(self.group_buf.items) catch |err| {
+                vex_log.warn("aof rewrite: merge in-flight failed: {s}", .{@errorName(err)});
+            };
+            w.flush() catch |err| {
+                vex_log.warn("aof rewrite: flush tmp failed: {s}", .{@errorName(err)});
+            };
+            self.group_buf.clearRetainingCapacity();
+        }
+
+        // 2. fsync the tmp file so the data is durable on disk before rename.
+        atomic_io.fsyncFile(tmp_file.handle) catch |err| {
+            vex_log.warn("aof rewrite: fsync tmp failed: {s}", .{@errorName(err)});
+        };
+
+        // 3. Close the old AOF file, rename tmp over it, reopen.
         self.file.close(self.io);
         const old_path_z = allocator.dupeSentinel(u8, self.path, 0) catch return;
         defer allocator.free(old_path_z);
         const tmp_path_z = allocator.dupeSentinel(u8, tmp_path, 0) catch return;
         defer allocator.free(tmp_path_z);
-        _ = c.rename(tmp_path_z, old_path_z);
+        if (c.rename(tmp_path_z, old_path_z) != 0) {
+            vex_log.err("aof rewrite: rename failed", .{});
+            // Try to reopen the old file so the AOF isn't left in a broken state.
+            self.file = std.Io.Dir.cwd().createFile(self.io, self.path, .{
+                .truncate = false,
+                .read = true,
+            }) catch return;
+            return;
+        }
 
         self.file = std.Io.Dir.cwd().createFile(self.io, self.path, .{
             .truncate = false,
             .read = true,
         }) catch return;
+
+        // 4. file_offset must be reset to the size of the new (rewritten) file
+        //    so future appends land at the correct position.
+        self.file_offset = self.file.length(self.io) catch 0;
+
+        // 5. fsync the parent directory so the rename itself is durable.
+        atomic_io.fsyncDir(allocator, self.path) catch |err| {
+            vex_log.warn("aof rewrite: fsync dir failed: {s}", .{@errorName(err)});
+        };
     }
 };
 

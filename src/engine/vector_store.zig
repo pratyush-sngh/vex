@@ -1,6 +1,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const StringIntern = @import("string_intern.zig").StringIntern;
+const atomic_io = @import("../storage/atomic_io.zig");
+const vex_log = @import("../log.zig");
 // libc mmap/munmap (avoid Zig 0.16 platform-specific wrappers)
 extern "c" fn mmap(addr: ?*anyopaque, len: usize, prot: c_int, flags: c_int, fd: c_int, offset: i64) ?*anyopaque;
 extern "c" fn munmap(addr: ?*anyopaque, len: usize) c_int;
@@ -369,10 +371,23 @@ pub const VectorStore = struct {
             }
         }
 
+        // fsync the tmp file before rename so the data is durable on disk.
+        atomic_io.fsyncFile(fd) catch |err| {
+            vex_log.warn("vvf: fsync tmp file failed: {s}", .{@errorName(err)});
+        };
+
         // Atomic rename
         var final_buf: [512]u8 = undefined;
         const final_path = std.fmt.bufPrintSentinel(&final_buf, "{s}/{s}.vvf", .{ vec_dir, field_name }, 0) catch return;
-        _ = std.c.rename(tmp_path, final_path);
+        if (std.c.rename(tmp_path, final_path) != 0) {
+            vex_log.warn("vvf: rename failed", .{});
+            return;
+        }
+
+        // fsync the parent directory so the rename itself survives a power loss.
+        atomic_io.fsyncDir(self.allocator, final_path) catch |err| {
+            vex_log.warn("vvf: fsync dir failed: {s}", .{@errorName(err)});
+        };
     }
 
     /// Load all .vvf files from {data_dir}/vectors/ via mmap.
