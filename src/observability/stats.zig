@@ -170,6 +170,15 @@ pub var connected_clients: std.atomic.Value(u32) = std.atomic.Value(u32).init(0)
 /// startup, read by INFO for `uptime_in_seconds`.
 pub var start_time_ms: i64 = 0;
 
+/// Set to true when the AOF flush path encountered an unrecoverable I/O
+/// error (ENOSPC, EIO, etc.) and we can no longer guarantee durability.
+/// Dispatch checks this and rejects write commands with -MISCONF; reads
+/// continue. Cleared by CONFIG SET appendfsync no, or by restart after
+/// the underlying issue is resolved.
+pub var persistence_broken: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+/// Errno from the last fatal persistence failure (exposed via INFO).
+pub var persistence_broken_errno: std.atomic.Value(i32) = std.atomic.Value(i32).init(0);
+
 /// Global registry. Populated at worker init via `register()`.
 /// Read by INFO and (later) /metrics.
 var workers_buf: [MAX_WORKERS]*WorkerStats = undefined;

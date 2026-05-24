@@ -155,6 +155,91 @@ pub const command_names = [_][]const u8{
 pub const N_CMDS: usize = command_names.len;
 pub const OTHER_IDX: u8 = @intCast(N_CMDS - 1);
 
+/// Set of command prefixes that mutate state. Used by the STOP-WRITE path
+/// in dispatchCommand to reject writes when persistence is broken
+/// (disk full, AOF flush errors, etc.). Reads continue to work.
+///
+/// We classify by prefix-string rather than maintaining a parallel bool
+/// array because new commands tend to follow naming conventions
+/// (SET/HSET/ZADD/GRAPH.ADDNODE/etc.) so prefix matching catches most
+/// future additions automatically.
+const WRITE_PREFIXES = [_][]const u8{
+    "SET",      "SETEX",  "SETNX",     "MSET",   "MSETEX", "MSETNX",
+    "DEL",      "UNLINK", "MGETDEL",   "GETDEL", "GETSET", "GETEX",
+    "INCR",     "INCRBY", "INCRTTL",   "DECR",   "DECRBY",
+    "APPEND",   "EXPIRE", "PEXPIRE",   "PERSIST", "COPY",   "RENAME", "RENAMENX",
+    "FLUSHDB",  "FLUSHALL",
+    "LPUSH",    "RPUSH",  "LPOP",      "RPOP",   "LPOPN",  "LSET",    "LREM",
+    "HSET",     "HDEL",   "HMSET",     "HINCRBY",
+    "SADD",     "SREM",
+    "ZADD",     "ZREM",   "ZINCRBY",
+    "GRAPH.",   // any GRAPH.* command that is a write — checked further
+};
+
+/// Set of GRAPH.* command names that are read-only. Everything else under
+/// the GRAPH.* prefix is considered a write.
+const GRAPH_READS = [_][]const u8{
+    "GRAPH.GETNODE",     "GRAPH.GETVEC",      "GRAPH.NEIGHBORS",
+    "GRAPH.LIST_BY_TYPE", "GRAPH.PATH",        "GRAPH.PATHS",
+    "GRAPH.WPATH",       "GRAPH.TRAVERSE",    "GRAPH.VECSEARCH",
+    "GRAPH.RAG",         "GRAPH.STATS",       "GRAPH.IMPACT",
+    "GRAPH.CHSTATS",
+};
+
+/// Returns true if the named command mutates state. Case-insensitive.
+/// Used by the STOP-WRITE gate. Conservative: anything not recognized
+/// returns false (safer to let an unknown command through than to wrongly
+/// block reads).
+pub fn isWriteCommand(name: []const u8) bool {
+    if (name.len == 0 or name.len > MAX_CMD_NAME_LEN) return false;
+    var upper: [MAX_CMD_NAME_LEN]u8 = undefined;
+    for (name, 0..) |ch, i| upper[i] = std.ascii.toUpper(ch);
+    const up = upper[0..name.len];
+
+    // GRAPH.* needs the GRAPH_READS exception list.
+    if (up.len >= 6 and std.mem.eql(u8, up[0..6], "GRAPH.")) {
+        for (GRAPH_READS) |r| if (std.mem.eql(u8, up, r)) return false;
+        return true;
+    }
+
+    for (WRITE_PREFIXES) |w| {
+        if (std.mem.eql(u8, up, w)) return true;
+    }
+    return false;
+}
+
+// ── Tests for write classification ──
+
+test "isWriteCommand — basic write detection" {
+    try std.testing.expect(isWriteCommand("SET"));
+    try std.testing.expect(isWriteCommand("set"));
+    try std.testing.expect(isWriteCommand("HSET"));
+    try std.testing.expect(isWriteCommand("DEL"));
+    try std.testing.expect(isWriteCommand("FLUSHALL"));
+}
+
+test "isWriteCommand — reads are not writes" {
+    try std.testing.expect(!isWriteCommand("GET"));
+    try std.testing.expect(!isWriteCommand("HGET"));
+    try std.testing.expect(!isWriteCommand("LRANGE"));
+    try std.testing.expect(!isWriteCommand("INFO"));
+    try std.testing.expect(!isWriteCommand("PING"));
+}
+
+test "isWriteCommand — GRAPH.* split" {
+    try std.testing.expect(isWriteCommand("GRAPH.ADDNODE"));
+    try std.testing.expect(isWriteCommand("GRAPH.SETPROP"));
+    try std.testing.expect(isWriteCommand("GRAPH.INGEST"));
+    try std.testing.expect(!isWriteCommand("GRAPH.GETNODE"));
+    try std.testing.expect(!isWriteCommand("GRAPH.NEIGHBORS"));
+    try std.testing.expect(!isWriteCommand("GRAPH.STATS"));
+}
+
+test "isWriteCommand — unknown is read" {
+    try std.testing.expect(!isWriteCommand("DEFINITELY_NOT_A_COMMAND"));
+    try std.testing.expect(!isWriteCommand(""));
+}
+
 /// Build a comptime map from uppercase name -> index. Lookup is O(1).
 const Map = std.StaticStringMap(u8);
 

@@ -1868,6 +1868,8 @@ pub const CommandHandler = struct {
             try aw.writer.print("aof_buffer_length:{d}\r\n", .{if (a.group_buf_inited) a.group_buf.items.len else @as(usize, 0)});
             try aw.writer.print("aof_fsync_mode:{s}\r\n", .{a.fsync_mode.label()});
             try aw.writer.print("aof_last_fsync:{d}\r\n", .{@divTrunc(a.lastFsyncMs(), 1000)});
+            const broken = obs_stats.persistence_broken.load(.monotonic);
+            try aw.writer.print("aof_last_write_status:{s}\r\n", .{if (broken) "err" else "ok"});
             try aw.writer.print("last_save_time:{d}\r\n", .{@divTrunc(a.last_save_time, 1000)});
         } else {
             try aw.writer.writeAll("aof_enabled:0\r\n");

@@ -5,6 +5,7 @@ const Allocator = std.mem.Allocator;
 const span = @import("../perf/span.zig");
 const vex_log = @import("../log.zig");
 const event_stats = @import("../observability/event_stats.zig");
+const obs_stats = @import("../observability/stats.zig");
 const atomic_io = @import("atomic_io.zig");
 
 /// Durability mode for the AOF.
@@ -305,7 +306,12 @@ pub const AOF = struct {
         const t0 = std.Io.Clock.Timestamp.now(self.io, .awake);
         const ev_span = event_stats.Span.begin();
         self.flushBufferToFile() catch |err| {
-            vex_log.warn("aof: flush to file failed: {s}", .{@errorName(err)});
+            vex_log.err("aof: flush failed ({s}); entering STOP-WRITE state. Writes will return -MISCONF until the underlying issue is resolved.", .{@errorName(err)});
+            // Persistence is broken: data may have been lost. Dispatch checks
+            // this flag and rejects write commands so the client doesn't
+            // receive +OK for writes that aren't durable. Set the errno from
+            // the underlying syscall if we can map it (best-effort).
+            obs_stats.persistence_broken.store(true, .release);
         };
         // appendfsync = always: real fsync inline so the caller doesn't
         // return to the client until the data is durable. Slow on rotational

@@ -938,6 +938,15 @@ pub const Worker = struct {
         const cmd_idx = cmd_table.lookup(args[0]);
         self.stats.recordCall(cmd_idx);
 
+        // STOP-WRITE gate: when persistence is broken (e.g. AOF flush hit
+        // ENOSPC), reject writes with Redis-shaped -MISCONF so the client
+        // doesn't get +OK for data that won't be durable. One atomic load
+        // per command — same cost class as the timing check below.
+        if (stats_mod.persistence_broken.load(.monotonic) and cmd_table.isWriteCommand(args[0])) {
+            conn.write_buf.appendSlice("-MISCONF Errors writing to the AOF file: persistence is in STOP-WRITE state. CONFIG SET appendfsync no to bypass, or restart after fixing the underlying issue.\r\n") catch {};
+            return;
+        }
+
         // Refresh per-connection CLIENT LIST metadata (cheap field writes).
         conn.view.last_cmd_idx = cmd_idx;
         conn.view.last_interaction_ts_ms = nowMillisAccept();
@@ -1611,6 +1620,13 @@ pub const Worker = struct {
             };
             const mode = aof_mod.FsyncMode.parse(value);
             a.setFsyncMode(self.allocator, mode);
+            // Switching to `no` is the documented escape hatch out of
+            // STOP-WRITE: the operator is explicitly choosing reduced
+            // durability so we can accept writes again.
+            if (mode == .no and stats_mod.persistence_broken.load(.monotonic)) {
+                stats_mod.persistence_broken.store(false, .release);
+                vex_log.warn("aof: STOP-WRITE state cleared by CONFIG SET appendfsync no", .{});
+            }
             vex_log.info("aof: appendfsync changed to {s} via CONFIG SET", .{mode.label()});
             conn.write_buf.appendSlice("+OK\r\n") catch {};
             return;
