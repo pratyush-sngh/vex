@@ -1201,6 +1201,14 @@ pub const Worker = struct {
         if (self.hash_store) |hs| hs.flush();
         if (self.set_store) |ss| ss.flush();
         if (self.sorted_set_store) |zs| zs.flush();
+        // Reset the graph engine under its write lock. The hot-path bypasses the
+        // CommandHandler entirely, so without this FLUSHALL/FLUSHDB would leave
+        // graph nodes/edges/properties intact and the next ADDNODE would surface
+        // DuplicateNode errors.
+        _ = std.c.pthread_rwlock_wrlock(self.graph_rwlock);
+        defer _ = std.c.pthread_rwlock_unlock(self.graph_rwlock);
+        self.graph.deinit();
+        self.graph.* = GraphEngine.init(self.allocator);
     }
 
     // ── WATCH/UNWATCH ─────────────────────────────────────────────────
