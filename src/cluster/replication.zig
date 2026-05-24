@@ -1,22 +1,16 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const protocol = @import("protocol.zig");
+const vex_log = @import("../log.zig");
 const config_mod = @import("config.zig");
 const ClusterConfig = config_mod.ClusterConfig;
 const ClusterNode = config_mod.ClusterNode;
-const vex_log = @import("../log.zig");
 
 fn nowMs() i64 {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
     return @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
 }
-
-/// Process-wide handles for INFO/observability readers. main.zig publishes
-/// these at startup; readers (cmdInfo) load via `@atomicLoad`.
-/// Either or both may be null in standalone mode.
-pub var current_leader_ptr: std.atomic.Value(?*ReplicationLeader) = std.atomic.Value(?*ReplicationLeader).init(null);
-pub var current_follower_ptr: std.atomic.Value(?*ReplicationFollower) = std.atomic.Value(?*ReplicationFollower).init(null);
 
 /// Leader-side replication: accepts follower connections and streams mutations.
 /// Callback type for executing a forwarded write command on the leader.
@@ -27,6 +21,12 @@ pub const GetSnapshotFn = *const fn (allocator: Allocator) ?[]u8;
 
 pub const HEARTBEAT_INTERVAL_MS: i64 = 5000; // 5 seconds
 pub const HEARTBEAT_TIMEOUT_MS: i64 = 15000; // 3 missed heartbeats = leader dead
+
+/// Process-wide handles for INFO/observability readers. main.zig publishes
+/// these at startup; readers (cmdInfo) load via `@atomicLoad`. Either or
+/// both may be null in standalone mode.
+pub var current_leader_ptr: std.atomic.Value(?*ReplicationLeader) = std.atomic.Value(?*ReplicationLeader).init(null);
+pub var current_follower_ptr: std.atomic.Value(?*ReplicationFollower) = std.atomic.Value(?*ReplicationFollower).init(null);
 
 /// Probe if any other node in the cluster is already acting as leader.
 /// Tries connecting to each node's replication port (base_port + 10000).
@@ -55,7 +55,7 @@ pub fn probeForLeader(allocator: Allocator, config: *const config_mod.ClusterCon
 
         if (std.c.connect(sock, @ptrCast(&addr), @sizeOf(std.c.sockaddr.in)) >= 0) {
             _ = std.c.close(sock);
-            vex_log.info("failover: found active leader node {d} at {s}:{d}", .{ node.id, node.host, repl_port });
+            vex_log.info("failover: found active leader: node {d} at {s}:{d}", .{ node.id, node.host, repl_port });
             return node;
         }
         _ = std.c.close(sock);
@@ -63,11 +63,112 @@ pub fn probeForLeader(allocator: Allocator, config: *const config_mod.ClusterCon
     return null;
 }
 
+/// Outbox item: a buffered frame waiting to be written by the drain thread.
+/// `payload` is an owned slice allocated by the enqueuer; the drain thread
+/// frees it after attempting to write.
+const OutboxItem = struct {
+    frame_type: protocol.FrameType,
+    payload: []u8,
+};
+
+/// Per-follower state. Owned by the leader; each follower has a dedicated
+/// drain thread that pulls from `outbox` and writes to `fd`.
+pub const FollowerState = struct {
+    fd: i32,
+    addr: [47:0]u8, // textual "ip:port" snapshot, NUL-padded
+    addr_len: u8,
+    connected_ts_ms: i64,
+    /// Bounded outbox queue. Each item's `payload` is an owned byte slice.
+    outbox: std.array_list.Managed(OutboxItem),
+    outbox_mutex: std.c.pthread_mutex_t,
+    outbox_cond: std.c.pthread_cond_t,
+    outbox_max: u32,
+    outbox_dropped: u64,
+    /// Set to true while the drain thread is alive. When the drain thread
+    /// errors (write failed), it sets this to false and the leader reaps the
+    /// follower on the next broadcast/heartbeat pass.
+    running: std.atomic.Value(bool),
+    drain_thread: ?std.Thread,
+    allocator: Allocator,
+
+    fn addrSlice(self: *const FollowerState) []const u8 {
+        return self.addr[0..self.addr_len];
+    }
+};
+
+const DEFAULT_OUTBOX_MAX: u32 = 1024;
+
+/// Format an IPv4 sockaddr into "ip:port" text. Returns the byte length.
+fn formatAddr(buf: *[47:0]u8, sa: *const std.c.sockaddr.in) u8 {
+    const a = std.mem.toBytes(sa.addr); // raw 4 bytes, network order on the wire,
+    // but `sa.addr` is host-endian-unsigned holding the network-order pattern
+    // exactly as filled by accept(2). We just print the bytes in order.
+    const port = std.mem.bigToNative(u16, sa.port);
+    const written = std.fmt.bufPrint(buf[0..47], "{d}.{d}.{d}.{d}:{d}", .{
+        a[0], a[1], a[2], a[3], port,
+    }) catch {
+        const fallback = "?:?";
+        @memcpy(buf[0..fallback.len], fallback);
+        buf[fallback.len] = 0;
+        return @intCast(fallback.len);
+    };
+    buf[written.len] = 0;
+    return @intCast(written.len);
+}
+
+/// Allocate and initialize a FollowerState. Caller is responsible for
+/// starting its drain thread and inserting it into the leader's list.
+fn createFollowerState(allocator: Allocator, fd: i32, outbox_max: u32) !*FollowerState {
+    const state = try allocator.create(FollowerState);
+    var addr_buf: [47:0]u8 = undefined;
+    @memset(addr_buf[0..47], 0);
+    addr_buf[47] = 0;
+    state.* = .{
+        .fd = fd,
+        .addr = addr_buf,
+        .addr_len = 0,
+        .connected_ts_ms = nowMs(),
+        .outbox = std.array_list.Managed(OutboxItem).init(allocator),
+        .outbox_mutex = std.c.PTHREAD_MUTEX_INITIALIZER,
+        .outbox_cond = std.c.PTHREAD_COND_INITIALIZER,
+        .outbox_max = outbox_max,
+        .outbox_dropped = 0,
+        .running = std.atomic.Value(bool).init(true),
+        .drain_thread = null,
+        .allocator = allocator,
+    };
+
+    // Capture peer address. Best-effort; failure leaves addr empty.
+    var sa: std.c.sockaddr.in = undefined;
+    var sa_len: std.c.socklen_t = @sizeOf(std.c.sockaddr.in);
+    if (std.c.getpeername(fd, @ptrCast(&sa), &sa_len) == 0) {
+        state.addr_len = formatAddr(&state.addr, &sa);
+    }
+
+    return state;
+}
+
+/// Free a follower state. Caller must ensure the drain thread is joined and
+/// the fd is closed before calling.
+fn destroyFollowerState(state: *FollowerState) void {
+    // Drain any remaining outbox items
+    for (state.outbox.items) |item| {
+        if (item.payload.len > 0) state.allocator.free(item.payload);
+    }
+    state.outbox.deinit();
+    _ = std.c.pthread_cond_destroy(&state.outbox_cond);
+    // pthread_mutex_destroy not strictly needed for static-init mutex on macOS,
+    // but kept for hygiene if pthread tracks it.
+    _ = std.c.pthread_mutex_destroy(&state.outbox_mutex);
+    state.allocator.destroy(state);
+}
+
 pub const ReplicationLeader = struct {
     allocator: Allocator,
     config: *const ClusterConfig,
     listen_port: u16,
-    follower_fds: std.array_list.Managed(i32),
+    /// Connected followers. Each entry is heap-allocated; the leader owns it.
+    followers: std.array_list.Managed(*FollowerState),
     mutex: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
     running: std.atomic.Value(bool),
     listener_thread: ?std.Thread,
@@ -84,7 +185,7 @@ pub const ReplicationLeader = struct {
             .allocator = allocator,
             .config = conf,
             .listen_port = base_port + 10000,
-            .follower_fds = std.array_list.Managed(i32).init(allocator),
+            .followers = std.array_list.Managed(*FollowerState).init(allocator),
             .running = std.atomic.Value(bool).init(false),
             .listener_thread = null,
             .heartbeat_thread = null,
@@ -97,13 +198,33 @@ pub const ReplicationLeader = struct {
 
     pub fn deinit(self: *ReplicationLeader) void {
         self.stop();
-        // Close follower connections
+
+        // Take ownership of the followers list under the lock so no one else
+        // mutates it while we are tearing down.
         _ = std.c.pthread_mutex_lock(&self.mutex);
-        for (self.follower_fds.items) |fd| {
-            _ = std.c.close(fd);
-        }
+        const states = self.followers.toOwnedSlice() catch &[_]*FollowerState{};
         _ = std.c.pthread_mutex_unlock(&self.mutex);
-        self.follower_fds.deinit();
+
+        // Signal every drain thread to stop, then join them.
+        for (states) |state| {
+            state.running.store(false, .release);
+            _ = std.c.pthread_mutex_lock(&state.outbox_mutex);
+            _ = std.c.pthread_cond_broadcast(&state.outbox_cond);
+            _ = std.c.pthread_mutex_unlock(&state.outbox_mutex);
+        }
+        for (states) |state| {
+            if (state.drain_thread) |t| {
+                t.join();
+                state.drain_thread = null;
+            }
+            if (state.fd >= 0) {
+                _ = std.c.close(state.fd);
+                state.fd = -1;
+            }
+            destroyFollowerState(state);
+        }
+        if (states.len > 0) self.allocator.free(states);
+        self.followers.deinit();
     }
 
     pub fn start(self: *ReplicationLeader) !void {
@@ -124,25 +245,122 @@ pub const ReplicationLeader = struct {
         }
     }
 
-    /// Broadcast an AOF record to all connected followers.
-    /// Called by the leader after executing a write command.
-    pub fn broadcastMutation(self: *ReplicationLeader, aof_record: []const u8) void {
-        _ = self.mutation_seq.fetchAdd(1, .monotonic);
-        _ = std.c.pthread_mutex_lock(&self.mutex);
-        defer _ = std.c.pthread_mutex_unlock(&self.mutex);
+    /// Reap any followers whose drain thread has exited (running=false) or
+    /// have been explicitly flagged for disconnection. Must be called WITHOUT
+    /// holding `self.mutex`; takes the lock internally.
+    fn reapDeadFollowers(self: *ReplicationLeader) void {
+        var to_destroy = std.array_list.Managed(*FollowerState).init(self.allocator);
+        defer to_destroy.deinit();
 
+        _ = std.c.pthread_mutex_lock(&self.mutex);
         var i: usize = 0;
-        while (i < self.follower_fds.items.len) {
-            const fd = self.follower_fds.items[i];
-            vex_log.debug("repl-leader: broadcasting to fd={d} len={d}", .{ fd, aof_record.len });
-            protocol.writeFrame(fd, .repl_data, aof_record) catch |err| {
-                vex_log.warn("repl-leader: broadcast to fd={d} failed ({s}); closing follower", .{ fd, @errorName(err) });
-                _ = std.c.close(fd);
-                _ = self.follower_fds.swapRemove(i);
+        while (i < self.followers.items.len) {
+            const state = self.followers.items[i];
+            if (!state.running.load(.acquire)) {
+                _ = self.followers.swapRemove(i);
+                _ = self.follower_count.fetchSub(1, .monotonic);
+                to_destroy.append(state) catch {};
                 continue;
-            };
+            }
             i += 1;
         }
+        _ = std.c.pthread_mutex_unlock(&self.mutex);
+
+        for (to_destroy.items) |state| {
+            // Ensure drain thread is fully done. It already set running=false,
+            // but join to release thread resources.
+            _ = std.c.pthread_mutex_lock(&state.outbox_mutex);
+            _ = std.c.pthread_cond_broadcast(&state.outbox_cond);
+            _ = std.c.pthread_mutex_unlock(&state.outbox_mutex);
+            if (state.drain_thread) |t| {
+                t.join();
+                state.drain_thread = null;
+            }
+            if (state.fd >= 0) {
+                _ = std.c.close(state.fd);
+                state.fd = -1;
+            }
+            vex_log.info("repl-leader: removed follower {s} (drain ended)", .{state.addrSlice()});
+            destroyFollowerState(state);
+        }
+    }
+
+    /// Enqueue a frame to a single follower's outbox. Returns true on success,
+    /// false if the outbox is full (caller should disconnect the follower).
+    /// Must be called WITHOUT holding `self.mutex`.
+    fn enqueueToFollower(
+        self: *ReplicationLeader,
+        state: *FollowerState,
+        frame_type: protocol.FrameType,
+        payload: []const u8,
+    ) bool {
+        _ = self;
+        // Dupe the payload first (outside the lock) to keep the critical section short.
+        const dup = state.allocator.dupe(u8, payload) catch {
+            vex_log.warn("repl-leader: outbox enqueue OOM for follower {s}", .{state.addrSlice()});
+            return false;
+        };
+
+        _ = std.c.pthread_mutex_lock(&state.outbox_mutex);
+        if (state.outbox.items.len >= state.outbox_max) {
+            state.outbox_dropped += 1;
+            const dropped = state.outbox_dropped;
+            _ = std.c.pthread_mutex_unlock(&state.outbox_mutex);
+            state.allocator.free(dup);
+            vex_log.warn(
+                "repl-leader: follower {s} outbox full ({d} items), dropping frame and disconnecting (dropped_total={d})",
+                .{ state.addrSlice(), state.outbox_max, dropped },
+            );
+            return false;
+        }
+        state.outbox.append(.{ .frame_type = frame_type, .payload = dup }) catch {
+            _ = std.c.pthread_mutex_unlock(&state.outbox_mutex);
+            state.allocator.free(dup);
+            vex_log.warn("repl-leader: outbox append failed for follower {s}", .{state.addrSlice()});
+            return false;
+        };
+        _ = std.c.pthread_cond_signal(&state.outbox_cond);
+        _ = std.c.pthread_mutex_unlock(&state.outbox_mutex);
+        return true;
+    }
+
+    /// Broadcast an AOF record to all connected followers.
+    /// Called by the leader after executing a write command.
+    /// This is non-blocking: each follower receives a copy of the frame in
+    /// its private outbox; a dedicated drain thread per follower performs
+    /// the actual socket write.
+    pub fn broadcastMutation(self: *ReplicationLeader, aof_record: []const u8) void {
+        _ = self.mutation_seq.fetchAdd(1, .monotonic);
+
+        // Snapshot the followers list under the lock, then release immediately.
+        _ = std.c.pthread_mutex_lock(&self.mutex);
+        const snapshot = self.allocator.alloc(*FollowerState, self.followers.items.len) catch {
+            _ = std.c.pthread_mutex_unlock(&self.mutex);
+            return;
+        };
+        @memcpy(snapshot, self.followers.items);
+        _ = std.c.pthread_mutex_unlock(&self.mutex);
+        defer self.allocator.free(snapshot);
+
+        // Enqueue to each follower; if enqueue fails (outbox full), mark for disconnect.
+        for (snapshot) |state| {
+            if (!state.running.load(.acquire)) continue;
+            vex_log.debug(
+                "repl-leader: broadcasting to {s} (fd={d} len={d})",
+                .{ state.addrSlice(), state.fd, aof_record.len },
+            );
+            if (!self.enqueueToFollower(state, .repl_data, aof_record)) {
+                // Outbox full or alloc failure — disconnect this follower.
+                state.running.store(false, .release);
+                _ = std.c.pthread_mutex_lock(&state.outbox_mutex);
+                _ = std.c.pthread_cond_broadcast(&state.outbox_cond);
+                _ = std.c.pthread_mutex_unlock(&state.outbox_mutex);
+            }
+        }
+
+        // Clean up any drain threads that exited (either by enqueue overflow
+        // above or by a prior write error).
+        self.reapDeadFollowers();
     }
 
     fn listenerLoop(self: *ReplicationLeader) void {
@@ -183,15 +401,19 @@ pub const ReplicationLeader = struct {
 
             vex_log.info("repl-leader: connection accepted (fd={d})", .{client_fd});
 
-            // DON'T add to follower_fds yet — wait until we know this is a repl_stream
+            // DON'T add to followers yet — wait until we know this is a repl_stream
             // connection (identified by repl_request frame). Forward connections send
             // write_forward frames and should NOT receive broadcasts.
 
             // Spawn handler thread for this connection
-            const ctx = self.allocator.create(FollowerHandlerCtx) catch continue;
+            const ctx = self.allocator.create(FollowerHandlerCtx) catch {
+                _ = std.c.close(client_fd);
+                continue;
+            };
             ctx.* = .{ .leader = self, .fd = client_fd };
             const t = std.Thread.spawn(.{}, followerHandler, .{ctx}) catch {
                 self.allocator.destroy(ctx);
+                _ = std.c.close(client_fd);
                 continue;
             };
             t.detach();
@@ -216,19 +438,27 @@ pub const ReplicationLeader = struct {
 
             const hb = protocol.encodeHeartbeat(self.mutation_seq.load(.monotonic), now_ms);
 
+            // Snapshot followers, release the lock, then enqueue.
             _ = std.c.pthread_mutex_lock(&self.mutex);
-            var j: usize = 0;
-            while (j < self.follower_fds.items.len) {
-                const fd = self.follower_fds.items[j];
-                protocol.writeFrame(fd, .heartbeat, &hb) catch {
-                    _ = std.c.close(fd);
-                    _ = self.follower_fds.swapRemove(j);
-                    _ = self.follower_count.fetchSub(1, .monotonic);
-                    continue;
-                };
-                j += 1;
-            }
+            const snapshot = self.allocator.alloc(*FollowerState, self.followers.items.len) catch {
+                _ = std.c.pthread_mutex_unlock(&self.mutex);
+                continue;
+            };
+            @memcpy(snapshot, self.followers.items);
             _ = std.c.pthread_mutex_unlock(&self.mutex);
+            defer self.allocator.free(snapshot);
+
+            for (snapshot) |state| {
+                if (!state.running.load(.acquire)) continue;
+                if (!self.enqueueToFollower(state, .heartbeat, &hb)) {
+                    state.running.store(false, .release);
+                    _ = std.c.pthread_mutex_lock(&state.outbox_mutex);
+                    _ = std.c.pthread_cond_broadcast(&state.outbox_cond);
+                    _ = std.c.pthread_mutex_unlock(&state.outbox_mutex);
+                }
+            }
+
+            self.reapDeadFollowers();
         }
     }
 
@@ -241,6 +471,14 @@ pub const ReplicationLeader = struct {
         const self = ctx.leader;
         const fd = ctx.fd;
         defer self.allocator.destroy(ctx);
+
+        // `registered` flips to true once this fd has been moved into
+        // `self.followers` (i.e. ownership transferred to a FollowerState).
+        // While false, this handler still owns `fd` and must close it on exit.
+        var registered: bool = false;
+        defer if (!registered) {
+            _ = std.c.close(fd);
+        };
 
         while (self.running.load(.acquire)) {
             var pfd = [1]std.c.pollfd{.{
@@ -294,20 +532,53 @@ pub const ReplicationLeader = struct {
                             vex_log.info("repl-leader: follower fd={d} requesting full sync", .{fd});
                             if (snap_fn(self.allocator)) |snap_data| {
                                 defer self.allocator.free(snap_data);
-                                protocol.writeFrame(fd, .full_sync_data, snap_data) catch |err| {
-                                    vex_log.warn("repl-leader: full sync write failed for fd={d}: {s}", .{ fd, @errorName(err) });
+                                protocol.writeFrame(fd, .full_sync_data, snap_data) catch {
+                                    vex_log.warn("repl-leader: full sync write failed for fd={d}", .{fd});
                                 };
                                 vex_log.info("repl-leader: full sync sent to fd={d} ({d} bytes)", .{ fd, snap_data.len });
                             }
                         }
                     }
 
-                    // Register for broadcast list
+                    // Register for broadcast list: allocate FollowerState, spawn drain thread,
+                    // append to leader's followers list. Ownership of `fd` transfers to the state.
+                    const state = createFollowerState(self.allocator, fd, DEFAULT_OUTBOX_MAX) catch {
+                        vex_log.warn("repl-leader: failed to allocate FollowerState for fd={d}", .{fd});
+                        break;
+                    };
+                    state.drain_thread = std.Thread.spawn(.{}, followerDrainLoop, .{state}) catch {
+                        vex_log.warn("repl-leader: failed to spawn drain thread for fd={d}", .{fd});
+                        destroyFollowerState(state);
+                        break;
+                    };
+
                     _ = std.c.pthread_mutex_lock(&self.mutex);
-                    self.follower_fds.append(fd) catch {};
+                    self.followers.append(state) catch {
+                        _ = std.c.pthread_mutex_unlock(&self.mutex);
+                        // Failed to append — shut down the drain thread and clean up.
+                        state.running.store(false, .release);
+                        _ = std.c.pthread_mutex_lock(&state.outbox_mutex);
+                        _ = std.c.pthread_cond_broadcast(&state.outbox_cond);
+                        _ = std.c.pthread_mutex_unlock(&state.outbox_mutex);
+                        if (state.drain_thread) |t| {
+                            t.join();
+                            state.drain_thread = null;
+                        }
+                        destroyFollowerState(state);
+                        break;
+                    };
                     _ = std.c.pthread_mutex_unlock(&self.mutex);
                     _ = self.follower_count.fetchAdd(1, .monotonic);
-                    vex_log.info("repl-leader: follower fd={d} registered for replication stream (from seq={d})", .{ fd, req_seq });
+                    registered = true;
+                    vex_log.info(
+                        "repl-leader: follower {s} (fd={d}) registered for replication stream (from seq={d})",
+                        .{ state.addrSlice(), fd, req_seq },
+                    );
+                    // After successful registration, this handler thread exits.
+                    // The drain thread owns writes; reads on this socket are no
+                    // longer expected in the steady state. (If we needed to keep
+                    // reading from followers, we'd spawn another reader thread.)
+                    return;
                 },
                 .heartbeat => {
                     if (frame.payload.len > 0) self.allocator.free(@constCast(frame.payload));
@@ -316,6 +587,44 @@ pub const ReplicationLeader = struct {
                     if (frame.payload.len > 0) self.allocator.free(@constCast(frame.payload));
                 },
             }
+        }
+    }
+
+    /// Drain loop: one per follower. Pulls frames from the outbox and writes
+    /// them to the follower's socket. Exits on write error or when
+    /// `running` becomes false.
+    fn followerDrainLoop(state: *FollowerState) void {
+        while (state.running.load(.acquire)) {
+            // Wait for an item to appear in the outbox.
+            _ = std.c.pthread_mutex_lock(&state.outbox_mutex);
+            while (state.running.load(.acquire) and state.outbox.items.len == 0) {
+                _ = std.c.pthread_cond_wait(&state.outbox_cond, &state.outbox_mutex);
+            }
+            if (!state.running.load(.acquire)) {
+                _ = std.c.pthread_mutex_unlock(&state.outbox_mutex);
+                break;
+            }
+
+            // Pop the front item (FIFO order). swapRemove is O(1) but reorders;
+            // use orderedRemove to preserve ordering for correctness.
+            const item = state.outbox.orderedRemove(0);
+            _ = std.c.pthread_mutex_unlock(&state.outbox_mutex);
+
+            // Write the frame outside the outbox lock. If this blocks (slow
+            // follower with full kernel buffer), only this follower's outbox
+            // backs up — other followers and the broadcast path are unaffected.
+            protocol.writeFrame(state.fd, item.frame_type, item.payload) catch |err| {
+                vex_log.warn(
+                    "repl-leader: drain write failed for follower {s}: {s}",
+                    .{ state.addrSlice(), @errorName(err) },
+                );
+                if (item.payload.len > 0) state.allocator.free(item.payload);
+                state.running.store(false, .release);
+                // Reaper (in broadcastMutation/heartbeatLoop) will join us and clean up.
+                return;
+            };
+
+            if (item.payload.len > 0) state.allocator.free(item.payload);
         }
     }
 };
@@ -512,7 +821,7 @@ pub const ReplicationFollower = struct {
 
         // If not promoted and still running, attempt reconnection to a new leader
         while (self.running.load(.acquire) and !self.promoted.load(.acquire)) {
-            vex_log.warn("failover: lost leader connection, attempting reconnection", .{});
+            vex_log.warn("failover: lost leader connection, attempting reconnection...", .{});
 
             // Close stale fds
             if (self.leader_fd >= 0) {
@@ -568,7 +877,7 @@ pub const ReplicationFollower = struct {
             }
 
             if (!reconnected) {
-                vex_log.err("failover: exhausted reconnection attempts", .{});
+                vex_log.warn("failover: exhausted reconnection attempts", .{});
                 break;
             }
 
@@ -602,7 +911,7 @@ pub const ReplicationFollower = struct {
             if (last_hb > 0 and (now - last_hb) > HEARTBEAT_TIMEOUT_MS) {
                 vex_log.warn("failover: leader heartbeat timeout ({d}ms since last)", .{now - last_hb});
                 if (self.config.amIHighestPriority()) {
-                    vex_log.warn("failover: highest priority follower — promoting to leader", .{});
+                    vex_log.info("failover: I am highest priority follower — PROMOTING TO LEADER", .{});
                     self.promoted.store(true, .release);
                     if (self.promote_fn) |promote| promote();
                     return; // Exit — we're the leader now
@@ -651,7 +960,7 @@ pub const ReplicationFollower = struct {
                         if (load_fn(frame.payload)) {
                             vex_log.info("repl-follower: full sync loaded successfully", .{});
                         } else {
-                            vex_log.err("repl-follower: full sync load failed", .{});
+                            vex_log.warn("repl-follower: full sync load failed", .{});
                         }
                     }
                     if (frame.payload.len > 0) self.allocator.free(@constCast(frame.payload));
