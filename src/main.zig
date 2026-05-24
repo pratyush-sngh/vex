@@ -788,4 +788,6 @@ test {
     _ = @import("engine/hnsw.zig");
     _ = @import("engine/rag.zig");
     _ = @import("engine/ch.zig");
+    _ = @import("observability/cmd_table.zig");
+    _ = @import("observability/stats.zig");
 }
