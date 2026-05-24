@@ -77,7 +77,7 @@ fn promoteToLeader() void {
     const rf = g_repl_follower orelse return;
     const cc = g_cluster_conf orelse return;
 
-    std.debug.print("[failover] promoting to leader...\n", .{});
+    vex_log.warn("failover: promoting to leader", .{});
 
     // Close forward connection — we no longer forward writes
     if (rf.forward_fd >= 0) {
@@ -89,15 +89,15 @@ fn promoteToLeader() void {
     g_promoted_leader = @import("cluster/replication.zig").ReplicationLeader.init(allocator, cc, g_local_port);
     g_promoted_leader.?.execute_fn = executeForwardedWrite;
     g_promoted_leader.?.snapshot_fn = getSnapshot;
-    g_promoted_leader.?.start() catch {
-        std.debug.print("[failover] failed to start replication leader\n", .{});
+    g_promoted_leader.?.start() catch |err| {
+        vex_log.err("failover: failed to start replication leader: {s}", .{@errorName(err)});
         return;
     };
 
     // Publish the new leader pointer so workers can find it via getPromotedLeader()
     rf.promoted_leader_ptr.store(@intFromPtr(&g_promoted_leader.?), .release);
 
-    std.debug.print("[failover] promotion complete — now accepting writes and follower connections on :{d}\n", .{g_local_port + 10000});
+    vex_log.info("failover: promotion complete; accepting writes and follower connections on :{d}", .{g_local_port + 10000});
 }
 
 /// Get a binary snapshot of KV + Graph for full sync to followers.
@@ -177,7 +177,8 @@ pub fn main(init: std.process.Init) !void {
 
     installSignalHandlers();
     const config = parseArgs(init);
-    vex_log.global = vex_log.Logger.init(config.log_level);
+    initGlobalLogger(allocator, config.log_file, config.log_level, config.log_format);
+    defer vex_log.global.deinit();
     var prof_state: span.Profile = undefined;
     var prof: ?*span.Profile = null;
     if (config.profile) {
@@ -337,6 +338,10 @@ pub fn main(init: std.process.Init) !void {
     }
 
     printBanner(config.port, kv.dbsize(), graph.nodeCount(), replayed);
+    vex_log.info(
+        "vex v{s} ready: port={d} kv_keys={d} graph_nodes={d} aof_replayed={d}",
+        .{ @import("root.zig").VERSION, config.port, kv.dbsize(), graph.nodeCount(), replayed },
+    );
 
     var server = try Server.init(
         allocator,
@@ -408,6 +413,8 @@ const Config = struct {
     maxmemory: usize,
     maxmemory_policy: @import("engine/kv.zig").EvictionPolicy,
     log_level: vex_log.Level,
+    log_file: ?[]const u8,
+    log_format: vex_log.Format,
 };
 
 fn parseArgs(init: std.process.Init) Config {
@@ -432,6 +439,8 @@ fn parseArgs(init: std.process.Init) Config {
     var maxmemory: usize = 0;
     var maxmemory_policy: @import("engine/kv.zig").EvictionPolicy = .noeviction;
     var log_level: vex_log.Level = .info;
+    var log_file: ?[]const u8 = null;
+    var log_format: vex_log.Format = .text;
 
     // ── Config file loading (order: default vex.conf → VEX_CONFIG env → --config flag)
     // Each source overrides the previous; CLI args override everything.
@@ -439,7 +448,7 @@ fn parseArgs(init: std.process.Init) Config {
         // 1. Try default config file: ./vex.conf
         applyConfigFile(init.io, "vex.conf", &host, &port, &data_dir, &requirepass,
             &maxclients, &max_client_buffer, &maxmemory, &maxmemory_policy,
-            &reactor, &workers, &log_level, &tls_cert, &tls_key);
+            &reactor, &workers, &log_level, &tls_cert, &tls_key, &log_file, &log_format);
 
         // 2. Try VEX_CONFIG environment variable
         const env_config = std.c.getenv("VEX_CONFIG");
@@ -448,7 +457,7 @@ fn parseArgs(init: std.process.Init) Config {
             if (path.len > 0) {
                 applyConfigFile(init.io, path, &host, &port, &data_dir, &requirepass,
                     &maxclients, &max_client_buffer, &maxmemory, &maxmemory_policy,
-                    &reactor, &workers, &log_level, &tls_cert, &tls_key);
+                    &reactor, &workers, &log_level, &tls_cert, &tls_key, &log_file, &log_format);
             }
         }
 
@@ -463,7 +472,7 @@ fn parseArgs(init: std.process.Init) Config {
                     const cfg_path = std.mem.sliceTo(cfg_path_z, 0);
                     applyConfigFile(init.io, cfg_path, &host, &port, &data_dir, &requirepass,
                         &maxclients, &max_client_buffer, &maxmemory, &maxmemory_policy,
-                        &reactor, &workers, &log_level, &tls_cert, &tls_key);
+                        &reactor, &workers, &log_level, &tls_cert, &tls_key, &log_file, &log_format);
                 }
                 break;
             }
@@ -560,6 +569,15 @@ fn parseArgs(init: std.process.Init) Config {
             if (it.next()) |l| {
                 log_level = vex_log.Level.parse(std.mem.sliceTo(l, 0));
             }
+        } else if (std.mem.eql(u8, arg, "--log-file")) {
+            if (it.next()) |p| {
+                const s = std.mem.sliceTo(p, 0);
+                log_file = if (std.mem.eql(u8, s, "-")) null else s;
+            }
+        } else if (std.mem.eql(u8, arg, "--log-format")) {
+            if (it.next()) |f| {
+                log_format = vex_log.Format.parse(std.mem.sliceTo(f, 0));
+            }
         } else if (std.mem.eql(u8, arg, "--maxmemory")) {
             if (it.next()) |n| {
                 maxmemory = std.fmt.parseInt(usize, std.mem.sliceTo(n, 0), 10) catch 0;
@@ -598,6 +616,8 @@ fn parseArgs(init: std.process.Init) Config {
         .maxmemory = maxmemory,
         .maxmemory_policy = maxmemory_policy,
         .log_level = log_level,
+        .log_file = log_file,
+        .log_format = log_format,
     };
 }
 
@@ -643,6 +663,8 @@ fn applyConfigFile(
     log_level: *vex_log.Level,
     tls_cert: *?[]const u8,
     tls_key: *?[]const u8,
+    log_file: *?[]const u8,
+    log_format: *vex_log.Format,
 ) void {
     const config_mod = @import("config.zig");
     // Use a page allocator since we can't access the gpa in parseArgs easily.
@@ -650,7 +672,7 @@ fn applyConfigFile(
     var cfg = config_mod.ConfigFile.loadFile(std.heap.page_allocator, io, cfg_path) catch |err| {
         // Silently skip file-not-found (for default vex.conf / optional env var)
         if (err != error.FileNotFound) {
-            std.debug.print("[vex] warning: cannot load config file '{s}': {s}\n", .{ cfg_path, @errorName(err) });
+            vex_log.warn("cannot load config file '{s}': {s}", .{ cfg_path, @errorName(err) });
         }
         return;
     };
@@ -670,6 +692,10 @@ fn applyConfigFile(
     if (cfg.get("reactor")) |_| reactor.* = true;
     if (cfg.get("workers")) |v| workers.* = std.fmt.parseInt(usize, v, 10) catch workers.*;
     if (cfg.get("log-level") orelse cfg.get("loglevel")) |v| log_level.* = vex_log.Level.parse(v);
+    if (cfg.get("log-file") orelse cfg.get("logfile")) |v| {
+        log_file.* = if (std.mem.eql(u8, v, "-") or v.len == 0) null else v;
+    }
+    if (cfg.get("log-format") orelse cfg.get("logformat")) |v| log_format.* = vex_log.Format.parse(v);
     if (cfg.get("tls-cert")) |v| tls_cert.* = v;
     if (cfg.get("tls-key")) |v| tls_key.* = v;
 }
@@ -698,6 +724,29 @@ fn parseMemorySize(s: []const u8) usize {
 
 fn log(comptime fmt: []const u8, args: anytype) void {
     vex_log.info(fmt, args);
+}
+
+fn initGlobalLogger(
+    allocator: std.mem.Allocator,
+    log_file: ?[]const u8,
+    level: vex_log.Level,
+    format: vex_log.Format,
+) void {
+    const path = log_file orelse {
+        vex_log.global = vex_log.Logger.initStderr(level, format);
+        return;
+    };
+    const path_z = allocator.dupeSentinel(u8, path, 0) catch {
+        vex_log.global = vex_log.Logger.initStderr(level, format);
+        vex_log.warn("cannot allocate log-file path; logs going to stderr", .{});
+        return;
+    };
+    defer allocator.free(path_z);
+    vex_log.global = vex_log.Logger.initFile(path_z, level, format) catch |err| {
+        vex_log.global = vex_log.Logger.initStderr(level, format);
+        vex_log.warn("cannot open log-file '{s}': {s}; logs going to stderr", .{ path, @errorName(err) });
+        return;
+    };
 }
 
 test "parseMemorySize" {
