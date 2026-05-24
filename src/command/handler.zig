@@ -210,6 +210,7 @@ pub const CommandHandler = struct {
                     if (std.mem.eql(u8, cmd, "ZCARD")) return self.cmdZcard(args, w);
                     if (std.mem.eql(u8, cmd, "ZRANK")) return self.cmdZrank(args, w);
                 },
+                'D' => if (std.mem.eql(u8, cmd, "DEBUG")) return self.cmdDebug(args, w),
                 else => {},
             },
             6 => switch (first) {
@@ -239,6 +240,7 @@ pub const CommandHandler = struct {
                     if (std.mem.eql(u8, cmd, "LRANGE")) return self.cmdLrange(args, w);
                     if (std.mem.eql(u8, cmd, "LINDEX")) return self.cmdLindex(args, w);
                 },
+                'M' => if (std.mem.eql(u8, cmd, "MEMORY")) return self.cmdMemory(args, w),
                 'Z' => {
                     if (std.mem.eql(u8, cmd, "ZSCORE")) return self.cmdZscore(args, w);
                     if (std.mem.eql(u8, cmd, "ZRANGE")) return self.cmdZrange(args, w);
@@ -2121,6 +2123,170 @@ pub const CommandHandler = struct {
             return;
         }
         try resp.serializeError(w, "unknown LATENCY subcommand");
+    }
+
+    /// DEBUG OBJECT <key> | DEBUG SLEEP <seconds> | DEBUG HELP
+    /// Operator-facing introspection. OBJECT returns key metadata,
+    /// SLEEP blocks the connection for N seconds — useful for testing
+    /// SLOWLOG/LATENCY end-to-end.
+    fn cmdDebug(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (args.len < 2) {
+            try resp.serializeError(w, "wrong number of arguments for 'debug'");
+            return;
+        }
+        var sub_buf: [16]u8 = undefined;
+        const sub = toUpperBuf(args[1], &sub_buf);
+
+        if (std.mem.eql(u8, sub, "OBJECT")) {
+            if (args.len < 3) {
+                try resp.serializeError(w, "wrong number of arguments for 'debug object'");
+                return;
+            }
+            var key_buf: [512]u8 = undefined;
+            var key_ref = namespacedKeyRef(self, args[2], &key_buf) catch {
+                try resp.serializeError(w, "internal: namespace failure");
+                return;
+            };
+            defer key_ref.deinit(self.allocator);
+            // The "Value at:0x..." format is what redis-cli prints for legacy
+            // clients. We omit a real address (we don't expose memory layout)
+            // and emit serializedlength + encoding hint based on the type.
+            const v = self.kvGet(key_ref.key);
+            if (v == null) {
+                try resp.serializeError(w, "no such key");
+                return;
+            }
+            const val = v.?;
+            const encoding: []const u8 = if (val.len <= 44) "embstr" else "raw";
+            var line_buf: [256]u8 = undefined;
+            const line = std.fmt.bufPrint(
+                &line_buf,
+                "Value at:0x0 refcount:1 encoding:{s} serializedlength:{d} lru:0 lru_seconds_idle:0",
+                .{ encoding, val.len },
+            ) catch {
+                try resp.serializeError(w, "internal: format failure");
+                return;
+            };
+            try resp.serializeSimpleString(w, line);
+            return;
+        }
+        if (std.mem.eql(u8, sub, "SLEEP")) {
+            if (args.len < 3) {
+                try resp.serializeError(w, "wrong number of arguments for 'debug sleep'");
+                return;
+            }
+            const secs = std.fmt.parseFloat(f64, args[2]) catch {
+                try resp.serializeError(w, "invalid seconds value");
+                return;
+            };
+            if (secs <= 0) {
+                try resp.serializeSimpleString(w, "OK");
+                return;
+            }
+            // Cap at 60s to keep the worker thread from being held forever by
+            // a misused operator command.
+            const capped: f64 = if (secs > 60.0) 60.0 else secs;
+            const whole_sec: i64 = @intFromFloat(@floor(capped));
+            const frac_ns: i64 = @intFromFloat((capped - @floor(capped)) * 1_000_000_000.0);
+            var ts = std.c.timespec{ .sec = whole_sec, .nsec = frac_ns };
+            var rem: std.c.timespec = undefined;
+            _ = std.c.nanosleep(&ts, &rem);
+            try resp.serializeSimpleString(w, "OK");
+            return;
+        }
+        if (std.mem.eql(u8, sub, "HELP")) {
+            const lines = [_][]const u8{
+                "DEBUG OBJECT <key>   -- Metadata about a key (encoding, serializedlength).",
+                "DEBUG SLEEP <secs>   -- Block the worker for N seconds (capped at 60). For testing SLOWLOG.",
+                "DEBUG HELP           -- This help.",
+            };
+            try resp.serializeArrayHeader(w, lines.len);
+            for (lines) |line| try resp.serializeBulkString(w, line);
+            return;
+        }
+        try resp.serializeError(w, "unknown DEBUG subcommand");
+    }
+
+    /// MEMORY USAGE <key> [SAMPLES N] | MEMORY STATS | MEMORY HELP
+    fn cmdMemory(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        if (args.len < 2) {
+            try resp.serializeError(w, "wrong number of arguments for 'memory'");
+            return;
+        }
+        var sub_buf: [16]u8 = undefined;
+        const sub = toUpperBuf(args[1], &sub_buf);
+
+        if (std.mem.eql(u8, sub, "USAGE")) {
+            if (args.len < 3) {
+                try resp.serializeError(w, "wrong number of arguments for 'memory usage'");
+                return;
+            }
+            var key_buf: [512]u8 = undefined;
+            var key_ref = namespacedKeyRef(self, args[2], &key_buf) catch {
+                try resp.serializeError(w, "internal: namespace failure");
+                return;
+            };
+            defer key_ref.deinit(self.allocator);
+            const v = self.kvGet(key_ref.key);
+            if (v == null) {
+                try resp.serializeBulkString(w, null);
+                return;
+            }
+            // Approximation: value bytes + small per-entry overhead (key copy,
+            // map slot, alignment). Redis's MEMORY USAGE is also an estimate.
+            const usage: i64 = @intCast(v.?.len + args[2].len + 56);
+            try resp.serializeInteger(w, usage);
+            return;
+        }
+        if (std.mem.eql(u8, sub, "STATS")) {
+            // Process-wide breakdown — mirrors a subset of Redis's MEMORY STATS.
+            // Returned as a flat RESP array of alternating key/value bulk strings.
+            var ru: std.c.rusage = undefined;
+            const ru_ok = std.c.getrusage(std.c.rusage.SELF, &ru) == 0;
+            const is_darwin_target = @import("builtin").os.tag == .macos;
+            const rss_bytes: u64 = if (!ru_ok) 0 else if (is_darwin_target)
+                @intCast(@max(@as(i64, ru.maxrss), 0))
+            else
+                @as(u64, @intCast(@max(@as(i64, ru.maxrss), 0))) * 1024;
+
+            const start_ms = obs_stats.start_time_ms;
+            const uptime_ms: i64 = if (start_ms == 0) 0 else obsNowMillis() - start_ms;
+
+            const Pair = struct { k: []const u8, v: u64 };
+            const pairs = [_]Pair{
+                .{ .k = "peak.allocated", .v = rss_bytes },
+                .{ .k = "total.allocated", .v = rss_bytes },
+                .{ .k = "startup.allocated", .v = 0 },
+                .{ .k = "replication.backlog", .v = 0 },
+                .{ .k = "clients.slaves", .v = 0 },
+                .{ .k = "clients.normal", .v = @intCast(obs_stats.connected_clients.load(.monotonic)) },
+                .{ .k = "cluster.links", .v = 0 },
+                .{ .k = "aof.buffer", .v = if (self.aof) |a| (if (a.group_buf_inited) a.group_buf.items.len else 0) else 0 },
+                .{ .k = "lua.caches", .v = 0 },
+                .{ .k = "overhead.total", .v = 0 },
+                .{ .k = "keys.count", .v = if (self.ckv) |ckv| ckv.dbsize() else 0 },
+                .{ .k = "dataset.bytes", .v = rss_bytes }, // approximation
+                .{ .k = "allocator.fragmentation.ratio", .v = 1 }, // we don't track yet
+                .{ .k = "uptime.ms", .v = @intCast(@max(uptime_ms, 0)) },
+            };
+            try resp.serializeArrayHeader(w, pairs.len * 2);
+            for (pairs) |p| {
+                try resp.serializeBulkString(w, p.k);
+                try resp.serializeInteger(w, @intCast(p.v));
+            }
+            return;
+        }
+        if (std.mem.eql(u8, sub, "HELP")) {
+            const lines = [_][]const u8{
+                "MEMORY USAGE <key>   -- Approximate bytes used by a key's value.",
+                "MEMORY STATS         -- Process-wide memory breakdown (flat key/value pairs).",
+                "MEMORY HELP          -- This help.",
+            };
+            try resp.serializeArrayHeader(w, lines.len);
+            for (lines) |line| try resp.serializeBulkString(w, line);
+            return;
+        }
+        try resp.serializeError(w, "unknown MEMORY subcommand");
     }
 
     // ── Graph Commands ────────────────────────────────────────────────

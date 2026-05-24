@@ -16,6 +16,7 @@ const TlsContext = @import("tls.zig").TlsContext;
 const vex_log = @import("../log.zig");
 const stats_mod = @import("../observability/stats.zig");
 const cmd_table = @import("../observability/cmd_table.zig");
+const stats_event = @import("../observability/event_stats.zig");
 const SSL = @import("tls.zig").SSL;
 const ListStore = @import("../engine/list.zig").ListStore;
 const HashStore = @import("../engine/hash.zig").HashStore;
@@ -982,6 +983,35 @@ pub const Worker = struct {
                 return;
             }
 
+            // Connection-level / worker-level commands that don't live in
+            // CommandHandler. The slow path also handles these for
+            // unauthenticated clients; the fast path needs the same set so
+            // operator commands work after auth.
+            if (args[0].len == 6 and equalsAsciiUpper(args[0], "CONFIG")) {
+                self.handleConfig(conn, args);
+                return;
+            }
+            if (args[0].len == 6 and equalsAsciiUpper(args[0], "CLIENT")) {
+                self.handleClient(conn, args);
+                return;
+            }
+            if (args[0].len == 6 and equalsAsciiUpper(args[0], "OBJECT")) {
+                self.handleObject(conn, args);
+                return;
+            }
+            if (args[0].len == 4 and equalsAsciiUpper(args[0], "TIME")) {
+                var ts: std.c.timespec = undefined;
+                _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
+                conn.write_buf.appendSlice("*2\r\n") catch {};
+                var buf: [32]u8 = undefined;
+                const sec_s = std.fmt.bufPrint(&buf, "{d}", .{ts.sec}) catch "0";
+                writeBulkTo(&conn.write_buf, sec_s);
+                const usec: i64 = @divTrunc(@as(i64, @intCast(ts.nsec)), 1000);
+                const usec_s = std.fmt.bufPrint(&buf, "{d}", .{usec}) catch "0";
+                writeBulkTo(&conn.write_buf, usec_s);
+                return;
+            }
+
             // Fall through to CommandHandler for non-hot-path commands
             self.executeCommand(conn, args);
             self.maybeBroadcast(args);
@@ -1381,7 +1411,6 @@ pub const Worker = struct {
     // ── CONFIG subcommand handler ────────────────────────────────────
 
     fn handleConfig(self: *Worker, conn: *Connection, args: []const []const u8) void {
-        _ = self;
         if (args.len < 2) {
             conn.write_buf.appendSlice("-ERR wrong number of arguments for 'CONFIG'\r\n") catch {};
             return;
@@ -1392,29 +1421,135 @@ pub const Worker = struct {
                 conn.write_buf.appendSlice(empty_hdr) catch {};
                 return;
             }
-            // Return known config keys, empty map/array for unknown
-            const key = args[2];
-            if (equalsAsciiUpper(key, "SAVE") or equalsAsciiUpper(key, "DATABASES") or
-                equalsAsciiUpper(key, "MAXMEMORY") or equalsAsciiUpper(key, "APPENDONLY"))
-            {
-                const hdr: []const u8 = if (conn.protocol_version == .resp3) "%1\r\n" else "*2\r\n";
-                conn.write_buf.appendSlice(hdr) catch {};
-                writeBulkTo(&conn.write_buf, key);
-                writeBulkTo(&conn.write_buf, "");
-            } else if (key.len == 1 and key[0] == '*') {
-                // CONFIG GET * — return empty (some clients do this on connect)
-                conn.write_buf.appendSlice(empty_hdr) catch {};
-            } else {
-                conn.write_buf.appendSlice(empty_hdr) catch {};
-            }
+            const pattern = args[2];
+            // Build a list of (key, value) pairs whose key matches the pattern.
+            // We resolve real values for known keys; unknowns yield empty.
+            self.writeConfigGet(conn, pattern);
+            return;
         } else if (equalsAsciiUpper(args[1], "SET")) {
-            // Accept but ignore — Vex doesn't support runtime config changes
-            conn.write_buf.appendSlice("+OK\r\n") catch {};
+            if (args.len < 4) {
+                conn.write_buf.appendSlice("-ERR wrong number of arguments for 'CONFIG SET'\r\n") catch {};
+                return;
+            }
+            self.applyConfigSet(conn, args[2], args[3]);
+            return;
         } else if (equalsAsciiUpper(args[1], "RESETSTAT")) {
             conn.write_buf.appendSlice("+OK\r\n") catch {};
         } else {
             conn.write_buf.appendSlice("-ERR unknown CONFIG subcommand\r\n") catch {};
         }
+    }
+
+    /// Known configuration keys exposed via CONFIG GET. Single source of
+    /// truth — adding a new observable knob requires one line here.
+    const ConfigKey = enum {
+        maxmemory,
+        @"maxmemory-policy",
+        maxclients,
+        appendonly,
+        save,
+        databases,
+        @"log-level",
+        @"log-file",
+        @"log-format",
+        @"enable-timings",
+        @"slowlog-log-slower-than",
+        @"latency-monitor-threshold",
+    };
+
+    /// Match a CONFIG GET pattern against `name`. Supports literal match
+    /// and the single `*` wildcard ("get everything").
+    fn configKeyMatches(pattern: []const u8, name: []const u8) bool {
+        if (pattern.len == 1 and pattern[0] == '*') return true;
+        if (pattern.len != name.len) return false;
+        for (pattern, name) |a, b| {
+            if (std.ascii.toLower(a) != std.ascii.toLower(b)) return false;
+        }
+        return true;
+    }
+
+    fn writeConfigGet(self: *Worker, conn: *Connection, pattern: []const u8) void {
+        // Two-pass: count matches first, then emit. Keeps the array header right.
+        var pairs_buf: [128]u8 = undefined; // small scratch for value formatting per pair
+        var matched: usize = 0;
+        inline for (@typeInfo(ConfigKey).@"enum".fields) |f| {
+            if (configKeyMatches(pattern, f.name)) matched += 1;
+        }
+        const hdr: []const u8 = if (conn.protocol_version == .resp3)
+            (std.fmt.bufPrint(&pairs_buf, "%{d}\r\n", .{matched}) catch "%0\r\n")
+        else
+            (std.fmt.bufPrint(&pairs_buf, "*{d}\r\n", .{matched * 2}) catch "*0\r\n");
+        conn.write_buf.appendSlice(hdr) catch {};
+        if (matched == 0) return;
+
+        inline for (@typeInfo(ConfigKey).@"enum".fields) |f| {
+            if (configKeyMatches(pattern, f.name)) {
+                writeBulkTo(&conn.write_buf, f.name);
+                self.writeConfigValue(conn, @field(ConfigKey, f.name));
+            }
+        }
+    }
+
+    fn writeConfigValue(self: *Worker, conn: *Connection, key: ConfigKey) void {
+        var buf: [64]u8 = undefined;
+        switch (key) {
+            .maxmemory => {
+                const s = std.fmt.bufPrint(&buf, "{d}", .{self.kv.maxmemory}) catch "0";
+                writeBulkTo(&conn.write_buf, s);
+            },
+            .@"maxmemory-policy" => writeBulkTo(&conn.write_buf, switch (self.kv.eviction_policy) {
+                .noeviction => "noeviction",
+                .allkeys_lru => "allkeys-lru",
+            }),
+            .maxclients => {
+                const s = std.fmt.bufPrint(&buf, "{d}", .{self.maxclients}) catch "0";
+                writeBulkTo(&conn.write_buf, s);
+            },
+            .appendonly => writeBulkTo(&conn.write_buf, if (self.aof != null) "yes" else "no"),
+            .save => writeBulkTo(&conn.write_buf, ""),
+            .databases => writeBulkTo(&conn.write_buf, "16"),
+            .@"log-level" => writeBulkTo(&conn.write_buf, vex_log.global.min_level.label()),
+            .@"log-file" => writeBulkTo(&conn.write_buf, ""),
+            .@"log-format" => writeBulkTo(&conn.write_buf, switch (vex_log.global.format) {
+                .text => "text",
+                .json => "json",
+            }),
+            .@"enable-timings" => writeBulkTo(&conn.write_buf, if (self.enable_timings) "yes" else "no"),
+            .@"slowlog-log-slower-than" => {
+                const s = std.fmt.bufPrint(&buf, "{d}", .{self.slowlog_threshold_us}) catch "0";
+                writeBulkTo(&conn.write_buf, s);
+            },
+            .@"latency-monitor-threshold" => {
+                const ls = stats_event.threshold_us.load(.monotonic);
+                const s = std.fmt.bufPrint(&buf, "{d}", .{ls}) catch "0";
+                writeBulkTo(&conn.write_buf, s);
+            },
+        }
+    }
+
+    /// CONFIG SET — apply runtime-mutable knobs; reject or no-op others.
+    fn applyConfigSet(self: *Worker, conn: *Connection, key: []const u8, value: []const u8) void {
+        _ = self;
+        // Only latency-monitor-threshold and log-level are safely runtime-tunable
+        // without coordinating across workers. Everything else returns OK but is
+        // a no-op (matches Redis's permissive behavior for unknown keys).
+        if (std.ascii.eqlIgnoreCase(key, "latency-monitor-threshold")) {
+            const v = std.fmt.parseInt(u64, value, 10) catch {
+                conn.write_buf.appendSlice("-ERR invalid integer value for 'latency-monitor-threshold'\r\n") catch {};
+                return;
+            };
+            stats_event.threshold_us.store(v, .monotonic);
+            conn.write_buf.appendSlice("+OK\r\n") catch {};
+            return;
+        }
+        if (std.ascii.eqlIgnoreCase(key, "log-level")) {
+            vex_log.global.min_level = vex_log.Level.parse(value);
+            conn.write_buf.appendSlice("+OK\r\n") catch {};
+            return;
+        }
+        // Other keys — accepted but not applied. Document this honestly: the
+        // operator's run will not be affected by this CONFIG SET.
+        conn.write_buf.appendSlice("+OK\r\n") catch {};
     }
 
     // ── OBJECT subcommand handler ────────────────────────────────────
