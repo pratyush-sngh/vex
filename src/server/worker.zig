@@ -596,14 +596,20 @@ pub const Worker = struct {
     fn registerConnection(self: *Worker, fd: i32) void {
         setTcpNoDelay(fd);
 
-        // Connection limit check
-        const count = self.active_connections.fetchAdd(1, .monotonic);
-        if (count >= self.maxclients) {
-            _ = self.active_connections.fetchSub(1, .monotonic);
-            self.stats.rejected_conns += 1;
-            _ = std.c.write(fd, "-ERR max number of clients reached\r\n", 36);
-            _ = std.c.close(fd);
-            return;
+        // Connection limit check — atomic cmpxchg so concurrent workers
+        // never collectively exceed maxclients. The previous
+        // fetchAdd-then-check pattern could over-admit by N when N workers
+        // raced past the threshold simultaneously.
+        while (true) {
+            const current = self.active_connections.load(.monotonic);
+            if (current >= self.maxclients) {
+                self.stats.rejected_conns += 1;
+                _ = std.c.write(fd, "-ERR max number of clients reached\r\n", 36);
+                _ = std.c.close(fd);
+                return;
+            }
+            if (self.active_connections.cmpxchgWeak(current, current + 1, .acq_rel, .monotonic) == null) break;
+            // Lost the race; another worker bumped the counter. Re-read and retry.
         }
         self.stats.accepted_conns += 1;
         _ = stats_mod.connected_clients.fetchAdd(1, .monotonic);
@@ -2029,7 +2035,10 @@ pub const Worker = struct {
         conn.write_buf.appendSlice(h) catch {};
 
         // Execute all commands under engine lock
-        while (!self.kv_mutex.tryLock()) std.atomic.spinLoopHint();
+        if (!acquireKvMutexWithBackoff(self.kv_mutex)) {
+            vex_log.err("worker {d}: kv_mutex acquire timed out after 5s — aborting command", .{self.id});
+            return;
+        }
         defer self.kv_mutex.unlock();
 
         for (q.items) |cmd| {
@@ -2941,7 +2950,10 @@ pub const Worker = struct {
             _ = std.c.pthread_rwlock_unlock(self.graph_rwlock);
         };
 
-        while (!self.kv_mutex.tryLock()) std.atomic.spinLoopHint();
+        if (!acquireKvMutexWithBackoff(self.kv_mutex)) {
+            vex_log.err("worker {d}: kv_mutex acquire timed out after 5s — aborting command", .{self.id});
+            return;
+        }
         defer self.kv_mutex.unlock();
 
         var handler = CommandHandler.init(
@@ -3008,7 +3020,20 @@ pub const Worker = struct {
             const remaining = conn.write_buf.items[conn.write_offset..];
             const rc = self.connWrite(conn, remaining.ptr, remaining.len);
             if (rc < 0) {
-                // Send buffer full — uncork and register for writable event
+                // Send buffer full. Before re-registering for writable, check
+                // whether the client has fallen so far behind that we should
+                // drop them. Mirrors Redis's `client-output-buffer-limit`:
+                // a slow consumer can otherwise cause the worker to OOM as
+                // write_buf grows unboundedly across responses.
+                const pending = conn.write_buf.items.len - conn.write_offset;
+                if (pending > self.max_client_buffer) {
+                    vex_log.warn("client {d} closed: output buffer {d} > limit {d}", .{ conn.client_id, pending, self.max_client_buffer });
+                    if (conn.ssl == null) {
+                        _ = std.c.setsockopt(conn.fd, 6, cork_opt, @ptrCast(&cork_off), @sizeOf(c_int));
+                    }
+                    self.closeConn(conn.fd);
+                    return;
+                }
                 if (conn.ssl == null) {
                     _ = std.c.setsockopt(conn.fd, 6, cork_opt, @ptrCast(&cork_off), @sizeOf(c_int));
                 }
@@ -3066,6 +3091,44 @@ fn findCRLF(data: []const u8) ?usize {
         if (data[i] == '\r' and data[i + 1] == '\n') return i;
     }
     return null;
+}
+
+/// Acquire `kv_mutex` with exponential backoff and a hard 5s timeout.
+/// Returns true on success, false on timeout. Replaces the previous pure
+/// spin-loop, which would burn 100% CPU forever if a lock holder hung
+/// (e.g. TLS write stuck, slow disk during AOF flush). The 5s ceiling is
+/// a guardrail — the caller should treat timeout as "command failed";
+/// log and return -ERR.
+fn acquireKvMutexWithBackoff(m: *std.atomic.Mutex) bool {
+    // Phase 1: tight spin (cache-warm contention).
+    var spins: u32 = 0;
+    while (spins < 64) : (spins += 1) {
+        if (m.tryLock()) return true;
+        std.atomic.spinLoopHint();
+    }
+    // Phase 2: yield to scheduler.
+    var yields: u32 = 0;
+    while (yields < 16) : (yields += 1) {
+        if (m.tryLock()) return true;
+        std.Thread.yield() catch {};
+    }
+    // Phase 3: exponential sleep up to 1ms, total wall budget 5s.
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+    const start_ns: i128 = @as(i128, @intCast(ts.sec)) * 1_000_000_000 + @as(i128, @intCast(ts.nsec));
+    const budget_ns: i128 = 5 * 1_000_000_000;
+    var sleep_us: i64 = 1;
+    while (true) {
+        if (m.tryLock()) return true;
+        var rem: std.c.timespec = undefined;
+        var sleep_ts = std.c.timespec{ .sec = 0, .nsec = sleep_us * 1000 };
+        _ = std.c.nanosleep(&sleep_ts, &rem);
+        sleep_us = @min(sleep_us * 2, 1000);
+
+        _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+        const now_ns: i128 = @as(i128, @intCast(ts.sec)) * 1_000_000_000 + @as(i128, @intCast(ts.nsec));
+        if (now_ns - start_ns > budget_ns) return false;
+    }
 }
 
 fn nowMillisAccept() i64 {
