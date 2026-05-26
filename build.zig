@@ -30,6 +30,75 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run vex server");
     run_step.dependOn(&run_cmd.step);
 
+    // vex-sentinel: failover orchestrator. Lives in sentinel/ and reuses a
+    // handful of vex modules via build.zig module imports — no premature
+    // common/ extraction.
+    const vex_log_mod = b.createModule(.{
+        .root_source_file = b.path("src/log.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const vex_atomic_io_mod = b.createModule(.{
+        .root_source_file = b.path("src/storage/atomic_io.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    // vex_resp: not consumed by sentinel today. Kept wired so the upcoming
+    // health.tickOnce() PR — which parses RESP replies from PING and
+    // VEX.STATUS — can import it without touching build.zig again. Drop if
+    // that PR slips past one release cycle.
+    const vex_resp_mod = b.createModule(.{
+        .root_source_file = b.path("src/server/resp.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const vex_cluster_config_mod = b.createModule(.{
+        .root_source_file = b.path("src/cluster/config.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
+    const sentinel_imports = [_]std.Build.Module.Import{
+        .{ .name = "vex_log", .module = vex_log_mod },
+        .{ .name = "vex_atomic_io", .module = vex_atomic_io_mod },
+        .{ .name = "vex_resp", .module = vex_resp_mod },
+        .{ .name = "vex_cluster_config", .module = vex_cluster_config_mod },
+    };
+
+    const sentinel_exe = b.addExecutable(.{
+        .name = "sentinel",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("sentinel/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &sentinel_imports,
+        }),
+    });
+    b.installArtifact(sentinel_exe);
+
+    const run_sentinel_cmd = b.addRunArtifact(sentinel_exe);
+    run_sentinel_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_sentinel_cmd.addArgs(args);
+    const run_sentinel_step = b.step("run-sentinel", "Run vex-sentinel");
+    run_sentinel_step.dependOn(&run_sentinel_cmd.step);
+
+    const sentinel_test_step = b.step("test-sentinel", "Run vex-sentinel unit tests");
+    const sentinel_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("sentinel/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &sentinel_imports,
+        }),
+    });
+    sentinel_test_step.dependOn(&b.addRunArtifact(sentinel_tests).step);
+
     // Single test root: main.zig's test block imports all modules (Zig 0.16 module paths).
     const test_step = b.step("test", "Run all unit tests");
     const unit_tests = b.addTest(.{
