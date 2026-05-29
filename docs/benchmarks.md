@@ -99,20 +99,21 @@ Pure engine speed, measured in Zig with `clock_gettime(MONOTONIC)`. 100K operati
 
 ### KV Strings (`zig build bench-kv -Doptimize=ReleaseFast`)
 
-⚠️ **Build currently broken** on this target — `src/engine/kv.zig` imports
-`../observability/stats.zig` and `../observability/event_stats.zig` which
-fall outside the bench module's path scope. The numbers below are the
-last known-good values from when the target compiled; rerun once
-`build.zig` is fixed to add the missing module imports.
-
 | Operation | Latency |
 |---|---|
-| GET (hit) | **22 ns** |
-| EXISTS | 19 ns |
-| SET (insert) | 73 ns |
-| SET (update) | 79 ns |
-| DEL (tombstone) | 35 ns |
-| SET (reuse tombstone) | 45 ns |
+| GET (miss) | **4.5 ns** |
+| EXISTS | 22.5 ns |
+| DEL (tombstone) | 32.6 ns |
+| SET (reuse tombstone) | 40.6 ns |
+| GET (hit) | 42.1 ns |
+| SET (insert) | 70.1 ns |
+| SET (update) | 83.5 ns |
+| Compact (50k entries) | 1.29 ms |
+
+GET (hit) is slightly slower than pre-0.7.3 (22 ns → 42 ns) because the
+hot-path GET now acquires the stripe `rdlock` to be safe against
+concurrent rehash (B3 fix in 0.7.3). The cost is one uncontended
+`pthread_rwlock_rdlock`/`unlock` round.
 
 ### Lists — Quicklist (`zig build bench-ds -Doptimize=ReleaseFast`)
 
@@ -169,34 +170,26 @@ and reports the mean.
 
 ### Graph Engine (`zig build bench-graph -Doptimize=ReleaseFast`, 50K nodes / 500K edges / 5 props each)
 
-⚠️ **Build currently broken** on this target — same root cause as
-`bench-kv`: `src/engine/vector_store.zig` and `src/engine/hnsw.zig`
-import `../storage/atomic_io.zig` and `../log.zig` which fall outside
-the bench module's path scope. Numbers below are the last known-good
-values from when the target compiled.
-
 | Operation | Latency | Notes |
 |---|---|---|
-| ADDNODE | 165 ns | |
-| SETPROP | **140 ns** | O(1) HashMap + per-entity index |
-| GETNODE | **173 ns** | O(1) countProps + O(k) collectAll |
-| ADDEDGE | 64 ns | |
-| COMPACT | 1.9 ms | CSR rebuild |
-| Neighbors | **32 ns** | CSR O(1) lookup |
-| BFS Traverse (depth 4) | **4.4 us** | avg 95 nodes visited |
-| Shortest Path | **31 us** | Bidirectional BFS |
-| Weighted Path | **46 us** | Bidirectional Dijkstra (flat arrays) |
+| Neighbors | **52.6 ns** | CSR O(1) lookup |
+| ADDNODE | 61.4 ns | |
+| ADDEDGE | 67.1 ns | |
+| SETPROP | 83.1 ns | O(1) HashMap + per-entity index |
+| GETNODE | 174.1 ns | O(1) countProps + O(k) collectAll |
+| BFS Traverse (depth 4) | **4.3 us** | avg 95 nodes visited |
+| Shortest Path | **32.3 us** | Bidirectional BFS |
+| Weighted Path | 162.4 us | Bidirectional Dijkstra (flat arrays) |
 
-### Contraction Hierarchies (2500-node 50×50 grid, `bench-graph`)
+### Contraction Hierarchies (`bench-graph`, 100-node random graph)
 
 | Metric | Value | Notes |
 |---|---|---|
-| CH Build | 324 ms | One-time preprocessing |
-| Dijkstra (bidir) | 46.0 us/op | Flat-array bidirectional Dijkstra |
-| **CH Query** | **14.9 us/op** | Reusable query engine, touched-list reset |
-| **Speedup** | **3.1x** | CH vs bidirectional Dijkstra |
+| Dijkstra (bidir) | 4.4 us/op | Flat-array bidirectional Dijkstra |
+| **CH Query** | **1.2 us/op** | Reusable query engine, touched-list reset |
+| **Speedup** | **3.7×** | CH vs bidirectional Dijkstra |
 
-CH preprocesses the graph into a hierarchy of shortcuts. Queries search only upward in rank from both endpoints. Speedup grows with graph size and path length — road networks with millions of nodes see 100-1000x.
+CH preprocesses the graph into a hierarchy of shortcuts. Queries search only upward in rank from both endpoints. Speedup grows with graph size and path length — road networks with millions of nodes see 100-1000×.
 
 ---
 

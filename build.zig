@@ -153,14 +153,29 @@ pub fn build(b: *std.Build) void {
     const bench_hashmap_step = b.step("bench-hashmap", "Benchmark std vs verztable string maps");
     bench_hashmap_step.dependOn(&run_hashmap_bench.step);
 
-    // KV engine benchmark
+    // KV engine benchmark. Routes through the `app` module (rooted at
+    // src/root.zig) so the bench can reach engine code whose internal
+    // imports cross src/engine/ -> src/observability/, etc. Without
+    // this indirection, modules rooted at src/engine/* can't escape
+    // the engine/ subtree and the build fails with "import of file
+    // outside module path".
     const kv_bench = b.addExecutable(.{
         .name = "kv_bench",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/engine/kv_bench.zig"),
+            .root_source_file = b.path("src/bench/kv_bench.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
+            .imports = &.{
+                .{ .name = "app", .module = b.createModule(.{
+                    .root_source_file = b.path("src/root.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{
+                        .{ .name = "build_options", .module = build_opts_mod },
+                    },
+                }) },
+            },
         }),
     });
     const run_kv_bench = b.addRunArtifact(kv_bench);
@@ -183,14 +198,26 @@ pub fn build(b: *std.Build) void {
     const bench_ds_step = b.step("bench-ds", "Benchmark data structures (list/hash/set/zset)");
     bench_ds_step.dependOn(&run_ds_bench.step);
 
-    // Graph engine benchmark
+    // Graph engine benchmark. Same `app` module routing as kv_bench
+    // (graph.zig transitively imports vector_store.zig and hnsw.zig,
+    // both of which reach into src/storage/ and src/log.zig).
     const graph_bench = b.addExecutable(.{
         .name = "graph_bench",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/engine/graph_bench.zig"),
+            .root_source_file = b.path("src/bench/graph_bench.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
+            .imports = &.{
+                .{ .name = "app", .module = b.createModule(.{
+                    .root_source_file = b.path("src/root.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{
+                        .{ .name = "build_options", .module = build_opts_mod },
+                    },
+                }) },
+            },
         }),
     });
     const run_graph_bench = b.addRunArtifact(graph_bench);

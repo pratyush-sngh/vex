@@ -1,6 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const KVStore = @import("kv.zig").KVStore;
+const app = @import("app");
+const KVStore = app.kv.KVStore;
 const c = std.c;
 
 const WARMUP = 1000;

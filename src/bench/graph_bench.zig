@@ -1,7 +1,8 @@
 const std = @import("std");
 const c = std.c;
-const GraphEngine = @import("graph.zig").GraphEngine;
-const query = @import("query.zig");
+const app = @import("app");
+const GraphEngine = app.graph.GraphEngine;
+const query = app.query;
 
 const NODES = 50_000;
 const EDGES_PER_NODE = 10;
@@ -158,7 +159,7 @@ pub fn main(_: std.process.Init) !void {
     // ─── CH Test: 1000 nodes, random sparse graph ────────────────
     std.debug.print("\n--- CH Test (100 nodes, 3 edges/node, random) ---\n", .{});
     {
-        const ch_mod = @import("ch.zig");
+        const ch_mod = app.ch;
         const CH_N = 100;
         var g2 = GraphEngine.init(allocator);
         defer g2.deinit();
