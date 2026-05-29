@@ -1,0 +1,158 @@
+name: Regression suite
+
+# Two gates:
+#   - PR/push:   unit tests (Debug + ReleaseSafe) + quick chaos suite.
+#                Catches obvious regressions before merge in ~10 min.
+#   - Nightly:   full stress (production-shape) + ThreadSanitizer build.
+#                Catches load-shape / race bugs that need real time
+#                under load to surface (the io_uring race that blew up
+#                0.7.2 → 0.7.3 took ~3-7 s of platform load to fire).
+#
+# Both jobs run on ubuntu-latest so the Linux io_uring code path is
+# exercised — that's where the production crash lives. macOS / Windows
+# runners would silently skip it.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 6 * * *'   # 06:00 UTC daily — pick anything outside business hours
+  workflow_dispatch:
+    inputs:
+      run_full_stress:
+        description: 'Run the full production-shape stress (5+ min)'
+        required: false
+        default: 'false'
+
+env:
+  # Pin to a known-working Zig nightly. Bump when build.zig.zon's
+  # minimum_zig_version moves.
+  ZIG_VERSION: '0.16.0-dev.3153+d6f43caad'
+
+jobs:
+
+  # ── PR gate: cheap, fast, must always pass ───────────────────────────
+  unit-tests:
+    name: Unit tests (${{ matrix.profile }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [debug, release-safe]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: zig build (sanity)
+        run: zig build
+
+      - name: zig build test (${{ matrix.profile }})
+        run: |
+          if [ "${{ matrix.profile }}" = "release-safe" ]; then
+            zig build test -Doptimize=ReleaseSafe --summary all
+          else
+            zig build test --summary all
+          fi
+
+      - name: zig build test-sentinel
+        run: zig build test-sentinel --summary all
+
+  # ── PR gate: chaos regressions (each script ≤ ~60s) ──────────────────
+  quick-chaos:
+    name: Quick chaos suite
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig ${{ env.ZIG_VERSION }}
+        uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install redis-cli
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends redis-tools
+
+      - name: Build vex (ReleaseSafe — keeps panics readable in CI logs)
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Run quick chaos suite
+        # Shorter durations than local defaults — keep CI runtime
+        # bounded. Override per-script via env if a flake needs more
+        # time to reproduce.
+        env:
+          DURATION: '20'
+        run: |
+          set -e
+          make stress-quick
+
+      - name: Upload chaos logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quick-chaos-logs
+          path: /tmp/vex-chaos-*
+          retention-days: 7
+
+  # ── Nightly: long-running production-shape + ThreadSanitizer ─────────
+  prod-shape:
+    name: Production-shape stress (5 min)
+    runs-on: ubuntu-latest
+    # Skip on PR — too long. Always run on schedule + manual dispatch.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Install redis-cli
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends redis-tools
+
+      - name: Build vex (ReleaseSafe)
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Production-shape stress
+        env:
+          DURATION: '300'
+        run: make stress-prod-shape
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prod-shape-logs
+          path: /tmp/vex-chaos-prod-shape-*
+          retention-days: 14
+
+  # ── Nightly: ThreadSanitizer unit tests ──────────────────────────────
+  tsan:
+    name: ThreadSanitizer unit tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: zig build test -Dsanitize-thread=true
+        run: zig build test -Dsanitize-thread=true --summary all
+
+  # ── Light: version-doc consistency ───────────────────────────────────
+  doc-sync:
+    name: Versioned docs in sync with build.zig.zon
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: make check-docs

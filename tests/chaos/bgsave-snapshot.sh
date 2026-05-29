@@ -34,15 +34,18 @@ BG_PIDS=()
 
 log() { printf '[bgsave] %s\n' "$*"; }
 cleanup() {
+    trap - EXIT INT TERM
     set +e
-    for p in "${BG_PIDS[@]}"; do kill "$p" 2>/dev/null; done
-    if [[ -n "$VEX_PID" ]]; then
-        kill "$VEX_PID" 2>/dev/null
-        wait "$VEX_PID" 2>/dev/null
-    fi
-    log "logs preserved at $RUN_DIR"
+    # Kill every direct child of this script (vex + redis-cli loops +
+    # any background subshell) with SIGTERM, wait briefly, then SIGKILL.
+    # pkill -P is robust to BG_PID arrays drifting and to children that
+    # ignore SIGTERM (vex shutdown handler can hang under load).
+    pkill -P $$ 2>/dev/null
+    sleep 0.3
+    pkill -9 -P $$ 2>/dev/null
+    [[ -n "$RUN_DIR" ]] && printf "logs preserved at %s\n" "$RUN_DIR" >&2
 }
-ping_ok() { redis-cli -p "$PORT" -t 3 PING 2>/dev/null | grep -q '^PONG$'; }
+ping_ok() { redis-cli -p "$PORT" PING 2>/dev/null | grep -q '^PONG$'; }
 start_vex() {
     "$VEX_BIN" \
         --port "$PORT" \
@@ -99,7 +102,7 @@ while (( elapsed < DURATION )); do
         exit 1
     fi
 
-    reply=$(redis-cli -p "$PORT" -t 5 BGSAVE 2>&1)
+    reply=$(redis-cli -p "$PORT" BGSAVE 2>&1)
     bgsave_count=$(( bgsave_count + 1 ))
     if echo "$reply" | grep -qi 'started'; then
         log "  bgsave #$bgsave_count: ok"
@@ -117,7 +120,7 @@ for p in "${BG_PIDS[@]}"; do wait "$p" 2>/dev/null; done
 
 # Final BGSAVE so we have a snapshot reflecting the final state.
 log "final BGSAVE + waiting for it to finish"
-redis-cli -p "$PORT" -t 10 BGSAVE >/dev/null
+redis-cli -p "$PORT" BGSAVE >/dev/null
 # LASTSAVE: when it advances past the pre-call timestamp, the BGSAVE landed.
 pre=$(redis-cli -p "$PORT" LASTSAVE 2>/dev/null)
 for _ in {1..120}; do
@@ -142,7 +145,12 @@ sample_key=$(redis-cli -p "$PORT" SCAN 0 COUNT 1 | tail -1)
 
 # ── Restart from snapshot ─────────────────────────────────────────────
 log "stopping vex"
-kill "$VEX_PID" 2>/dev/null
+kill -TERM "$VEX_PID" 2>/dev/null
+# Wait up to 2s for graceful shutdown so AOF flushes, then SIGKILL.
+# vex's SIGTERM handler only sets a shutdown flag the main loop must
+# poll, and under load that poll can be delayed indefinitely.
+for _ in $(seq 1 20); do kill -0 "$VEX_PID" 2>/dev/null || break; sleep 0.1; done
+kill -9 "$VEX_PID" 2>/dev/null
 wait "$VEX_PID" 2>/dev/null
 VEX_PID=
 

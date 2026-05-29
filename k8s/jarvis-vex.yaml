@@ -1,0 +1,121 @@
+# Vex deployment in the jarvis namespace on fundsindia-scrum-eks.
+# Purpose: reproduce the production crash loop in a clean environment
+# we can poke at, then iterate fixes (0.7.4) against the same setup.
+#
+# Apply: kubectl apply -f k8s/jarvis-vex.yaml
+# Access: kubectl -n jarvis port-forward svc/vex 6380:6380
+#         redis-cli -p 6380 PING
+# Logs:   kubectl -n jarvis logs deploy/vex -f
+# Status: kubectl -n jarvis get pods -w
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: vex-data
+  namespace: jarvis
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: gp3
+  resources:
+    requests:
+      storage: 50Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vex
+  namespace: jarvis
+  labels:
+    app: vex
+    purpose: crash-repro
+spec:
+  replicas: 1
+  strategy:
+    # Recreate so the PVC isn't held by two pods during rollout.
+    type: Recreate
+  selector:
+    matchLabels:
+      app: vex
+  template:
+    metadata:
+      labels:
+        app: vex
+    spec:
+      terminationGracePeriodSeconds: 10
+      # Vex's image runs as uid 10001 (user 'vex'). The gp3 PVC mounts
+      # as root:root by default, so vex can't open /data/vex.aof.
+      # fsGroup makes the kubelet chown the volume to the specified
+      # GID before mounting — see k8s docs on "ownership management".
+      securityContext:
+        fsGroup: 10001
+      containers:
+      - name: vex
+        # ECR image built locally with -Dcpu=x86_64_v3 so the binary runs
+        # on AMD Zen 1/3 EKS nodes. ghcr.io/pratyush-sngh/vex:0.7.3 SIGILLs
+        # on those nodes — the CI image uses native CPU target on an
+        # Intel runner. Switch back once docker-publish.yml is updated to
+        # pass -Dcpu=x86_64_v3 (Dockerfile.vex already has it).
+        image: 208168340597.dkr.ecr.ap-south-1.amazonaws.com/jarvis/vex:0.7.3-cpuv3
+        imagePullPolicy: Always
+        args:
+          - --port
+          - "6380"
+          - --workers
+          - "4"
+          - --data-dir
+          - /data
+          - --appendonly
+          - "yes"
+        ports:
+          - containerPort: 6380
+            name: resp
+            protocol: TCP
+        env:
+          - name: TZ
+            value: Asia/Kolkata
+          # If the crash signature changes, MALLOC_CHECK_=3 makes glibc
+          # abort earlier — useful for sharpening the diagnosis.
+          # Uncomment temporarily when debugging:
+          # - name: MALLOC_CHECK_
+          #   value: "3"
+        volumeMounts:
+          - name: data
+            mountPath: /data
+        readinessProbe:
+          tcpSocket:
+            port: 6380
+          initialDelaySeconds: 2
+          periodSeconds: 5
+          timeoutSeconds: 2
+        # No livenessProbe on purpose — we want to inspect the pod when
+        # it's stuck rather than have k8s recycle it from underneath us.
+        # The container exits on real crashes anyway; restartPolicy is
+        # Always at the pod spec level.
+        resources:
+          requests:
+            cpu: "2"
+            memory: 2Gi
+          limits:
+            cpu: "4"
+            memory: 8Gi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: vex-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vex
+  namespace: jarvis
+  labels:
+    app: vex
+spec:
+  type: ClusterIP
+  selector:
+    app: vex
+  ports:
+    - port: 6380
+      targetPort: 6380
+      protocol: TCP
+      name: resp

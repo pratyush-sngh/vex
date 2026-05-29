@@ -1,0 +1,65 @@
+name: Auto-tag on version bump
+
+# When a commit lands on main and `build.zig.zon`'s .version field has
+# changed to a value that doesn't yet have a corresponding `vX.Y.Z` tag,
+# this workflow creates the tag and pushes it. That re-uses the existing
+# `docker-publish.yml` (which triggers on `v*` tag push) so a single
+# commit "bump 0.7.4 → 0.7.5" is enough to ship a release end-to-end.
+#
+# Safety: only fires on push to main, only creates the tag when missing.
+# Re-pushing a commit with an already-tagged version is a no-op.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'build.zig.zon'
+
+permissions:
+  contents: write   # tag create + push
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # need full history to check tag existence
+
+      - name: Extract canonical version from build.zig.zon
+        id: version
+        run: |
+          v=$(awk -F'"' '/^[[:space:]]*\.version[[:space:]]*=/{print $2; exit}' build.zig.zon)
+          if [ -z "$v" ]; then
+            echo "::error::could not read .version from build.zig.zon"
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "tag=v$v" >> "$GITHUB_OUTPUT"
+          echo "[auto-tag] canonical version: $v"
+
+      - name: Skip if tag already exists
+        id: check
+        run: |
+          tag="${{ steps.version.outputs.tag }}"
+          if git rev-parse "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "[auto-tag] tag $tag already exists — nothing to do"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "[auto-tag] tag $tag does not exist — will create"
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create + push tag
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GIT_COMMITTER_NAME: github-actions[bot]
+          GIT_COMMITTER_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+        run: |
+          tag="${{ steps.version.outputs.tag }}"
+          v="${{ steps.version.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$tag" -m "Release $v (auto-tagged from build.zig.zon bump)"
+          git push origin "$tag"
+          echo "[auto-tag] created and pushed $tag"

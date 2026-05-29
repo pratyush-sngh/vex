@@ -1,0 +1,51 @@
+# Chaos-runner Pod for jarvis. Runs the full tests/chaos/ suite on
+# Linux (io_uring + TLS + full ephemeral port range), capturing
+# PASS/FAIL for each script. Each script spawns its OWN ephemeral
+# vex inside the runner — they don't touch the deployed jarvis-vex
+# Service (port-conflict isolation).
+#
+# Apply:    kubectl apply -f k8s/jarvis-chaos.yaml
+# Watch:    kubectl -n jarvis logs -f pod/chaos-runner
+# Interact: kubectl -n jarvis exec -it chaos-runner -- bash
+# Cleanup:  kubectl -n jarvis delete pod chaos-runner
+apiVersion: v1
+kind: Pod
+metadata:
+  name: chaos-runner
+  namespace: jarvis
+  labels:
+    app: chaos-runner
+    purpose: vex-regression
+spec:
+  # No restart: this is a one-shot run. The image's CMD exits 0/1
+  # based on PASS/FAIL — let the Pod show that exit so we can read
+  # the result from `kubectl get pods`.
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 30
+  containers:
+    - name: runner
+      image: 208168340597.dkr.ecr.ap-south-1.amazonaws.com/jarvis/vex:chaos-runner
+      imagePullPolicy: Always
+      # Scripts spawn vex on various ports; need bind permission, no
+      # need for root beyond that. Default user in the image is root
+      # (different from the vex image which runs as 10001 — see
+      # Dockerfile.chaos-runner for why).
+      resources:
+        # Enough headroom for the busiest scripts (hotpath-rehash
+        # piles 500k unique keys into ConcurrentKV). The deployed
+        # jarvis-vex has 8Gi; we mirror that.
+        requests:
+          cpu: "2"
+          memory: 4Gi
+        limits:
+          cpu: "4"
+          memory: 8Gi
+      # /tmp gets used heavily for vex temp data + chaos script logs.
+      # emptyDir keeps it on local disk for speed, not on the PVC.
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+  volumes:
+    - name: tmp
+      emptyDir:
+        sizeLimit: 4Gi

@@ -34,15 +34,18 @@ GET_PID=
 
 log() { printf '[bgrewriteaof] %s\n' "$*"; }
 cleanup() {
+    trap - EXIT INT TERM
     set +e
-    [[ -n "$GET_PID" ]] && kill "$GET_PID" 2>/dev/null
-    if [[ -n "$VEX_PID" ]]; then
-        kill "$VEX_PID" 2>/dev/null
-        wait "$VEX_PID" 2>/dev/null
-    fi
-    log "logs preserved at $RUN_DIR"
+    # Kill every direct child of this script (vex + redis-cli loops +
+    # any background subshell) with SIGTERM, wait briefly, then SIGKILL.
+    # pkill -P is robust to BG_PID arrays drifting and to children that
+    # ignore SIGTERM (vex shutdown handler can hang under load).
+    pkill -P $$ 2>/dev/null
+    sleep 0.3
+    pkill -9 -P $$ 2>/dev/null
+    [[ -n "$RUN_DIR" ]] && printf "logs preserved at %s\n" "$RUN_DIR" >&2
 }
-ping_ok() { redis-cli -p "$PORT" -t 3 PING 2>/dev/null | grep -q '^PONG$'; }
+ping_ok() { redis-cli -p "$PORT" PING 2>/dev/null | grep -q '^PONG$'; }
 
 # ── Sanity ────────────────────────────────────────────────────────────
 [[ -x "$VEX_BIN" ]] || { log "FAIL: $VEX_BIN missing — run 'zig build' first"; exit 1; }
@@ -97,7 +100,7 @@ log "starting GET stream sampling latency (target $GET_SAMPLE_COUNT samples)"
         # Pick a random key index so we hit different stripes.
         k=$(( (RANDOM * 32768 + RANDOM) % N_KEYS + 1 ))
         t0_ns=$(perl -MTime::HiRes=time -e 'printf "%d\n", time*1e9')
-        out=$(redis-cli -p "$PORT" -t 5 GET "k$k" 2>/dev/null)
+        out=$(redis-cli -p "$PORT" GET "k$k" 2>/dev/null)
         rc=$?
         t1_ns=$(perl -MTime::HiRes=time -e 'printf "%d\n", time*1e9')
         ms=$(( (t1_ns - t0_ns) / 1000000 ))
@@ -117,7 +120,7 @@ sleep 1
 # ── Trigger BGREWRITEAOF ──────────────────────────────────────────────
 log "issuing BGREWRITEAOF"
 issue_t0=$(perl -MTime::HiRes=time -e 'printf "%d\n", time*1e9')
-issue_reply=$(redis-cli -p "$PORT" -t 5 BGREWRITEAOF)
+issue_reply=$(redis-cli -p "$PORT" BGREWRITEAOF)
 issue_t1=$(perl -MTime::HiRes=time -e 'printf "%d\n", time*1e9')
 issue_ms=$(( (issue_t1 - issue_t0) / 1000000 ))
 log "  reply: '$issue_reply' (returned in ${issue_ms}ms)"
@@ -135,7 +138,7 @@ fi
 
 # ── Immediate re-issue should be refused ──────────────────────────────
 sleep 0.1
-reissue=$(redis-cli -p "$PORT" -t 3 BGREWRITEAOF 2>&1)
+reissue=$(redis-cli -p "$PORT" BGREWRITEAOF 2>&1)
 if ! echo "$reissue" | grep -qi 'in progress'; then
     log "WARN: concurrent BGREWRITEAOF was not refused — got '$reissue'"
     log "      (this only fails if the rewrite already finished — usually OK on tiny datasets)"

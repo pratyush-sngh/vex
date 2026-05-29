@@ -33,14 +33,16 @@ PUB_PIDS=()
 log() { printf '[pubsub-tls] %s\n' "$*"; }
 
 cleanup() {
+    trap - EXIT INT TERM
     set +e
-    for p in "${PUB_PIDS[@]}"; do kill "$p" 2>/dev/null; done
-    for p in "${SUB_PIDS[@]}"; do kill "$p" 2>/dev/null; done
-    if [[ -n "$VEX_PID" ]]; then
-        kill "$VEX_PID" 2>/dev/null
-        wait "$VEX_PID" 2>/dev/null
-    fi
-    log "logs preserved at $RUN_DIR"
+    # Kill every direct child of this script (vex + redis-cli loops +
+    # any background subshell) with SIGTERM, wait briefly, then SIGKILL.
+    # pkill -P is robust to BG_PID arrays drifting and to children that
+    # ignore SIGTERM (vex shutdown handler can hang under load).
+    pkill -P $$ 2>/dev/null
+    sleep 0.3
+    pkill -9 -P $$ 2>/dev/null
+    [[ -n "$RUN_DIR" ]] && printf "logs preserved at %s\n" "$RUN_DIR" >&2
 }
 
 vex_alive() {
@@ -48,7 +50,9 @@ vex_alive() {
 }
 
 tls_ping() {
-    redis-cli --tls --insecure -p "$PORT" -t 3 PING 2>/dev/null | grep -q '^PONG$'
+    # Note: no `-t` — redis-cli 7.0 (Debian Bookworm) doesn't support
+    # the timeout flag. Default behavior is fine for our use.
+    redis-cli --tls --insecure -p "$PORT" PING 2>/dev/null | grep -q '^PONG$'
 }
 
 # ── Self-signed cert ──────────────────────────────────────────────────
@@ -73,6 +77,24 @@ log "starting vex on :$PORT with $WORKERS workers + TLS"
     --tls-key "$RUN_DIR/key.pem" \
     > "$RUN_DIR/vex.log" 2>&1 &
 VEX_PID=$!
+
+# Brief wait so the banner / TLS init line lands in vex.log.
+for _ in {1..20}; do
+    [[ -s "$RUN_DIR/vex.log" ]] && break
+    sleep 0.1
+done
+
+# Vex on dev macOS builds is often compiled without an OpenSSL backend
+# and prints "TLS init failed: TlsNotAvailable" then falls back to
+# plaintext. Probing the running server with --tls would hang forever
+# because the TCP handshake succeeds and the TLS handshake stalls. Skip
+# cleanly so the rest of the chaos suite runs.
+if grep -q "TLS init failed\|TlsNotAvailable" "$RUN_DIR/vex.log"; then
+    log "SKIP: this vex build has no working TLS backend (see vex.log)"
+    log "  the cross-worker TLS pub/sub race needs OpenSSL to reproduce"
+    log "  this script will run cleanly on Linux CI"
+    exit 0
+fi
 
 # Wait for vex to be ready (≤5s).
 for _ in {1..50}; do

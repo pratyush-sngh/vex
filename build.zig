@@ -10,6 +10,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Sanitizer / safety profiles. The defaults match the prior build
+    // behavior; the chaos suite (tests/chaos/) exercises them via
+    // dedicated Makefile targets (test-tsan, test-release-safe).
+    const sanitize_thread = b.option(bool, "sanitize-thread", "Enable ThreadSanitizer (-fsanitize-thread)") orelse false;
+    const sanitize_c = b.option(bool, "sanitize-c", "Enable UBSan / -fsanitize-c=full") orelse false;
+
     const build_opts = b.addOptions();
     build_opts.addOption([]const u8, "version", vex_version);
     const build_opts_mod = build_opts.createModule();
@@ -28,6 +34,8 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = true,
+            .sanitize_thread = if (sanitize_thread) true else null,
+            .sanitize_c = if (sanitize_c) .full else null,
             .imports = &.{
                 .{ .name = "build_options", .module = build_opts_mod },
             },
@@ -120,6 +128,8 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = true,
+            .sanitize_thread = if (sanitize_thread) true else null,
+            .sanitize_c = if (sanitize_c) .full else null,
             .imports = &.{
                 .{ .name = "build_options", .module = build_opts_mod },
             },

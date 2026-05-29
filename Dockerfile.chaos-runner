@@ -1,0 +1,52 @@
+# Chaos-runner image: bundles vex + the chaos suite + the tools each
+# script depends on (redis-cli, perl, bash). Lets us run the whole
+# suite on Linux from a single Pod, exercising the io_uring + TLS
+# code paths that macOS dev builds can't touch.
+#
+# Build (from repo root, on any platform):
+#   docker buildx build --platform=linux/amd64 \
+#     -f Dockerfile.chaos-runner \
+#     -t 208168340597.dkr.ecr.ap-south-1.amazonaws.com/jarvis/vex:chaos-runner \
+#     --load .
+#
+# Run inside the cluster (the manifest in k8s/jarvis-chaos.yaml does this):
+#   kubectl -n jarvis exec -it chaos-runner -- /chaos/run.sh
+
+# Stage 1: build vex with the portable x86_64_v3 target. Same Zig as
+# Dockerfile.vex so the chaos-runner vex matches the deployed vex.
+FROM debian:bookworm-slim AS builder
+RUN apt-get update -qq && apt-get install -y -qq curl xz-utils ca-certificates > /dev/null 2>&1 \
+    && arch="$(dpkg --print-architecture)" \
+    && if [ "$arch" = "arm64" ]; then zig_pkg="zig-aarch64-linux-0.17.0-dev.314+eae06cf5c"; else zig_pkg="zig-x86_64-linux-0.17.0-dev.314+eae06cf5c"; fi \
+    && curl -sL "https://ziglang.org/builds/${zig_pkg}.tar.xz" | tar xJ -C /opt \
+    && ln -s "/opt/${zig_pkg}/zig" /usr/local/bin/zig \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY . .
+RUN zig build -Doptimize=ReleaseFast -Dcpu=x86_64_v3
+
+# Stage 2: runtime with the suite + dependencies. Run as root because
+# the chaos scripts spawn ephemeral vex processes on various ports and
+# need to bind+listen; vex itself drops nothing intrusive at runtime.
+FROM debian:bookworm-slim
+RUN apt-get update -qq \
+    && apt-get install -y -qq --no-install-recommends \
+        redis-tools \
+        redis-server \
+        perl \
+        ca-certificates \
+        coreutils \
+        procps \
+        python3-minimal \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/zig-out/bin/vex /usr/local/bin/vex
+
+# Bake the chaos scripts in so the runner is self-contained — no kubectl
+# cp dance, no ConfigMap juggling. run-all.sh is the suite driver.
+COPY tests/chaos /chaos
+COPY Makefile /workspace/Makefile
+
+WORKDIR /workspace
+ENTRYPOINT ["/bin/bash"]
+CMD ["-c", "/chaos/run-all.sh"]

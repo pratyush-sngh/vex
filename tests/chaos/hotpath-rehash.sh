@@ -40,15 +40,18 @@ BG_PIDS=()
 
 log() { printf '[rehash] %s\n' "$*"; }
 cleanup() {
+    trap - EXIT INT TERM
     set +e
-    for p in "${BG_PIDS[@]}"; do kill "$p" 2>/dev/null; done
-    if [[ -n "$VEX_PID" ]]; then
-        kill "$VEX_PID" 2>/dev/null
-        wait "$VEX_PID" 2>/dev/null
-    fi
-    log "logs preserved at $RUN_DIR"
+    # Kill every direct child of this script (vex + redis-cli loops +
+    # any background subshell) with SIGTERM, wait briefly, then SIGKILL.
+    # pkill -P is robust to BG_PID arrays drifting and to children that
+    # ignore SIGTERM (vex shutdown handler can hang under load).
+    pkill -P $$ 2>/dev/null
+    sleep 0.3
+    pkill -9 -P $$ 2>/dev/null
+    [[ -n "$RUN_DIR" ]] && printf "logs preserved at %s\n" "$RUN_DIR" >&2
 }
-ping_ok() { redis-cli -p "$PORT" -t 3 PING 2>/dev/null | grep -q '^PONG$'; }
+ping_ok() { redis-cli -p "$PORT" PING 2>/dev/null | grep -q '^PONG$'; }
 
 # ── Sanity ────────────────────────────────────────────────────────────
 [[ -x "$VEX_BIN" ]] || { log "FAIL: $VEX_BIN missing — run 'zig build' first"; exit 1; }
