@@ -247,4 +247,67 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_persistence_bench.addArgs(args);
     const bench_persistence_step = b.step("bench-persistence", "Benchmark snapshot and AOF persistence paths");
     bench_persistence_step.dependOn(&run_persistence_bench.step);
+
+    // ── DPDK targets ────────────────────────────────────────────────
+    // Opt-in (`-Ddpdk=true`); Linux x86_64 only. Requires libdpdk-dev
+    // and libmd-dev on the build host (system libraries; zig calls
+    // pkg-config to discover them). See tools/dpdk/Dockerfile.dpdk for
+    // a reference install line and docs/dpdk.md for the bigger
+    // picture. When this option is on we build the two probes from
+    // tools/dpdk/ as part of `zig build`, gated by:
+    //
+    //   * platform check below (early panic on macOS / arm64),
+    //   * pkg-config resolution of libdpdk (zig will fail fast if
+    //     headers/libs aren't installed),
+    //   * a one-line dpdk_shim.c we compile alongside each probe.
+    //
+    // CI uses this to gate every PR: even though it can't actually
+    // *run* the probes without a bound NIC, "does the DPDK build
+    // path still link?" catches the breakage class the io_uring race
+    // belonged to.
+    const dpdk_enabled = b.option(bool, "dpdk", "Build DPDK probes from tools/dpdk/ (Linux x86_64 only; requires libdpdk-dev + libmd-dev)") orelse false;
+    if (dpdk_enabled) {
+        if (target.result.os.tag != .linux or target.result.cpu.arch != .x86_64) {
+            std.debug.panic(
+                "-Ddpdk=true requires linux/x86_64; got {s}/{s}. " ++
+                    "Use the tools/dpdk/Dockerfile.dpdk image (--platform=linux/amd64) " ++
+                    "to build DPDK probes from a non-Linux host.",
+                .{ @tagName(target.result.os.tag), @tagName(target.result.cpu.arch) },
+            );
+        }
+
+        const dpdk_probes = [_]struct { name: []const u8, src: []const u8 }{
+            .{ .name = "hello_lcore", .src = "tools/dpdk/hello_lcore.zig" },
+            .{ .name = "port_probe", .src = "tools/dpdk/port_probe.zig" },
+        };
+
+        const dpdk_step = b.step("dpdk", "Build the DPDK probes (requires -Ddpdk=true; Linux x86_64 only)");
+
+        for (dpdk_probes) |probe| {
+            const exe_probe = b.addExecutable(.{
+                .name = probe.name,
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path(probe.src),
+                    .target = target,
+                    .optimize = optimize,
+                    .link_libc = true,
+                }),
+            });
+            // dpdk_shim.c wraps the DPDK symbols that live as
+            // static-inline in headers (rte_lcore_id, rte_eth_rx_burst,
+            // ...). See tools/dpdk/dpdk_shim.c for the rationale.
+            exe_probe.root_module.addCSourceFile(.{
+                .file = b.path("tools/dpdk/dpdk_shim.c"),
+                .flags = &.{ "-O2", "-Wall", "-Wextra" },
+            });
+            // Let Zig discover libdpdk + transitive deps (libmd via
+            // libbsd, libnuma, libpcap, ...) via pkg-config. `.weak`
+            // would suppress the link-time failure; we want the loud
+            // version so a misconfigured build host fails fast.
+            exe_probe.root_module.linkSystemLibrary("dpdk", .{ .use_pkg_config = .force });
+            exe_probe.root_module.linkSystemLibrary("md", .{});
+            b.installArtifact(exe_probe);
+            dpdk_step.dependOn(&exe_probe.step);
+        }
+    }
 }
