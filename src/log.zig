@@ -135,7 +135,7 @@ pub const Logger = struct {
     }
 };
 
-fn formatJsonLine(buf: []u8, ts: []const u8, level: []const u8, msg: []const u8) ?[]const u8 {
+pub fn formatJsonLine(buf: []u8, ts: []const u8, level: []const u8, msg: []const u8) ?[]const u8 {
     var pos: usize = 0;
     const prefix = "{\"ts\":\"";
     if (pos + prefix.len > buf.len) return null;
@@ -161,7 +161,7 @@ fn formatJsonLine(buf: []u8, ts: []const u8, level: []const u8, msg: []const u8)
 
 /// Write a JSON-escaped version of `s` into `dst`. Returns bytes written, or
 /// null if `dst` is too small.
-fn jsonEscape(dst: []u8, s: []const u8) ?usize {
+pub fn jsonEscape(dst: []u8, s: []const u8) ?usize {
     var pos: usize = 0;
     for (s) |ch| {
         switch (ch) {
@@ -210,7 +210,7 @@ fn jsonEscape(dst: []u8, s: []const u8) ?usize {
     return pos;
 }
 
-fn formatTimestamp(buf: *[30]u8) []const u8 {
+pub fn formatTimestamp(buf: *[30]u8) []const u8 {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(std.c.CLOCK.REALTIME, &ts);
     const now_ms: i64 = @as(i64, @intCast(ts.sec)) * 1000 + @divTrunc(@as(i64, @intCast(ts.nsec)), 1_000_000);
@@ -273,76 +273,3 @@ pub fn err(comptime fmt: []const u8, args: anytype) void {
     global.err(fmt, args);
 }
 
-test "log level parse" {
-    try std.testing.expectEqual(Level.debug, Level.parse("debug"));
-    try std.testing.expectEqual(Level.info, Level.parse("info"));
-    try std.testing.expectEqual(Level.warn, Level.parse("warn"));
-    try std.testing.expectEqual(Level.err, Level.parse("error"));
-    try std.testing.expectEqual(Level.info, Level.parse("unknown"));
-}
-
-test "log level filtering" {
-    const logger = Logger.init(.warn);
-    try std.testing.expect(!logger.enabled(.debug));
-    try std.testing.expect(!logger.enabled(.info));
-    try std.testing.expect(logger.enabled(.warn));
-    try std.testing.expect(logger.enabled(.err));
-}
-
-test "format parse" {
-    try std.testing.expectEqual(Format.json, Format.parse("json"));
-    try std.testing.expectEqual(Format.json, Format.parse("JSON"));
-    try std.testing.expectEqual(Format.text, Format.parse("text"));
-    try std.testing.expectEqual(Format.text, Format.parse("anything-else"));
-}
-
-test "timestamp format" {
-    var buf: [30]u8 = undefined;
-    const ts = formatTimestamp(&buf);
-    // Should be like "2026-04-23T10:30:00Z" — 20 chars
-    try std.testing.expectEqual(@as(usize, 20), ts.len);
-    try std.testing.expect(ts[4] == '-');
-    try std.testing.expect(ts[10] == 'T');
-    try std.testing.expect(ts[19] == 'Z');
-}
-
-test "json escape — plain ascii" {
-    var buf: [64]u8 = undefined;
-    const n = jsonEscape(&buf, "hello world").?;
-    try std.testing.expectEqualStrings("hello world", buf[0..n]);
-}
-
-test "json escape — quote and backslash" {
-    var buf: [64]u8 = undefined;
-    const n = jsonEscape(&buf, "say \"hi\" \\ ok").?;
-    try std.testing.expectEqualStrings("say \\\"hi\\\" \\\\ ok", buf[0..n]);
-}
-
-test "json escape — control chars" {
-    var buf: [64]u8 = undefined;
-    const n = jsonEscape(&buf, "line1\nline2\ttab\r").?;
-    try std.testing.expectEqualStrings("line1\\nline2\\ttab\\r", buf[0..n]);
-}
-
-test "json escape — buffer too small" {
-    var buf: [4]u8 = undefined;
-    try std.testing.expect(jsonEscape(&buf, "abcdefghij") == null);
-}
-
-test "format json line — well-formed" {
-    var buf: [256]u8 = undefined;
-    const line = formatJsonLine(&buf, "2026-05-24T12:00:00Z", "WARN", "broadcast to fd=7 failed: BrokenPipe").?;
-    try std.testing.expectEqualStrings(
-        "{\"ts\":\"2026-05-24T12:00:00Z\",\"level\":\"WARN\",\"msg\":\"broadcast to fd=7 failed: BrokenPipe\"}\n",
-        line,
-    );
-}
-
-test "format json line — escapes in message" {
-    var buf: [256]u8 = undefined;
-    const line = formatJsonLine(&buf, "2026-05-24T12:00:00Z", "INFO", "got \"frame\" type=3\nrest").?;
-    try std.testing.expectEqualStrings(
-        "{\"ts\":\"2026-05-24T12:00:00Z\",\"level\":\"INFO\",\"msg\":\"got \\\"frame\\\" type=3\\nrest\"}\n",
-        line,
-    );
-}

@@ -1,0 +1,28 @@
+FROM debian:bookworm-slim AS builder
+RUN apt-get update -qq && apt-get install -y -qq curl xz-utils ca-certificates > /dev/null 2>&1 \
+    && arch="$(dpkg --print-architecture)" \
+    && if [ "$arch" = "arm64" ]; then zig_pkg="zig-aarch64-linux-0.17.0-dev.314+eae06cf5c"; else zig_pkg="zig-x86_64-linux-0.17.0-dev.314+eae06cf5c"; fi \
+    && curl -sL "https://ziglang.org/builds/${zig_pkg}.tar.xz" | tar xJ -C /opt \
+    && ln -s "/opt/${zig_pkg}/zig" /usr/local/bin/zig \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY . .
+# ReleaseSafe keeps Zig's safety checks (bounds, null, overflow) compiled in,
+# -Dsanitize-c=true enables UBSan on any C sources / libc calls. Together this
+# is the closest to ASan we can get without rebuilding glibc.
+RUN arch="$(uname -m)" \
+    && if [ "$arch" = "x86_64" ]; then \
+        zig build -Doptimize=ReleaseSafe -Dsanitize-c=true -Dcpu=x86_64_v3; \
+    else \
+        zig build -Doptimize=ReleaseSafe -Dsanitize-c=true; \
+    fi
+
+FROM debian:bookworm-slim
+RUN useradd -m -u 10001 vex
+WORKDIR /app
+COPY --from=builder /app/zig-out/bin/vex /usr/local/bin/vex
+RUN mkdir -p /data && chown -R vex:vex /data
+USER vex
+EXPOSE 6380
+ENTRYPOINT ["/usr/local/bin/vex"]
+CMD ["--port", "6380", "--data-dir", "/data"]

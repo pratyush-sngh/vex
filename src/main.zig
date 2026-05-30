@@ -768,7 +768,7 @@ fn applyConfigFile(
 }
 
 /// Parse memory size with optional suffix: "256mb", "1gb", "1024" (bytes)
-fn parseMemorySize(s: []const u8) usize {
+pub fn parseMemorySize(s: []const u8) usize {
     if (s.len == 0) return 0;
     var end = s.len;
     var multiplier: usize = 1;
@@ -820,50 +820,4 @@ fn initGlobalLogger(
         vex_log.warn("cannot open log-file '{s}': {s}; logs going to stderr", .{ path, @errorName(err) });
         return;
     };
-}
-
-test "parseMemorySize" {
-    try std.testing.expectEqual(@as(usize, 1024), parseMemorySize("1024"));
-    try std.testing.expectEqual(@as(usize, 256 * 1024 * 1024), parseMemorySize("256mb"));
-    try std.testing.expectEqual(@as(usize, 256 * 1024 * 1024), parseMemorySize("256MB"));
-    try std.testing.expectEqual(@as(usize, 1024 * 1024 * 1024), parseMemorySize("1gb"));
-    try std.testing.expectEqual(@as(usize, 64 * 1024), parseMemorySize("64kb"));
-    try std.testing.expectEqual(@as(usize, 0), parseMemorySize(""));
-    try std.testing.expectEqual(@as(usize, 0), parseMemorySize("abc"));
-}
-
-test {
-    _ = @import("server/resp.zig");
-    _ = @import("engine/kv.zig");
-    _ = @import("engine/concurrent_kv.zig");
-    _ = @import("server/event_loop.zig");
-    _ = @import("server/worker.zig");
-    _ = @import("engine/graph.zig");
-    _ = @import("engine/query.zig");
-    _ = @import("command/handler.zig");
-    _ = @import("storage/snapshot.zig");
-    _ = @import("storage/aof.zig");
-    _ = @import("perf/span.zig");
-    _ = @import("engine/string_intern.zig");
-    _ = @import("engine/property_store.zig");
-    _ = @import("command/comptime_dispatch.zig");
-    _ = @import("server/tls.zig");
-    _ = @import("log.zig");
-    _ = @import("config.zig");
-    _ = @import("cluster/config.zig");
-    _ = @import("cluster/protocol.zig");
-    _ = @import("cluster/replication.zig");
-    _ = @import("engine/list.zig");
-    _ = @import("engine/hash.zig");
-    _ = @import("engine/set.zig");
-    _ = @import("engine/sorted_set.zig");
-    _ = @import("engine/vector_store.zig");
-    _ = @import("engine/hnsw.zig");
-    _ = @import("engine/rag.zig");
-    _ = @import("engine/ch.zig");
-    _ = @import("observability/cmd_table.zig");
-    _ = @import("observability/stats.zig");
-    _ = @import("observability/event_stats.zig");
-    _ = @import("observability/clients.zig");
-    _ = @import("storage/atomic_io.zig");
 }

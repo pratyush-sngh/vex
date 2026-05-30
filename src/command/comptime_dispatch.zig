@@ -84,44 +84,7 @@ comptime {
 
 // ── Tests ───────────────────────────────────────────────────────────
 
-fn runtimeDispatchKey(name: []const u8) u16 {
+pub fn runtimeDispatchKey(name: []const u8) u16 {
     return (@as(u16, @intCast(name.len)) << 8) | @as(u16, std.ascii.toUpper(name[0]));
 }
 
-test "dispatch keys are unique" {
-    // Comptime validation already runs above; this tests the runtime path
-    for (hot_commands, 0..) |a, i| {
-        for (hot_commands[i + 1 ..]) |b| {
-            try std.testing.expect(runtimeDispatchKey(a.name) != runtimeDispatchKey(b.name));
-        }
-    }
-}
-
-test "dispatch key computation" {
-    try std.testing.expectEqual(dispatchKey("GET"), (3 << 8) | 'G');
-    try std.testing.expectEqual(dispatchKey("SET"), (3 << 8) | 'S');
-    try std.testing.expectEqual(dispatchKey("DEL"), (3 << 8) | 'D');
-    try std.testing.expectEqual(dispatchKey("PING"), (4 << 8) | 'P');
-    try std.testing.expectEqual(dispatchKey("EXISTS"), (6 << 8) | 'E');
-}
-
-test "resp integer literals" {
-    try std.testing.expectEqualStrings(":0\r\n", RespInts.@"0");
-    try std.testing.expectEqualStrings(":1\r\n", RespInts.@"1");
-    try std.testing.expectEqualStrings(":-1\r\n", RespInts.@"-1");
-    try std.testing.expectEqualStrings(":-2\r\n", RespInts.@"-2");
-}
-
-test "findCommand" {
-    const get_cmd = comptime findCommand(&hot_commands, "GET");
-    try std.testing.expect(get_cmd != null);
-    try std.testing.expect(!get_cmd.?.flags.is_write);
-    try std.testing.expectEqual(@as(u4, 2), get_cmd.?.flags.min_args);
-
-    const set_cmd = comptime findCommand(&hot_commands, "SET");
-    try std.testing.expect(set_cmd != null);
-    try std.testing.expect(set_cmd.?.flags.is_write);
-
-    const missing = comptime findCommand(&hot_commands, "UNKNOWN");
-    try std.testing.expect(missing == null);
-}

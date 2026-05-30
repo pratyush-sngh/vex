@@ -174,9 +174,3 @@ fn loadSym(comptime T: type, handle: *anyopaque, name: [*:0]const u8) ?T {
 
 // ── Tests ───────────────────────────────────────────────────────────
 
-test "tls module compiles" {
-    // Just verify the module compiles without OpenSSL linked.
-    // Actual TLS tests require cert/key files.
-    const t: ?TlsContext = null;
-    _ = t;
-}
