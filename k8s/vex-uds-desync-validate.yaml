@@ -1,0 +1,74 @@
+# One-shot validation for the two handover bugs, on the real io_uring backend:
+#   1. UDS stuck-listener (open issue #2): sustained UDS load + connect churn
+#      with --workers 4 must keep accepting (pre-fix: ECONNREFUSED).
+#   2. compare-client RESP desync (open issue #3): c=16/c=32 runs must report
+#      zero "unknown RESP type" errors (pre-fix: poisoned conns).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vex-uds-desync-validate
+  namespace: scrum6
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node.kubernetes.io/instance-type
+                    operator: In
+                    values: ["c5a.2xlarge"]
+      containers:
+        - name: validate
+          image: 208168340597.dkr.ecr.ap-south-1.amazonaws.com/jarvis/vex:compare-bench
+          imagePullPolicy: Always
+          command: ["bash", "-c"]
+          args:
+            - |
+              set -u
+              mkdir -p /tmp/vexdata
+              /usr/local/bin/vex --port 6380 --data-dir /tmp/vexdata --no-persistence \
+                  --reactor --workers 4 --maxclients 50000 --unixsocket /tmp/vex.sock >/tmp/vex.log 2>&1 &
+              for i in $(seq 1 60); do redis-cli -p 6380 ping >/dev/null 2>&1 && break; sleep 0.2; done
+              echo "tcp ping: $(redis-cli -p 6380 ping)"
+              echo "uds ping: $(redis-cli -s /tmp/vex.sock ping 2>&1)"
+
+              echo "=== UDS stuck-listener validation (4 rounds, io_uring backend) ==="
+              for round in 1 2 3 4; do
+                bench=$(timeout 120 redis-benchmark -s /tmp/vex.sock -c 16 -n 200000 -t set,get -q 2>&1 | tr "\r" "\n" | grep "requests per second" | tail -1)
+                ok=0; refused=0
+                for i in $(seq 1 200); do
+                  if redis-cli -s /tmp/vex.sock ping >/dev/null 2>&1; then ok=$((ok+1)); else refused=$((refused+1)); fi
+                done
+                echo "round $round: $bench | fresh UDS connects ok=$ok refused=$refused"
+              done
+              echo "=== mixed TCP+UDS accept churn (dual-producer race exercise) ==="
+              # Subshell so `wait` only covers the churn pids, not the
+              # backgrounded vex server (which never exits).
+              ( for i in $(seq 1 300); do redis-cli -t 5 -p 6380 ping >/dev/null 2>&1 & redis-cli -t 5 -s /tmp/vex.sock ping >/dev/null 2>&1 & done; wait )
+              echo "post-churn uds ping: $(redis-cli -s /tmp/vex.sock ping 2>&1)"
+              echo "post-churn tcp ping: $(redis-cli -p 6380 ping 2>&1)"
+              echo "open fds: $(ls /proc/$(pidof vex)/fd | wc -l)"
+
+              echo "=== desync validation: compare-client c=16 and c=32 ==="
+              redis-server --port 6379 --bind 127.0.0.1 --appendonly no --save "" --daemonize yes --logfile /tmp/redis.log --maxclients 50000
+              for c in 16 32; do
+                timeout 300 /usr/local/bin/compare-client -redis 127.0.0.1:6379 -vex 127.0.0.1:6380 \
+                    -n 60000 -c $c -warmup 1000 -runs 1 -timeout 120s > /tmp/cc-$c.out 2>&1
+                echo "c=$c exit=$? desync=$(grep -c 'unknown RESP type' /tmp/cc-$c.out) crlf=$(grep -c 'missing CRLF' /tmp/cc-$c.out) errors=$(grep -ci 'error' /tmp/cc-$c.out)"
+                grep -i "error" /tmp/cc-$c.out | head -3
+              done
+              echo "=== vex log (warnings) ==="
+              grep -iE "warn|err" /tmp/vex.log | grep -v "sqpoll=false" | head -10
+              echo "VALIDATION COMPLETE"
+          resources:
+            requests:
+              cpu: "6"
+              memory: "2Gi"
+            limits:
+              cpu: "8"
+              memory: "4Gi"

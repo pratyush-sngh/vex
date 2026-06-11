@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"math"
 	"net"
 	"os"
@@ -128,7 +129,10 @@ func main() {
 
 		// Re-seed for remaining benchmarks
 		for i := 0; i < cfg.n; i++ {
-			_ = clients[0].cmd("SET", fmt.Sprintf("k:%d", i), fmt.Sprintf("v:%d", i))
+			if err := clients[0].cmd("SET", fmt.Sprintf("k:%d", i), fmt.Sprintf("v:%d", i)); err != nil {
+				fmt.Printf("re-seed failed at k:%d: %v\n", i, err)
+				break
+			}
 		}
 
 		printBench("EXISTS (hit)", cfg, func(i int, worker int) error {
@@ -219,6 +223,26 @@ func main() {
 			return clients[worker%len(clients)].cmd("HGET", fmt.Sprintf("h:%d", i%100), fmt.Sprintf("f:%d", i%cfg.n))
 		})
 
+		// HMSET: 10 field/value pairs per call
+		printBench("HMSET(10)", cfg, func(i int, worker int) error {
+			args := make([]string, 0, 22)
+			args = append(args, "HMSET", fmt.Sprintf("hm:%d", i%100))
+			for j := 0; j < 10; j++ {
+				args = append(args, fmt.Sprintf("f:%d:%d", i, j), fmt.Sprintf("v:%d:%d", i, j))
+			}
+			return clients[worker%len(clients)].cmdRaw(args...)
+		})
+
+		// HMGET: 10 fields per call (hits the fields HMSET just wrote)
+		printBench("HMGET(10)", cfg, func(i int, worker int) error {
+			args := make([]string, 0, 12)
+			args = append(args, "HMGET", fmt.Sprintf("hm:%d", i%100))
+			for j := 0; j < 10; j++ {
+				args = append(args, fmt.Sprintf("f:%d:%d", i%cfg.n, j))
+			}
+			return clients[worker%len(clients)].cmdRaw(args...)
+		})
+
 		printBench("HGETALL", cfg, func(i int, worker int) error {
 			return clients[worker%len(clients)].cmd("HGETALL", fmt.Sprintf("h:%d", i%100))
 		})
@@ -285,7 +309,10 @@ func main() {
 			}
 			// Seed data
 			for i := 0; i < cfg.n; i++ {
-				_ = clients[0].cmd("SET", fmt.Sprintf("k:%d", i), fmt.Sprintf("v:%d", i))
+				if err := clients[0].cmd("SET", fmt.Sprintf("k:%d", i), fmt.Sprintf("v:%d", i)); err != nil {
+					fmt.Printf("pipeline seed failed at k:%d: %v\n", i, err)
+					break
+				}
 			}
 
 			printBench(fmt.Sprintf("PIPE-SET(%d)", pipeSize), cfg, func(i int, worker int) error {
@@ -639,28 +666,78 @@ type client struct {
 	conn    net.Conn
 	rd      *bufio.Reader
 	timeout time.Duration
+	addr    string
+	// broken marks a connection whose RESP stream can no longer be trusted
+	// (I/O error, timeout mid-frame, framing error). It is re-dialed on next
+	// use instead of being reused mid-frame, which would poison every
+	// subsequent command with "unknown RESP type byte" errors.
+	broken bool
 }
 
-func newClient(addr string, timeout time.Duration) (*client, error) {
-	c, err := net.DialTimeout("tcp", addr, timeout)
+func dialConn(addr string, timeout time.Duration) (net.Conn, error) {
+	network, target := "tcp", addr
+	if strings.HasPrefix(addr, "unix:") {
+		network, target = "unix", strings.TrimPrefix(addr, "unix:")
+	}
+	c, err := net.DialTimeout(network, target, timeout)
 	if err != nil {
 		return nil, err
 	}
 	_ = c.SetDeadline(time.Now().Add(timeout))
-	return &client{conn: c, rd: bufio.NewReader(c), timeout: timeout}, nil
+	return c, nil
+}
+
+func newClient(addr string, timeout time.Duration) (*client, error) {
+	c, err := dialConn(addr, timeout)
+	if err != nil {
+		return nil, err
+	}
+	return &client{conn: c, rd: bufio.NewReader(c), timeout: timeout, addr: addr}, nil
 }
 
 func (c *client) close() { _ = c.conn.Close() }
 
+func (c *client) redial() error {
+	_ = c.conn.Close()
+	conn, err := dialConn(c.addr, c.timeout)
+	if err != nil {
+		return err
+	}
+	c.conn = conn
+	c.rd = bufio.NewReader(conn)
+	c.broken = false
+	return nil
+}
+
 func (c *client) ping() error { return c.cmd("PING") }
 
+// serverError is a RESP "-ERR ..." reply: the stream is still in sync, so the
+// connection stays usable. Every other error taints the stream.
+type serverError string
+
+func (e serverError) Error() string { return string(e) }
+
+func isServerError(err error) bool {
+	var se serverError
+	return errors.As(err, &se)
+}
+
 func (c *client) cmd(parts ...string) error {
+	if c.broken {
+		if err := c.redial(); err != nil {
+			return err
+		}
+	}
 	_ = c.conn.SetDeadline(time.Now().Add(c.timeout))
 	payload := encodeArray(parts)
 	if _, err := c.conn.Write(payload); err != nil {
+		c.broken = true
 		return err
 	}
 	_, err := readRESP(c.rd)
+	if err != nil && !isServerError(err) {
+		c.broken = true
+	}
 	return err
 }
 
@@ -672,20 +749,37 @@ func (c *client) cmdRaw(parts ...string) error {
 // cmdPipeline sends N commands in one write, then reads N responses.
 // This is how real Redis clients work — batching amortizes syscall overhead.
 func (c *client) cmdPipeline(cmds [][]string) error {
+	if c.broken {
+		if err := c.redial(); err != nil {
+			return err
+		}
+	}
 	_ = c.conn.SetDeadline(time.Now().Add(c.timeout))
 	var buf bytes.Buffer
 	for _, parts := range cmds {
 		buf.Write(encodeArray(parts))
 	}
 	if _, err := c.conn.Write(buf.Bytes()); err != nil {
+		c.broken = true
 		return err
 	}
+	// Drain ALL pipelined replies even if one is a server error — aborting
+	// early would leave the remaining replies in the stream and desync the
+	// next command on this connection.
+	var firstErr error
 	for range cmds {
 		if _, err := readRESP(c.rd); err != nil {
+			if isServerError(err) {
+				if firstErr == nil {
+					firstErr = err
+				}
+				continue
+			}
+			c.broken = true
 			return err
 		}
 	}
-	return nil
+	return firstErr
 }
 
 func encodeArray(parts []string) []byte {
@@ -717,7 +811,7 @@ func readRESP(r *bufio.Reader) (any, error) {
 		if err != nil {
 			return nil, err
 		}
-		return nil, errors.New(strings.TrimSpace(line))
+		return nil, serverError(strings.TrimSpace(line))
 	case '$':
 		line, err := r.ReadString('\n')
 		if err != nil {
@@ -730,9 +824,15 @@ func readRESP(r *bufio.Reader) (any, error) {
 		if n < 0 {
 			return nil, nil
 		}
+		// io.ReadFull, NOT r.Read: bufio.Reader.Read may return short
+		// whenever the frame straddles a TCP delivery boundary, leaving the
+		// body tail + CRLF unconsumed and desyncing the stream.
 		buf := make([]byte, n+2)
-		if _, err = r.Read(buf); err != nil {
+		if _, err = io.ReadFull(r, buf); err != nil {
 			return nil, err
+		}
+		if buf[n] != '\r' || buf[n+1] != '\n' {
+			return nil, fmt.Errorf("bulk string missing CRLF terminator (got %q %q)", buf[n], buf[n+1])
 		}
 		return string(buf[:n]), nil
 	case '*':

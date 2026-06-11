@@ -1,0 +1,33 @@
+# Idle pod on the bench node class for interactive observation runs
+# (kubectl exec driven). Same image/resources as vex-compare-bench.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vex-observe
+  namespace: scrum6
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node.kubernetes.io/instance-type
+                    operator: In
+                    values: ["c5a.2xlarge"]
+      containers:
+        - name: observe
+          image: 208168340597.dkr.ecr.ap-south-1.amazonaws.com/jarvis/vex:compare-bench
+          imagePullPolicy: Always
+          command: ["bash", "-c", "sleep 7200"]
+          resources:
+            requests:
+              cpu: "6"
+              memory: "2Gi"
+            limits:
+              cpu: "8"
+              memory: "4Gi"

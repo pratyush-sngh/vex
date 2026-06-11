@@ -1,0 +1,42 @@
+# Single-shot benchmark: runs redis-server + vex + go bench client in one
+# pod inside the scrum6 namespace. Lands on a c5a.2xlarge node with a 4 CPU
+# reservation to minimise noise from cluster neighbours.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: vex-compare-bench
+  namespace: scrum6
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node.kubernetes.io/instance-type
+                    operator: In
+                    values: ["c5a.2xlarge"]
+      containers:
+        - name: bench
+          image: 208168340597.dkr.ecr.ap-south-1.amazonaws.com/jarvis/vex:compare-bench
+          imagePullPolicy: Always
+          env:
+            - name: BENCH_MATRIX
+              value: "1"
+            - name: WORKERS_LIST
+              value: "4"
+            - name: C_LIST
+              value: "16 32 64"
+            - name: BENCH_N
+              value: "50000"
+          resources:
+            requests:
+              cpu: "6"
+              memory: "2Gi"
+            limits:
+              cpu: "8"
+              memory: "4Gi"

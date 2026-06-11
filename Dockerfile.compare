@@ -1,0 +1,51 @@
+# Self-contained Linux comparison image: runs redis-server + vex + go bench
+# client inside one container. Unix sockets live on the container's Linux
+# filesystem, so macOS Docker bind-mount limitations don't apply.
+#
+# Usage:
+#   docker build -f Dockerfile.compare -t vex-compare-bench .
+#   docker run --rm vex-compare-bench -n 10000 -c 1 -warmup 1000 -runs 5
+#   docker run --rm vex-compare-bench -n 5000 -c 8 -warmup 500 -runs 3
+
+# ── Stage 1: build go bench client ──────────────────────────────────────
+FROM golang:1.22-bookworm AS go_builder
+WORKDIR /src
+COPY tools/compare-client/go.mod ./
+COPY tools/compare-client/main.go ./
+RUN go build -o /usr/local/bin/compare-client .
+
+# ── Stage 2: build vex with the same Zig version as Dockerfile.vex ──────
+FROM debian:bookworm-slim AS zig_builder
+RUN apt-get update -qq && apt-get install -y -qq curl xz-utils ca-certificates > /dev/null 2>&1 \
+    && arch="$(dpkg --print-architecture)" \
+    && if [ "$arch" = "arm64" ]; then zig_pkg="zig-aarch64-linux-0.17.0-dev.314+eae06cf5c"; else zig_pkg="zig-x86_64-linux-0.17.0-dev.314+eae06cf5c"; fi \
+    && curl -sL "https://ziglang.org/builds/${zig_pkg}.tar.xz" | tar xJ -C /opt \
+    && ln -s "/opt/${zig_pkg}/zig" /usr/local/bin/zig \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY . .
+RUN arch="$(uname -m)" \
+    && if [ "$arch" = "x86_64" ]; then \
+        zig build -Doptimize=ReleaseFast -Dcpu=x86_64_v3; \
+    else \
+        zig build -Doptimize=ReleaseFast; \
+    fi
+
+# ── Stage 3: runtime image — combine redis-server + vex + bench client ──
+FROM debian:bookworm-slim
+RUN apt-get update -qq && apt-get install -y -qq libssl3 procps linux-perf > /dev/null && \
+    ln -sf "$(ls /usr/bin/perf_* 2>/dev/null | head -1)" /usr/local/bin/perf 2>/dev/null || true && \
+    rm -rf /var/lib/apt/lists/*
+
+# Pull the official Redis 8.0.3 binaries — same version used in the
+# docker-compose.compare.yml setup, so the comparison stays apples-to-apples.
+COPY --from=redis:8.0.3 /usr/local/bin/redis-server /usr/local/bin/redis-server
+COPY --from=redis:8.0.3 /usr/local/bin/redis-cli /usr/local/bin/redis-cli
+COPY --from=redis:8.0.3 /usr/local/bin/redis-benchmark /usr/local/bin/redis-benchmark
+
+COPY --from=zig_builder /app/zig-out/bin/vex /usr/local/bin/vex
+COPY --from=go_builder /usr/local/bin/compare-client /usr/local/bin/compare-client
+COPY scripts/run-bench-in-container.sh /usr/local/bin/run-bench
+RUN chmod +x /usr/local/bin/run-bench && mkdir -p /socks /data
+
+ENTRYPOINT ["/usr/local/bin/run-bench"]
