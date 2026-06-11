@@ -1,6 +1,6 @@
 # Vex
 
-A high-performance KV + Graph database written in Zig. Drop-in Redis replacement that's 20-40% faster per instance on the same hardware. Same ops, same clients, same horizontal scaling model -- fewer instances for the same throughput.
+A high-performance KV + Graph database written in Zig. Drop-in Redis replacement: 20-40% faster per instance on pipelined workloads, and up to 2.7x Redis throughput unpipelined once concurrency exceeds ~12 connections. Same ops, same clients, same horizontal scaling model -- fewer instances for the same throughput.
 
 ## Why Vex?
 
@@ -17,6 +17,7 @@ Redis is single-threaded. To scale, you add more instances. Vex does the same --
 | Protocol | RESP | RESP (compatible) | RESP (compatible) |
 
 - **20-40% faster than Redis** on pipelined workloads with equal resources (4 cores, `redis-benchmark`, median of 30 runs)
+- **Up to 2.7x Redis throughput unpipelined** (the default for most Redis clients): +30% at 16 connections, +166% at 128 (SET, 4 workers); parity ±13% below 12 connections where both servers are RTT-bound
 - **Beats Dragonfly** at 4 cores (+16% to +201%) -- shared-nothing routing overhead loses to striped locks at moderate core counts
 - **22x faster shortest path than Memgraph** via bidirectional BFS + CSR adjacency + Contraction Hierarchies
 - **Redis-compatible** -- works with `redis-cli`, redis-py, Jedis, go-redis, ioredis, any Redis client
@@ -40,7 +41,8 @@ Redis is single-threaded. To scale, you add more instances. Vex does the same --
 | **[Clustering](docs/clustering.md)** | Leader/follower replication, epoch mechanism, VEX.PROMOTE, consistency model |
 | **[Observability](docs/observability.md)** | INFO, SLOWLOG, LATENCY, CLIENT LIST, DEBUG/MEMORY/CONFIG, JSON logs, redis_exporter |
 | **[Separation of Concerns](docs/separation-of-concerns.md)** | How vex / vex-sentinel / sidecars are split. Mechanism vs policy. |
-| **[Benchmarks](docs/benchmarks.md)** | KV vs Redis, graph vs Memgraph, internal engine benchmarks |
+| **[Benchmarks](docs/benchmarks.md)** | KV vs Redis (pipelined + unpipelined), graph vs Memgraph, internal engine benchmarks |
+| **[Unpipelined Command Grids](docs/unpipelined-command-grids.md)** | Per-command vex-vs-Redis deltas across workers × connections |
 | **[Deployment](docs/deployment.md)** | Production checklist, systemd, Docker, tuning |
 | **[Vector Search & GRAPH.RAG](docs/vector-search.md)** | HNSW vector search, f16 mmap storage, RAG pipeline examples |
 | **[Vector Benchmarks](docs/vector-benchmarks.md)** | Benchmark design: Vex vs Redis+RediSearch vs Qdrant vs Weaviate |
@@ -108,6 +110,16 @@ Benchmarked with **`redis-benchmark`** (industry standard). Docker containers wi
 | RPOP | 1.54M | **1.65M** | **+7%** | 6.00M | **7.32M** | **+22%** |
 
 Vex wins **10/10 TCP** (+7% to +37%), **10/10 UDS** (+13% to +162%). At P=100 c=32 UDS: ZADD +236%, LPUSH +224%, HSET +178%. Full results: [Benchmarks](docs/benchmarks.md)
+
+### KV unpipelined (one command per round-trip — the default for most clients)
+
+SET vs Redis 8.0.3, vex `--workers 4`, AWS c5a.2xlarge (8 vCPU), 50k ops x 3 runs:
+
+| Connections | 4 | 8 | 16 | 32 | 64 | 128 |
+|---|---|---|---|---|---|---|
+| Vex Δ vs Redis | −13% | −4% | **+30%** | **+109%** | **+138%** | **+166%** |
+
+Below ~12 connections both servers are RTT-bound and effectively tied (vex wins +13-38% at c≤2, dips at exactly c=4, parity by c=8). From c=16 up, Redis saturates its single thread (~110k ops/s) while vex keeps scaling to ~300k. Per-command grids across w={1,2,4,6,8} x c={1..128}: [Benchmarks](docs/benchmarks.md)
 
 ### Graph: Vex vs Memgraph (10K nodes / 50K edges)
 

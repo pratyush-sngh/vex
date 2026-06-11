@@ -31,6 +31,107 @@ vex:
 
 ---
 
+## Unpipelined Performance (one command per round-trip)
+
+The sections below this one use `redis-benchmark -P 50` (50 commands per
+pipeline batch). Pipelining is the single biggest throughput lever, but
+**most Redis clients do not pipeline by default** — redis-py, Jedis,
+go-redis, node-redis, redigo, and redis-rb all send one command per
+round-trip unless explicitly batched. This section documents that default
+regime; the pipelined and unpipelined stories are different and should not
+be compared to each other.
+
+**Environment:** AWS EKS `c5a.2xlarge` (8 vCPU / 4 physical cores), Linux
+io_uring backend, vex + Redis 8.0.3 + load generator co-located in one pod,
+n=50,000 × 3 runs per cell via the Go compare-client
+(`tools/compare-client`). June 2026, post io_uring wait-path fixes.
+
+### SET — vex throughput delta vs Redis 8.0.3, by connections (c) and vex workers (w)
+
+Positive = vex faster. Redis is single-threaded, so its absolute numbers
+(~18k ops/s at c=1, plateauing at ~110k from c≈32) are the same in every
+column.
+
+| c \ w | w=1 | w=2 | w=4 | w=6 | w=8 |
+|---|---|---|---|---|---|
+| 1 | +17% | +15% | +3% | +14% | +13% |
+| 2 | +36% | +22% | +29% | +23% | +38% |
+| 3 | +5% | +4% | −6% | −5% | −5% |
+| 4 | −0% | −10% | −13% | −12% | −12% |
+| 6 | −5% | −0% | −6% | −5% | −5% |
+| 8 | −7% | −3% | −4% | +1% | +2% |
+| 12 | −5% | +4% | +7% | +12% | +40% |
+| 16 | +3% | +16% | +30% | +36% | +34% |
+| 24 | +8% | +60% | +87% | +82% | +70% |
+| 32 | +7% | +91% | +109% | +94% | +86% |
+| 48 | +5% | +94% | +120% | +105% | +98% |
+| 64 | +3% | +93% | +138% | +120% | +110% |
+| 128 | −0% | +93% | +166% | +143% | +133% |
+
+Three regimes, with sharp boundaries:
+
+1. **c ≤ 2 — vex wins on per-op latency** (+13% to +38%). Neither server
+   can batch wakeups at this concurrency, so it reduces to a pure
+   per-command-cost race.
+2. **c = 3–8 — the contested valley** (worst: −13% at c=4). Redis's single
+   event loop already amortizes wakeups across connections here while
+   total load is still RTT-bound; the dip is pinned at *absolute* c≈4
+   regardless of vex's worker count and appears in every command except
+   `MSET` (whose 10-keys-per-round-trip behaves like built-in pipelining
+   — confirming the dip lives in the wakeup path, not the data
+   structures).
+3. **c ≥ 12 — multi-worker scaling takes over.** Redis saturates its one
+   thread; vex keeps scaling (w=4 reaches ~300k ops/s at c=128, still
+   climbing).
+
+**Worker-count guidance for an 8-vCPU host: `--workers 4` is optimal**
+(ceilings at c=128: w=1 → 110k, w=2 → 221k, w=4 → 300k, w=6 → 273k,
+w=8 → 253k ops/s). Past 4 workers the co-located load and SMT contention
+on 4 physical cores cost more than the extra workers add.
+
+Per-command pattern notes (full grids: [unpipelined-command-grids.md](unpipelined-command-grids.md)):
+
+- **Hash point ops scale best** — at w=4 c=128: HGET +223%, HSET +219%
+  vs Redis (striped HashStore + combined-allocation writes).
+- **Multi-key ops** (MSET/MGET/HMSET/HMGET ×10 keys) skip the c=4 valley
+  but top out lower (+79% to +144%) — parse/serialize cost grows with
+  payload.
+- **HINCRBY** shows +413% at w=4 c=128, but that is mostly an anomalous
+  Redis weakness — do not headline it.
+
+### Big-reply commands: measure the client before believing the numbers
+
+`HGETALL` on a 1,500-field hash (~32KB replies) initially appeared to be
+a vex loss (−3…−10% at c≥16). Instrumenting the full stack showed the
+benchmark client was the bottleneck in every run: parsing a ~3,000-element
+reply pins one `redis-benchmark` thread at 100% CPU at ~3.7k ops/s while
+both servers idle. Measuring with a parse-free drain client
+(`tools/drain-client`, validates reply framing once then drains exact byte
+counts) and reading throughput from each server's own
+`total_commands_processed`:
+
+| | HGETALL throughput | Server CPU |
+|---|---|---|
+| Redis 8.0.3 | 7,878 ops/s | single thread at **100%** (hard ceiling) |
+| vex (w=4, wire cache) | **~178,000 ops/s (~23×)** | 4 workers saturated, ~5.7 GB/s of replies |
+
+Two vex-side mechanisms produce this:
+
+1. **Wire cache** — hashes with ≥16 fields cache their fully-serialized
+   RESP reply (RESP2/RESP3 separately) on the hash itself; any
+   HSET/HDEL/HINCRBY invalidates it. A cache-hit HGETALL is one stripe
+   rdlock + one memcpy (~4 µs total dispatch, measured by `DEBUG PROBES`).
+2. **Buffer-swap send** — replies ≥4KB transfer ownership to the send
+   buffer by pointer swap instead of memcpy.
+
+Redis's big-reply ceiling is its single serialization thread; vex builds
+the reply once and then serves it from all workers concurrently. The
+honest caveats: the 23× is for *read-hot* large hashes (every mutation
+forces one re-serialization), and any fully-parsing client will measure
+far lower numbers — because of its own parse cost, not the server's.
+
+---
+
 ## Vex vs Redis 8.0 (`redis-benchmark`, P=50, c=16)
 
 Reproduced via `./tools/bench.sh 15` — runs the standard `redis-benchmark`
