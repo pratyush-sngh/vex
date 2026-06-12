@@ -47,6 +47,11 @@ cleanup() {
 }
 ping_ok() { redis-cli -p "$PORT" PING 2>/dev/null | grep -q '^PONG$'; }
 start_vex() {
+    # $2: boot window in seconds (default 5). The restart-from-snapshot
+    # call passes a much larger window: restoring a few hundred thousand
+    # keys is legitimately slow in Debug builds, where the DebugAllocator
+    # captures a stack trace per allocation (minutes for a ~6MB zdb).
+    local boot_window=${2:-5}
     "$VEX_BIN" \
         --port "$PORT" \
         --workers "$WORKERS" \
@@ -54,7 +59,8 @@ start_vex() {
         --appendonly yes \
         > "$1" 2>&1 &
     VEX_PID=$!
-    for _ in {1..50}; do ping_ok && return 0; sleep 0.1; done
+    local i
+    for (( i = 0; i < boot_window * 10; i++ )); do ping_ok && return 0; sleep 0.1; done
     log "FAIL: vex not responding (log $1)"
     tail -20 "$1" | sed 's/^/    /'
     return 1
@@ -155,7 +161,7 @@ wait "$VEX_PID" 2>/dev/null
 VEX_PID=
 
 log "restarting vex from snapshot"
-start_vex "$RUN_DIR/vex-restart.log" || { log "FAIL: vex did not come back up after restart"; exit 1; }
+start_vex "$RUN_DIR/vex-restart.log" 300 || { log "FAIL: vex did not come back up after restart"; exit 1; }
 
 post_dbsize=$(redis-cli -p "$PORT" DBSIZE | tr -d ' \r')
 log "  pre-restart dbsize: $pre_dbsize"

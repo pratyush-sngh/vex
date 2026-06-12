@@ -60,33 +60,40 @@ for i in $(seq 1 "$HOT_KEYS"); do
 done
 
 # Writers: alternate small (fast path) and large (slow path) on hot keys.
-log "spawning $WRITER_LOOPS writers (alternating small ↔ large)"
+# Batched through --pipe: one connection per ~2000 commands. A redis-cli
+# process (and TCP connection) per command exhausts macOS ephemeral ports
+# in seconds (EADDRNOTAVAIL), which fails the script's own health ping
+# while vex is perfectly healthy.
+log "spawning $WRITER_LOOPS writers (alternating small ↔ large, batched)"
 for w in $(seq 1 "$WRITER_LOOPS"); do
     (
         end_ts=$(( $(date +%s) + DURATION ))
         i=0
         while (( $(date +%s) < end_ts )); do
-            i=$(( i + 1 ))
-            k=$(( (i % HOT_KEYS) + 1 ))
-            if (( i % 2 == 0 )); then
-                redis-cli -p "$PORT" SET "hot:$k" "s$i" >/dev/null 2>&1 || break  # inline fast path
-            else
-                redis-cli -p "$PORT" SET "hot:$k" "$LARGE_VAL" >/dev/null 2>&1 || break  # heap path
-            fi
+            for j in $(seq 1 2000); do
+                i=$(( i + 1 ))
+                k=$(( (i % HOT_KEYS) + 1 ))
+                if (( i % 2 == 0 )); then
+                    printf 'SET hot:%d s%d\n' "$k" "$i"      # inline fast path
+                else
+                    printf 'SET hot:%d %s\n' "$k" "$LARGE_VAL"  # heap path
+                fi
+            done | redis-cli -p "$PORT" --pipe >/dev/null 2>&1 || break
         done
     ) > "$RUN_DIR/write-$w.log" 2>&1 &
     BG_PIDS+=("$!")
 done
 
 # Readers: GET the same keys; with the race, eventually a torn read
-# crashes via OOB memcpy from inline_buf.
-log "spawning $READER_LOOPS GET loops on the same keys"
+# crashes via OOB memcpy from inline_buf. Same batching rationale.
+log "spawning $READER_LOOPS GET loops on the same keys (batched)"
 for r in $(seq 1 "$READER_LOOPS"); do
     (
         end_ts=$(( $(date +%s) + DURATION ))
         while (( $(date +%s) < end_ts )); do
-            k=$(( (RANDOM % HOT_KEYS) + 1 ))
-            redis-cli -p "$PORT" GET "hot:$k" >/dev/null 2>&1 || break
+            for j in $(seq 1 2000); do
+                printf 'GET hot:%d\n' "$(( (RANDOM % HOT_KEYS) + 1 ))"
+            done | redis-cli -p "$PORT" --pipe >/dev/null 2>&1 || break
         done
     ) > "$RUN_DIR/read-$r.log" 2>&1 &
     BG_PIDS+=("$!")

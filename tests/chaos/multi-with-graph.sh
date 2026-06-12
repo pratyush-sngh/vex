@@ -56,17 +56,23 @@ for e in $(seq 1 "$EXEC_CLIENTS"); do
         end_ts=$(( $(date +%s) + DURATION ))
         round=0
         while (( $(date +%s) < end_ts )); do
-            round=$(( round + 1 ))
+            # 10 MULTI/EXEC rounds per redis-cli invocation: one
+            # connection per round churns through macOS ephemeral
+            # ports (EADDRNOTAVAIL) and false-fails the health ping
+            # while vex is healthy.
             {
-                printf 'MULTI\n'
-                for i in $(seq 1 "$CMDS_PER_EXEC"); do
-                    new_id=$(( N_INIT_NODES + (e * 1000000) + (round * 1000) + i ))
-                    printf 'GRAPH.ADDNODE m%d service\n' "$new_id"
-                    # Touch a random existing node for SETPROP too.
-                    rk=$(( (RANDOM % N_INIT_NODES) + 1 ))
-                    printf 'GRAPH.SETPROP n%d r%d v%d\n' "$rk" "$round" "$i"
+                for _b in $(seq 1 10); do
+                    round=$(( round + 1 ))
+                    printf 'MULTI\n'
+                    for i in $(seq 1 "$CMDS_PER_EXEC"); do
+                        new_id=$(( N_INIT_NODES + (e * 1000000) + (round * 1000) + i ))
+                        printf 'GRAPH.ADDNODE m%d service\n' "$new_id"
+                        # Touch a random existing node for SETPROP too.
+                        rk=$(( (RANDOM % N_INIT_NODES) + 1 ))
+                        printf 'GRAPH.SETPROP n%d r%d v%d\n' "$rk" "$round" "$i"
+                    done
+                    printf 'EXEC\n'
                 done
-                printf 'EXEC\n'
             } | redis-cli -p "$PORT" >/dev/null 2>&1 || break
         done
     ) > "$RUN_DIR/exec-$e.log" 2>&1 &
@@ -79,13 +85,19 @@ for r in $(seq 1 "$READ_CLIENTS"); do
         end_ts=$(( $(date +%s) + DURATION ))
         i=0
         while (( $(date +%s) < end_ts )); do
-            i=$(( i + 1 ))
-            k=$(( (RANDOM % N_INIT_NODES) + 1 ))
-            case $(( i % 3 )) in
-                0) redis-cli -p "$PORT" GRAPH.GETNODE "n$k" >/dev/null 2>&1 || break ;;
-                1) redis-cli -p "$PORT" GRAPH.NEIGHBORS "n$k" >/dev/null 2>&1 || break ;;
-                2) redis-cli -p "$PORT" GRAPH.LIST_BY_TYPE service >/dev/null 2>&1 || break ;;
-            esac
+            # 300 reads per connection (same ephemeral-port rationale
+            # as the writers).
+            {
+                for _b in $(seq 1 300); do
+                    i=$(( i + 1 ))
+                    k=$(( (RANDOM % N_INIT_NODES) + 1 ))
+                    case $(( i % 3 )) in
+                        0) printf 'GRAPH.GETNODE n%d\n' "$k" ;;
+                        1) printf 'GRAPH.NEIGHBORS n%d\n' "$k" ;;
+                        2) printf 'GRAPH.LIST_BY_TYPE service\n' ;;
+                    esac
+                done
+            } | redis-cli -p "$PORT" >/dev/null 2>&1 || break
         done
     ) > "$RUN_DIR/read-$r.log" 2>&1 &
     BG_PIDS+=("$!")

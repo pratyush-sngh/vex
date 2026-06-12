@@ -89,8 +89,12 @@ for p in $(seq 1 "$SET_PIPELINES"); do
     (
         start=$(( (p - 1) * keys_per_pipe + 1 ))
         end=$(( p * keys_per_pipe ))
-        for i in $(seq "$start" "$end"); do
+        # arithmetic loop, not seq: BSD seq prints >=1e6 in scientific
+        # notation, which printf %d rejects
+        i=$start
+        while (( i <= end )); do
             printf 'SET k%d_%d v_%d\n' "$p" "$i" "$i"
+            i=$(( i + 1 ))
         done | redis-cli -p "$PORT" --pipe > "$RUN_DIR/set-$p.log" 2>&1
     ) &
     BG_PIDS+=("$!")

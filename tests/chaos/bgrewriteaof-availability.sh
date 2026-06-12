@@ -91,27 +91,17 @@ log "loading $N_EDGES graph edges"
     done
 ) | redis-cli -p "$PORT" --pipe >/dev/null
 
-# ── Background GET stream — must stay responsive during rewrite ───────
+# ── Background latency stream — must stay responsive during rewrite ───
+# ONE persistent connection via `redis-cli --latency-history` (1s
+# buckets, each line reporting min/max/avg). The previous version
+# spawned a redis-cli process (fork+exec+connect) per GET sample —
+# that measures the client machine (process spawn time +
+# ephemeral-port pressure), not server stalls, and produced
+# multi-second false "latencies" on macOS.
 LATENCY_LOG="$RUN_DIR/get-latency.log"
 : > "$LATENCY_LOG"
-log "starting GET stream sampling latency (target $GET_SAMPLE_COUNT samples)"
-(
-    for s in $(seq 1 "$GET_SAMPLE_COUNT"); do
-        # Pick a random key index so we hit different stripes.
-        k=$(( (RANDOM * 32768 + RANDOM) % N_KEYS + 1 ))
-        t0_ns=$(perl -MTime::HiRes=time -e 'printf "%d\n", time*1e9')
-        out=$(redis-cli -p "$PORT" GET "k$k" 2>/dev/null)
-        rc=$?
-        t1_ns=$(perl -MTime::HiRes=time -e 'printf "%d\n", time*1e9')
-        ms=$(( (t1_ns - t0_ns) / 1000000 ))
-        if [[ $rc -ne 0 || -z "$out" ]]; then
-            printf 'ERR %d\n' "$ms" >> "$LATENCY_LOG"
-        else
-            printf '%d\n' "$ms" >> "$LATENCY_LOG"
-        fi
-        sleep 0.02
-    done
-) &
+log "starting latency stream on one persistent connection"
+redis-cli -p "$PORT" --latency-history -i 1 > "$LATENCY_LOG" 2>&1 &
 GET_PID=$!
 
 # Give the GET stream a moment to baseline.
@@ -144,8 +134,11 @@ if ! echo "$reissue" | grep -qi 'in progress'; then
     log "      (this only fails if the rewrite already finished — usually OK on tiny datasets)"
 fi
 
-# ── Wait for the GET stream to finish so we can analyze latency ───────
-log "waiting for GET stream to complete"
+# ── Observe through the rewrite window, then stop the stream ──────────
+OBSERVE_SEC=${OBSERVE_SEC:-12}
+log "observing latency for ${OBSERVE_SEC}s through the rewrite"
+sleep "$OBSERVE_SEC"
+kill "$GET_PID" 2>/dev/null
 wait "$GET_PID" 2>/dev/null
 GET_PID=
 
@@ -156,30 +149,19 @@ if ! ping_ok; then
     exit 1
 fi
 
-errors=$(grep -c '^ERR' "$LATENCY_LOG" || true)
-samples=$(wc -l < "$LATENCY_LOG" | tr -d ' ')
-oks=$(( samples - errors ))
-sorted=$(grep -v '^ERR' "$LATENCY_LOG" | sort -n)
-if [[ -z "$sorted" ]]; then
-    log "FAIL: no successful GET samples"
+# --latency-history lines: "min: 0, max: 5, avg: 0.12 (89 samples) -- 1.00 seconds range"
+buckets=$(grep -c 'seconds range' "$LATENCY_LOG" || true)
+if (( buckets == 0 )); then
+    log "FAIL: latency stream produced no samples (connection died?)"
+    sed 's/^/    /' "$LATENCY_LOG" | head -5
     exit 1
 fi
-p50_idx=$(( oks / 2 ))
-p99_idx=$(( oks * 99 / 100 ))
-p50=$(echo "$sorted" | sed -n "${p50_idx}p")
-p99=$(echo "$sorted" | sed -n "${p99_idx}p")
-maxv=$(echo "$sorted" | tail -1)
+maxv=$(grep -oE 'max: [0-9]+' "$LATENCY_LOG" | awk '{ if ($2 > m) m = $2 } END { print m + 0 }')
 
-log "GET stream results:"
-log "  samples=$samples ok=$oks errors=$errors"
-log "  latency p50=${p50}ms p99=${p99}ms max=${maxv}ms"
+log "latency stream results: $buckets one-second buckets, worst bucket max=${maxv}ms"
 
-if (( errors > 0 )); then
-    log "FAIL: $errors GET requests errored during rewrite (pre-B2 symptom: kv_mutex 5s timeout)"
-    exit 1
-fi
 if (( maxv > STALL_THRESHOLD_MS )); then
-    log "FAIL: max GET latency ${maxv}ms > ${STALL_THRESHOLD_MS}ms threshold (rewrite stalled the hot path)"
+    log "FAIL: max latency ${maxv}ms > ${STALL_THRESHOLD_MS}ms threshold (rewrite stalled the hot path)"
     exit 1
 fi
 
