@@ -1,9 +1,9 @@
 const std = @import("std");
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
-const resp = @import("resp.zig");
-const KVStore = @import("../engine/kv.zig").KVStore;
-const graph_mod = @import("../engine/graph.zig");
+const resp = @import("../protocol/resp.zig");
+const KVStore = @import("../engine/kv/kv.zig").KVStore;
+const graph_mod = @import("../engine/graph/graph.zig");
 const GraphEngine = graph_mod.GraphEngine;
 const CommandHandler = @import("../command/handler.zig").CommandHandler;
 const KeysMode = @import("../command/handler.zig").KeysMode;
@@ -1011,7 +1011,7 @@ pub const Server = struct {
         var kv_mutex = std.atomic.Mutex.unlocked;
 
         // Create ConcurrentKV and import existing data from the plain KVStore.
-        const ConcurrentKV = @import("../engine/concurrent_kv.zig").ConcurrentKV;
+        const ConcurrentKV = @import("../engine/kv/concurrent_kv.zig").ConcurrentKV;
         var ckv = ConcurrentKV.init(self.allocator, self.io);
         ckv.initStripes();
         ckv.maxmemory = self.kv.maxmemory;
@@ -1024,10 +1024,10 @@ pub const Server = struct {
         defer pubsub.deinit();
 
         const WM = @import("worker.zig").WatchMap;
-        const ListStore = @import("../engine/list.zig").ListStore;
-        const HashStore = @import("../engine/hash.zig").HashStore;
-        const SetStore = @import("../engine/set.zig").SetStore;
-        const SortedSetStore = @import("../engine/sorted_set.zig").SortedSetStore;
+        const ListStore = @import("../engine/types/list.zig").ListStore;
+        const HashStore = @import("../engine/types/hash.zig").HashStore;
+        const SetStore = @import("../engine/types/set.zig").SetStore;
+        const SortedSetStore = @import("../engine/types/sorted_set.zig").SortedSetStore;
         var list_store = ListStore.init(self.allocator);
         defer list_store.deinit();
         var hash_store = HashStore.init(self.allocator);

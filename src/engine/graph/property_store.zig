@@ -1,6 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const string_intern = @import("string_intern.zig");
+const string_intern = @import("../string_intern.zig");
 const StringIntern = string_intern.StringIntern;
 
 /// Sparse property storage for graph entities (nodes and edges).

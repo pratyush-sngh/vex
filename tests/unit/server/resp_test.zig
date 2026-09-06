@@ -1,7 +1,7 @@
-// Migrated unit tests for src/server/resp.zig.
+// Migrated unit tests for src/protocol/resp.zig.
 
 const std = @import("std");
-const resp = @import("../../../src/server/resp.zig");
+const resp = @import("../../../src/protocol/resp.zig");
 
 const Parser = resp.Parser;
 const serializeBulkString = resp.serializeBulkString;

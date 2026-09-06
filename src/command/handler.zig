@@ -1,18 +1,18 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const vex_root = @import("../root.zig");
-const resp = @import("../server/resp.zig");
-const KVStore = @import("../engine/kv.zig").KVStore;
-const graph_mod = @import("../engine/graph.zig");
+const resp = @import("../protocol/resp.zig");
+const KVStore = @import("../engine/kv/kv.zig").KVStore;
+const graph_mod = @import("../engine/graph/graph.zig");
 const GraphEngine = graph_mod.GraphEngine;
-const query = @import("../engine/query.zig");
+const query = @import("../query/query.zig");
 const snapshot = @import("../storage/snapshot.zig");
 const aof_mod = @import("../storage/aof.zig");
 const AOF = aof_mod.AOF;
-const ListStore = @import("../engine/list.zig").ListStore;
-const HashStore = @import("../engine/hash.zig").HashStore;
-const SetStore = @import("../engine/set.zig").SetStore;
-const SortedSetStore = @import("../engine/sorted_set.zig").SortedSetStore;
+const ListStore = @import("../engine/types/list.zig").ListStore;
+const HashStore = @import("../engine/types/hash.zig").HashStore;
+const SetStore = @import("../engine/types/set.zig").SetStore;
+const SortedSetStore = @import("../engine/types/sorted_set.zig").SortedSetStore;
 const obs_stats = @import("../observability/stats.zig");
 const obs_cmd_table = @import("../observability/cmd_table.zig");
 const event_stats = @import("../observability/event_stats.zig");
@@ -31,7 +31,7 @@ pub const KeysMode = enum {
 pub var bgsave_in_progress: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 pub var bgrewriteaof_in_progress: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
-pub const ConcurrentKV = @import("../engine/concurrent_kv.zig").ConcurrentKV;
+pub const ConcurrentKV = @import("../engine/kv/concurrent_kv.zig").ConcurrentKV;
 
 pub const CommandHandler = struct {
     kv: *KVStore,
@@ -3079,7 +3079,7 @@ pub const CommandHandler = struct {
         @memcpy(std.mem.sliceAsBytes(qa), raw_query);
         const vi = self.graph.vec_indices orelse { try resp.serializeError(w, "no vector index for field"); return; };
         const idx = vi.get(field) orelse { try resp.serializeError(w, "no vector index for field"); return; };
-        @import("../engine/vector_store.zig").VectorStore.normalize(qa);
+        @import("../engine/vector/vector_store.zig").VectorStore.normalize(qa);
         const results = idx.search(qa, k, &self.graph.node_alive) catch { try resp.serializeError(w, "search failed"); return; };
         defer self.allocator.free(results);
         try resp.serializeMapOrArrayHeader(w, results.len, self.protocol_version);
@@ -3092,7 +3092,7 @@ pub const CommandHandler = struct {
     }
 
     fn cmdGraphRag(self: *CommandHandler, args: []const []const u8, w: *std.Io.Writer) !void {
-        const rag_mod = @import("../engine/rag.zig");
+        const rag_mod = @import("../modules/graphrag/rag.zig");
         if (args.len < 5) { try resp.serializeError(w, "usage: GRAPH.RAG <field> <query> K <n> [DEPTH d] [DIR d]"); return; }
         const field = args[1];
         const raw_query = args[2];
@@ -3284,7 +3284,7 @@ pub const CommandHandler = struct {
             return;
         };
 
-        @import("../engine/vector_store.zig").VectorStore.normalize(qa);
+        @import("../engine/vector/vector_store.zig").VectorStore.normalize(qa);
         const results = idx.search(qa, count, &self.graph.node_alive) catch {
             try resp.serializeError(w, "search failed");
             return;
@@ -3675,7 +3675,7 @@ pub const CommandHandler = struct {
         // by all agents, and filters drop many candidates).
         const vi = self.graph.vec_indices orelse { try resp.serializeArrayHeader(w, 0); return; };
         const idx = vi.get(MEMORY_FIELD) orelse { try resp.serializeArrayHeader(w, 0); return; };
-        @import("../engine/vector_store.zig").VectorStore.normalize(query_vec);
+        @import("../engine/vector/vector_store.zig").VectorStore.normalize(query_vec);
         const big_k: u32 = @intCast(@min(@as(usize, 4096), @max(limit * 8 + 64, 128)));
         const results = idx.search(query_vec, big_k, &self.graph.node_alive) catch { try resp.serializeError(w, "search failed"); return; };
         defer self.allocator.free(results);

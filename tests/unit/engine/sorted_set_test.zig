@@ -1,7 +1,7 @@
-// Migrated unit tests for src/engine/sorted_set.zig.
+// Migrated unit tests for src/engine/types/sorted_set.zig.
 
 const std = @import("std");
-const SortedSetStore = @import("../../../src/engine/sorted_set.zig").SortedSetStore;
+const SortedSetStore = @import("../../../src/engine/types/sorted_set.zig").SortedSetStore;
 
 test "ZADD and ZSCORE" {
     var store = SortedSetStore.init(std.testing.allocator);

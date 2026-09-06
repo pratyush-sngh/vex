@@ -9,7 +9,7 @@
 #     -t 208168340597.dkr.ecr.ap-south-1.amazonaws.com/jarvis/vex:chaos-runner \
 #     --load .
 #
-# Run inside the cluster (the manifest in k8s/jarvis-chaos.yaml does this):
+# Run inside the cluster (the manifest in tests/k8s/jarvis-chaos.yaml does this):
 #   kubectl -n jarvis exec -it chaos-runner -- /chaos/run.sh
 
 # Stage 1: build vex with the portable x86_64_v3 target. Same Zig as

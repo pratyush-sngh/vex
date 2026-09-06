@@ -1,7 +1,7 @@
-// Migrated unit tests for src/engine/graph.zig.
+// Migrated unit tests for src/engine/graph/graph.zig.
 
 const std = @import("std");
-const graph_mod = @import("../../../src/engine/graph.zig");
+const graph_mod = @import("../../../src/engine/graph/graph.zig");
 const string_intern = @import("../../../src/engine/string_intern.zig");
 
 const GraphEngine = graph_mod.GraphEngine;

@@ -37,7 +37,7 @@ These cannot move out — they need direct access to per-request state:
 
 - **All RESP command handling** (`src/command/`, `src/server/`)
 - **In-memory storage**: KV, hash, list, set, sorted set (`src/engine/`)
-- **Graph engine + vector store + HNSW** (`src/engine/graph.zig`, `vector_store.zig`, `hnsw.zig`)
+- **Graph engine + vector store + HNSW** (`src/engine/graph/graph.zig`, `vector_store.zig`, `hnsw.zig`)
 - **Persistence**: AOF, snapshots, atomic rename + fsync helpers (`src/storage/`)
 - **Replication wire**: heartbeats, broadcast queues, ack frames, full-sync (`src/cluster/replication.zig`, `protocol.zig`)
 - **Observability data capture**: per-command counters, SLOWLOG ring, LATENCY events, CLIENT LIST registry (`src/observability/`)
@@ -131,7 +131,7 @@ Vex writes `vex.zdb` and `vex.aof` atomically. An external watcher uploads them 
 The original sentinel plan flirted with Go because of `redis_exporter`'s precedent and Go's ergonomic concurrency. The decision landed on Zig instead:
 
 1. **Same toolchain.** One build system, one CI, one release pipeline.
-2. **Real code reuse.** RESP serializer (`src/server/resp.zig`), Logger (`src/log.zig`), Config (`src/config.zig`), atomic_io (`src/storage/atomic_io.zig`) — all consumed directly by `sentinel/` via build.zig modules. No FFI, no duplicate implementations.
+2. **Real code reuse.** RESP serializer (`src/protocol/resp.zig`), Logger (`src/log.zig`), Config (`src/config.zig`), atomic_io (`src/storage/atomic_io.zig`) — all consumed directly by `sentinel/` via build.zig modules. No FFI, no duplicate implementations.
 3. **Single binary deployment per concern.** Operators get `vex` and `vex-sentinel` from the same release, same way.
 4. **Ecosystem investment.** A Zig Prom library and a Zig HTTP server come out of this work, usable beyond vex.
 

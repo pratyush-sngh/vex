@@ -1,7 +1,7 @@
-// Migrated unit tests for src/engine/concurrent_kv.zig.
+// Migrated unit tests for src/engine/kv/concurrent_kv.zig.
 
 const std = @import("std");
-const ConcurrentKV = @import("../../../src/engine/concurrent_kv.zig").ConcurrentKV;
+const ConcurrentKV = @import("../../../src/engine/kv/concurrent_kv.zig").ConcurrentKV;
 const obs_stats = @import("../../../src/observability/stats.zig");
 
 test "concurrent_kv basic set/get" {

@@ -1,7 +1,7 @@
-// Migrated unit tests for src/engine/hash.zig.
+// Migrated unit tests for src/engine/types/hash.zig.
 
 const std = @import("std");
-const HashStore = @import("../../../src/engine/hash.zig").HashStore;
+const HashStore = @import("../../../src/engine/types/hash.zig").HashStore;
 
 test "HSET and HGET" {
     var store = HashStore.init(std.testing.allocator); store.initStripes();

@@ -1,6 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const probes = @import("../observability/probes.zig");
+const probes = @import("../../observability/probes.zig");
 
 const STRIPE_COUNT: usize = 32;
 const STRIPE_MASK: usize = STRIPE_COUNT - 1;

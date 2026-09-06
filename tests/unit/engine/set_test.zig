@@ -1,7 +1,7 @@
-// Migrated unit tests for src/engine/set.zig.
+// Migrated unit tests for src/engine/types/set.zig.
 
 const std = @import("std");
-const SetStore = @import("../../../src/engine/set.zig").SetStore;
+const SetStore = @import("../../../src/engine/types/set.zig").SetStore;
 
 test "SADD and SISMEMBER" {
     var store = SetStore.init(std.testing.allocator);

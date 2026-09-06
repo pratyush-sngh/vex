@@ -2,10 +2,10 @@ const std = @import("std");
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
 const EventLoop = @import("event_loop.zig").EventLoop;
-const resp = @import("resp.zig");
-const KVStore = @import("../engine/kv.zig").KVStore;
-const ConcurrentKV = @import("../engine/concurrent_kv.zig").ConcurrentKV;
-const GraphEngine = @import("../engine/graph.zig").GraphEngine;
+const resp = @import("../protocol/resp.zig");
+const KVStore = @import("../engine/kv/kv.zig").KVStore;
+const ConcurrentKV = @import("../engine/kv/concurrent_kv.zig").ConcurrentKV;
+const GraphEngine = @import("../engine/graph/graph.zig").GraphEngine;
 const CommandHandler = @import("../command/handler.zig").CommandHandler;
 const KeysMode = @import("../command/handler.zig").KeysMode;
 const AOF = @import("../storage/aof.zig").AOF;
@@ -20,10 +20,10 @@ const stats_event = @import("../observability/event_stats.zig");
 const client_registry = @import("../observability/clients.zig");
 const probes = @import("../observability/probes.zig");
 const SSL = @import("tls.zig").SSL;
-const ListStore = @import("../engine/list.zig").ListStore;
-const HashStore = @import("../engine/hash.zig").HashStore;
-const SetStore = @import("../engine/set.zig").SetStore;
-const SortedSetStore = @import("../engine/sorted_set.zig").SortedSetStore;
+const ListStore = @import("../engine/types/list.zig").ListStore;
+const HashStore = @import("../engine/types/hash.zig").HashStore;
+const SetStore = @import("../engine/types/set.zig").SetStore;
+const SortedSetStore = @import("../engine/types/sorted_set.zig").SortedSetStore;
 
 const builtin = @import("builtin");
 const is_linux = builtin.os.tag == .linux;
@@ -2482,7 +2482,7 @@ pub const Worker = struct {
                     // ConcurrentKV.setInternal can free during a rehash.
                     // Take the stripe rdlock for the duration of the entry
                     // access so writers (who take wrlock) are excluded.
-                    const KVS = @import("../engine/kv.zig").KVStore;
+                    const KVS = @import("../engine/kv/kv.zig").KVStore;
                     const ns_key = nsKey(conn.selected_db, args[1]) orelse return false;
 
                     const lock_t0: u64 = if (probe_on) probes.start() else 0;
@@ -2582,7 +2582,7 @@ pub const Worker = struct {
                     if (args.len >= 4 and args[3].len == 2) {
                         if (equalsAsciiUpper(args[3], "NX") or equalsAsciiUpper(args[3], "XX")) return false;
                     }
-                    const KVS = @import("../engine/kv.zig").KVStore;
+                    const KVS = @import("../engine/kv/kv.zig").KVStore;
                     const ns_key = nsKey(conn.selected_db, args[1]) orelse return false;
                     const value = args[2];
 
@@ -2690,7 +2690,7 @@ pub const Worker = struct {
                 } else if (args.len >= 2 and equalsAsciiUpper(cmd, "MGET")) {
                     // MGET: build response in staging buffer, single write_buf append
                     // One alloc+free per call beats 300 appendSlice calls (1 memcpy vs 300)
-                    const KVS = @import("../engine/kv.zig").KVStore;
+                    const KVS = @import("../engine/kv/kv.zig").KVStore;
                     const key_count = args.len - 1;
                     const est = 32 + key_count * 80;
                     var resp_buf = self.allocator.alloc(u8, est) catch return false;

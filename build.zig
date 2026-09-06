@@ -90,14 +90,14 @@ pub fn build(b: *std.Build) void {
     const sentinel_imports = [_]std.Build.Module.Import{
         .{ .name = "vex_log", .module = simpleModule(b, target, optimize, "src/log.zig") },
         .{ .name = "vex_atomic_io", .module = simpleModule(b, target, optimize, "src/storage/atomic_io.zig") },
-        .{ .name = "vex_resp", .module = simpleModule(b, target, optimize, "src/server/resp.zig") },
+        .{ .name = "vex_resp", .module = simpleModule(b, target, optimize, "src/protocol/resp.zig") },
         .{ .name = "vex_cluster_config", .module = simpleModule(b, target, optimize, "src/cluster/config.zig") },
     };
 
     const sentinel_exe = b.addExecutable(.{
         .name = "sentinel",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("sentinel/main.zig"),
+            .root_source_file = b.path("cmd/vex-sentinel/main.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
@@ -113,7 +113,7 @@ pub fn build(b: *std.Build) void {
 
     const sentinel_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("sentinel/main.zig"),
+            .root_source_file = b.path("cmd/vex-sentinel/main.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
@@ -125,7 +125,7 @@ pub fn build(b: *std.Build) void {
     // ── vex-embed: embedding proxy ────────────────────────────────────
     // Standalone process that fronts vex and adds text→vector embedding via
     // an external HTTP endpoint, keeping blocking HTTP off vex's event loop.
-    // Reuses src/log.zig like sentinel; all other logic lives under embed/.
+    // Reuses src/log.zig like sentinel; all other logic lives under cmd/vex-embed/.
     const embed_imports = [_]std.Build.Module.Import{
         .{ .name = "vex_log", .module = simpleModule(b, target, optimize, "src/log.zig") },
     };
@@ -133,7 +133,7 @@ pub fn build(b: *std.Build) void {
     const embed_exe = b.addExecutable(.{
         .name = "vex-embed",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("embed/main.zig"),
+            .root_source_file = b.path("cmd/vex-embed/main.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
@@ -150,7 +150,7 @@ pub fn build(b: *std.Build) void {
 
     const embed_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("embed/main.zig"),
+            .root_source_file = b.path("cmd/vex-embed/main.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
@@ -243,9 +243,10 @@ pub fn build(b: *std.Build) void {
     });
     addBench(b, target, optimize, .{
         .name = "ds_bench",
-        .source = "src/engine/ds_bench.zig",
+        .source = "src/bench/ds_bench.zig",
         .step = "bench-ds",
         .desc = "Benchmark data structures (list/hash/set/zset)",
+        .imports = &.{.{ .name = "app", .module = app_mod }},
     });
     addBench(b, target, optimize, .{
         .name = "graph_bench",

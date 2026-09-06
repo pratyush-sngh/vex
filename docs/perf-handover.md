@@ -60,12 +60,12 @@ Removed ~285 lines of genuinely dead code across these sites:
 | `src/engine/concurrent_kv.zig` | `getAndWriteBulk` (unused zero-alloc GET) | 66 lines, zero call sites |
 | `src/engine/concurrent_kv.zig` | `setInline` (unused inline-SET path) | 46 lines, zero call sites |
 | `src/engine/concurrent_kv.zig` | `writeLockAll`, `writeUnlockAll` | 8 lines, never called (read variants are used) |
-| `src/engine/kv.zig` | `KVStore.isExpired` | Shadowed by `ConcurrentKV.isExpired` which is the real call site |
-| `src/engine/query.zig` | `prefetchCSROffsets`, `reconstructFlatPath`, `reconstructPath`, `reconstructWeightedPath` | 73 lines, never called |
+| `src/engine/kv/kv.zig` | `KVStore.isExpired` | Shadowed by `ConcurrentKV.isExpired` which is the real call site |
+| `src/query/query.zig` | `prefetchCSROffsets`, `reconstructFlatPath`, `reconstructPath`, `reconstructWeightedPath` | 73 lines, never called |
 | `src/observability/stats.zig` | `unpackArgs` | The SLOWLOG GET handler at `handler.zig:2044` inlines the decode |
 | `src/server/worker.zig` | `writeMapHeaderTo`, `writeSetHeaderTo` | 28 lines, never called |
 
-Also collapsed 8 near-identical RESP header serializers in `src/server/resp.zig`
+Also collapsed 8 near-identical RESP header serializers in `src/protocol/resp.zig`
 into a shared `writePrefixedNum` helper — ~25 lines saved, no behavior change.
 
 **Test impact:** all 218 unit tests still pass.
@@ -79,7 +79,7 @@ into a shared `writePrefixedNum` helper — ~25 lines saved, no behavior change.
 which is `O(blocks)` — 244 blocks for the 100 k-entry test.
 
 **Fix:** added per-`List` cursor cache + cumulative-count index in
-`src/engine/list.zig`:
+`src/engine/types/list.zig`:
 
 - `block_index: ArrayList(*Block)` + `block_cumcount: ArrayList(usize)` for
   `O(log blocks)` binary search.
@@ -109,7 +109,7 @@ field/value pair, ahead of the stripe lock. The pre-dupe pattern was meant
 to avoid holding the lock during alloc; in practice it just doubled
 allocator pressure.
 
-**Fix:** in `src/engine/hash.zig`, `FieldMap.set` now stores both bytes in
+**Fix:** in `src/engine/types/hash.zig`, `FieldMap.set` now stores both bytes in
 **one combined allocation** laid out as `[field bytes][value bytes]`. The
 hashmap's `key_ptr` and `value_ptr` are slices into the same buffer. Free
 goes through `key.ptr[0..key.len + value.len]`.
@@ -155,7 +155,7 @@ Also has a `BENCH_PROFILE=1` mode that attempts `perf record`. Blocked by
 EKS kernel's `perf_event_paranoid` setting even with `privileged: true`.
 Left in place for non-EKS use.
 
-### 3. K8s Job manifest at `k8s/vex-compare-bench.yaml`
+### 3. K8s Job manifest at `tests/k8s/vex-compare-bench.yaml`
 
 Targets the `scrum6` namespace, pins to `c5a.2xlarge` via nodeAffinity,
 reserves 4-6 CPU cores. Image pushed to `jarvis/vex:compare-bench` in ECR.
@@ -365,7 +365,7 @@ for the rare new-key path.
 `StringHashMap` with 32 stripes, each with its own `pthread_rwlock_t` +
 `StringHashMap(FieldMap)`. Same pattern as `ConcurrentKV`.
 
-Key file: `src/engine/hash.zig`.
+Key file: `src/engine/types/hash.zig`.
 
 - `STRIPE_COUNT: usize = 32`
 - `stripeOf(key)` uses FNV-1a 32-bit + power-of-2 mask (~10-15 ns; the
@@ -550,14 +550,14 @@ A complete list of files touched this session:
 | `src/server/event_loop.zig` | Removed dead `if (!is_linux) unreachable;` guards |
 | `src/perf/span.zig` | Removed `recordLockWait` + related metric |
 | `src/engine/concurrent_kv.zig` | Removed unused `getAndWriteBulk`, `setInline`, `writeLockAll`, `writeUnlockAll` |
-| `src/engine/kv.zig` | Removed unused `isExpired` (shadowed) |
-| `src/engine/query.zig` | Removed unused path-reconstruction helpers |
+| `src/engine/kv/kv.zig` | Removed unused `isExpired` (shadowed) |
+| `src/query/query.zig` | Removed unused path-reconstruction helpers |
 | `src/observability/stats.zig` | Removed unused `unpackArgs` |
 | `src/server/worker.zig` | Added probes integration, **connection-leak fix**, dropped `dsl.acquire` for hash ops, FNV-1a hash for stripeIndex, dead `writeMapHeaderTo`/`writeSetHeaderTo` removed |
 | `src/server/tcp.zig` | Wired up `hash_store.initStripes()`, removed obsolete `hash_store.map_mutex` init, registered probes |
-| `src/server/resp.zig` | Consolidated 8 header serializers into `writePrefixedNum` helper |
-| `src/engine/list.zig` | **Cursor cache + cumulative-count index** for `LINDEX`/`LRANGE` |
-| `src/engine/hash.zig` | **Combined-allocation HSET + striped HashStore** (32 stripes, per-stripe rwlock) |
+| `src/protocol/resp.zig` | Consolidated 8 header serializers into `writePrefixedNum` helper |
+| `src/engine/types/list.zig` | **Cursor cache + cumulative-count index** for `LINDEX`/`LRANGE` |
+| `src/engine/types/hash.zig` | **Combined-allocation HSET + striped HashStore** (32 stripes, per-stripe rwlock) |
 | `src/observability/probes.zig` | **New file** — `WorkerProbes`, `DEBUG PROBES` command backing data |
 | `src/command/handler.zig` | `DEBUG PROBES` subcommand, HSET path simplified |
 | `tests/unit/engine/list_test.zig` | Added regression test for popTail→pushTail boundary |
@@ -565,7 +565,7 @@ A complete list of files touched this session:
 | `tests/unit/command/handler_test.zig` | Same — `initStripes()` after `HashStore.init()` (2 sites) |
 | `Dockerfile.compare` | **New file** — single-image bench container |
 | `docker-compose.compare-tcp.yml` | **New file** — TCP-only variant (macOS bind-mount issue with unix sockets) |
-| `k8s/vex-compare-bench.yaml` | **New file** — EKS bench job manifest |
+| `tests/k8s/vex-compare-bench.yaml` | **New file** — EKS bench job manifest |
 | `scripts/run-bench-in-container.sh` | **New file** — bench/matrix/probe driver |
 | `tools/compare-client/main.go` | Unix-socket support via `unix:` prefix |
 | `docs/perf-handover.md` | This document |
@@ -643,7 +643,7 @@ methodology.
   - Linked from the project's `MEMORY.md`.
 - **Image in ECR:** `208168340597.dkr.ecr.ap-south-1.amazonaws.com/jarvis/vex:compare-bench`
 - **K8s namespace:** `scrum6`
-- **Bench job manifest:** `k8s/vex-compare-bench.yaml`
+- **Bench job manifest:** `tests/k8s/vex-compare-bench.yaml`
 - **Bench driver script:** `scripts/run-bench-in-container.sh`
 - **Probe command:** `redis-cli -p 6380 DEBUG PROBES [ON|OFF|RESET]`
 - **Existing benchmark docs:** `docs/benchmarks.md` (pipelined-favored;
@@ -662,8 +662,8 @@ docker buildx build --platform linux/amd64 -f Dockerfile.compare \
     -t 208168340597.dkr.ecr.ap-south-1.amazonaws.com/jarvis/vex:compare-bench \
     --push .
 
-# 3. Set BENCH_MATRIX=1 in k8s/vex-compare-bench.yaml then apply
-kubectl apply -f k8s/vex-compare-bench.yaml
+# 3. Set BENCH_MATRIX=1 in tests/k8s/vex-compare-bench.yaml then apply
+kubectl apply -f tests/k8s/vex-compare-bench.yaml
 
 # 4. Watch
 kubectl -n scrum6 logs -f job/vex-compare-bench
@@ -672,6 +672,6 @@ kubectl -n scrum6 logs -f job/vex-compare-bench
 To re-run probes:
 
 ```
-# Set BENCH_PROBES=1 in k8s/vex-compare-bench.yaml then apply.
+# Set BENCH_PROBES=1 in tests/k8s/vex-compare-bench.yaml then apply.
 # Output: per-worker DEBUG PROBES breakdown after SET / GET / HSET load.
 ```

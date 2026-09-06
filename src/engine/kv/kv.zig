@@ -1,7 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const obs_stats = @import("../observability/stats.zig");
-const event_stats = @import("../observability/event_stats.zig");
+const obs_stats = @import("../../observability/stats.zig");
+const event_stats = @import("../../observability/event_stats.zig");
 
 /// Core key-value store backed by a hash map.
 /// All keys and values are owned byte slices.

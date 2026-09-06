@@ -114,11 +114,11 @@ MEMORY.STORE agent "likes Python" VEC TEXT "likes Python"
 
 | File | Responsibility |
 |------|----------------|
-| `embed/main.zig`        | Entrypoint: parse flags, start proxy, handle signals. |
-| `embed/config.zig`      | CLI flag parsing → `Config`. |
-| `embed/embedder.zig`    | HTTP embedding client + `floatsToBytes`. |
-| `embed/proxy.zig`       | Transparent RESP TCP proxy + `EMBED` interception. |
-| `embed/resp_detect.zig` | Head-of-stream `EMBED` command detection. |
+| `cmd/vex-embed/main.zig`        | Entrypoint: parse flags, start proxy, handle signals. |
+| `cmd/vex-embed/config.zig`      | CLI flag parsing → `Config`. |
+| `cmd/vex-embed/embedder.zig`    | HTTP embedding client + `floatsToBytes`. |
+| `cmd/vex-embed/proxy.zig`       | Transparent RESP TCP proxy + `EMBED` interception. |
+| `cmd/vex-embed/resp_detect.zig` | Head-of-stream `EMBED` command detection. |
 
 ```sh
 zig build test-vex-embed     # run vex-embed unit tests

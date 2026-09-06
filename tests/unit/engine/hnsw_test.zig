@@ -1,8 +1,8 @@
-// Migrated unit tests for src/engine/hnsw.zig.
+// Migrated unit tests for src/engine/vector/hnsw.zig.
 
 const std = @import("std");
-const hnsw = @import("../../../src/engine/hnsw.zig");
-const VectorStore = @import("../../../src/engine/vector_store.zig").VectorStore;
+const hnsw = @import("../../../src/engine/vector/hnsw.zig");
+const VectorStore = @import("../../../src/engine/vector/vector_store.zig").VectorStore;
 
 const HnswIndex = hnsw.HnswIndex;
 const MinHeap = hnsw.MinHeap;

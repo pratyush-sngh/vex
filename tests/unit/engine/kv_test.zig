@@ -1,7 +1,7 @@
-// Migrated unit tests for src/engine/kv.zig.
+// Migrated unit tests for src/engine/kv/kv.zig.
 
 const std = @import("std");
-const kv_mod = @import("../../../src/engine/kv.zig");
+const kv_mod = @import("../../../src/engine/kv/kv.zig");
 const KVStore = kv_mod.KVStore;
 const globMatch = kv_mod.globMatch;
 

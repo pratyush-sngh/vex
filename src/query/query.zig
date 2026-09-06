@@ -1,12 +1,12 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const graph_mod = @import("graph.zig");
+const graph_mod = @import("../engine/graph/graph.zig");
 const GraphEngine = graph_mod.GraphEngine;
 const NodeId = graph_mod.NodeId;
 const CSR = graph_mod.CSR;
 const DeltaEdge = graph_mod.DeltaEdge;
-const StringIntern = @import("string_intern.zig").StringIntern;
-const TypeMask = @import("string_intern.zig").TypeMask;
+const StringIntern = @import("../engine/string_intern.zig").StringIntern;
+const TypeMask = @import("../engine/string_intern.zig").TypeMask;
 
 pub const Direction = enum { outgoing, incoming, both };
 

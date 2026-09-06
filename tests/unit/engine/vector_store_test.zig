@@ -1,7 +1,7 @@
-// Migrated unit tests for src/engine/vector_store.zig.
+// Migrated unit tests for src/engine/vector/vector_store.zig.
 
 const std = @import("std");
-const VectorStore = @import("../../../src/engine/vector_store.zig").VectorStore;
+const VectorStore = @import("../../../src/engine/vector/vector_store.zig").VectorStore;
 
 test "vector store set and get" {
     const allocator = std.testing.allocator;

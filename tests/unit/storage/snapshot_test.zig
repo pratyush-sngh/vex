@@ -2,8 +2,8 @@
 
 const std = @import("std");
 const snapshot = @import("../../../src/storage/snapshot.zig");
-const KVStore = @import("../../../src/engine/kv.zig").KVStore;
-const GraphEngine = @import("../../../src/engine/graph.zig").GraphEngine;
+const KVStore = @import("../../../src/engine/kv/kv.zig").KVStore;
+const GraphEngine = @import("../../../src/engine/graph/graph.zig").GraphEngine;
 
 const save = snapshot.save;
 const load = snapshot.load;

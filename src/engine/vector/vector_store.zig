@@ -1,8 +1,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const StringIntern = @import("string_intern.zig").StringIntern;
-const atomic_io = @import("../storage/atomic_io.zig");
-const vex_log = @import("../log.zig");
+const StringIntern = @import("../string_intern.zig").StringIntern;
+const atomic_io = @import("../../storage/atomic_io.zig");
+const vex_log = @import("../../log.zig");
 // libc mmap/munmap (avoid Zig 0.16 platform-specific wrappers)
 extern "c" fn mmap(addr: ?*anyopaque, len: usize, prot: c_int, flags: c_int, fd: c_int, offset: i64) ?*anyopaque;
 extern "c" fn munmap(addr: ?*anyopaque, len: usize) c_int;

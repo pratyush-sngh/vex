@@ -1,9 +1,12 @@
 const std = @import("std");
 const c = std.c;
-const ListStore = @import("list.zig").ListStore;
-const HashStore = @import("hash.zig").HashStore;
-const SetStore = @import("set.zig").SetStore;
-const SortedSetStore = @import("sorted_set.zig").SortedSetStore;
+// Routed through the `app` module (rooted at src/root.zig) so this bench can
+// reach engine internals without escaping a deep module subtree. See build.zig.
+const app = @import("app");
+const ListStore = app.list.ListStore;
+const HashStore = app.hash.HashStore;
+const SetStore = app.set.SetStore;
+const SortedSetStore = app.sorted_set.SortedSetStore;
 
 const OPS = 100_000;
 const WARMUP = 1000;
@@ -122,6 +125,9 @@ pub fn main(_: std.process.Init) !void {
     std.debug.print("\n--- Hashes ---\n", .{});
     {
         var hs = HashStore.init(allocator);
+        hs.initStripes(); // required after init() so the 32 stripe rwlocks are
+        // real (macOS rwlocks don't survive the init()+return struct copy);
+        // without it deinit() tears down uninitialized locks → SIGKILL.
         defer hs.deinit();
 
         // HSET: add N fields to one hash

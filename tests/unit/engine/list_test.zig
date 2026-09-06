@@ -1,7 +1,7 @@
-// Migrated unit tests for src/engine/list.zig.
+// Migrated unit tests for src/engine/types/list.zig.
 
 const std = @import("std");
-const ListStore = @import("../../../src/engine/list.zig").ListStore;
+const ListStore = @import("../../../src/engine/types/list.zig").ListStore;
 
 test "LPUSH and RPUSH" {
     var store = ListStore.init(std.testing.allocator);

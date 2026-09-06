@@ -29,7 +29,7 @@ The Go compare client measures **end-to-end RTT** only. It cannot attribute time
 
 ### A3. Allocation / memcpy duplication lens (tertiary)
 
-- Dev-only **counting allocator** wrapper or allocation counters around RESP parse and KV `setInternal` paths ([`src/server/resp.zig`](../../src/server/resp.zig), [`src/engine/kv.zig`](../../src/engine/kv.zig)).
+- Dev-only **counting allocator** wrapper or allocation counters around RESP parse and KV `setInternal` paths ([`src/protocol/resp.zig`](../../src/protocol/resp.zig), [`src/engine/kv/kv.zig`](../../src/engine/kv/kv.zig)).
 - Report allocs / bytes copied **per command class** (`SET`, `GET`, `DEL`, graph ops).
 
 ## Phase B — Benchmark harness improvements (fairness + SLO guardrails)
@@ -46,9 +46,9 @@ Update [`tools/compare-client/main.go`](../../tools/compare-client/main.go) and 
 Candidate work items (pick based on evidence, not upfront):
 
 1. **AOF**: remove per-command `length` + `seekTo` EOF + `flush` if traces show `aof_write` dominates; document durability window if batching/group commit is introduced ([`src/storage/aof.zig`](../../src/storage/aof.zig)).
-2. **Receive buffer / RESP**: reduce `copyForwards` shifts ([`src/server/tcp.zig`](../../src/server/tcp.zig)); reduce `dupe` churn ([`src/server/resp.zig`](../../src/server/resp.zig)) where lifetimes allow.
+2. **Receive buffer / RESP**: reduce `copyForwards` shifts ([`src/server/tcp.zig`](../../src/server/tcp.zig)); reduce `dupe` churn ([`src/protocol/resp.zig`](../../src/protocol/resp.zig)) where lifetimes allow.
 3. **Execution model**: if mutex/wait dominates at high `-c`, move to **single-writer reactor** (Redis-like) or other architecture; if parse/alloc dominates, prefer micro-structural fixes first.
-4. **Graph queries**: fix obvious algorithmic tails in [`src/engine/query.zig`](../../src/engine/query.zig) (e.g. `orderedRemove(0)` BFS dequeue) when graph read paths matter.
+4. **Graph queries**: fix obvious algorithmic tails in [`src/query/query.zig`](../../src/query/query.zig) (e.g. `orderedRemove(0)` BFS dequeue) when graph read paths matter.
 
 ## Verification loop
 

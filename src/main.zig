@@ -1,6 +1,6 @@
 const std = @import("std");
-const KVStore = @import("engine/kv.zig").KVStore;
-const GraphEngine = @import("engine/graph.zig").GraphEngine;
+const KVStore = @import("engine/kv/kv.zig").KVStore;
+const GraphEngine = @import("engine/graph/graph.zig").GraphEngine;
 const Server = @import("server/tcp.zig").Server;
 const ScaleMode = @import("server/tcp.zig").ScaleMode;
 const TlsContext = @import("server/tls.zig").TlsContext;
@@ -456,7 +456,7 @@ const Config = struct {
     tls_cert: ?[]const u8,
     tls_key: ?[]const u8,
     maxmemory: usize,
-    maxmemory_policy: @import("engine/kv.zig").EvictionPolicy,
+    maxmemory_policy: @import("engine/kv/kv.zig").EvictionPolicy,
     log_level: vex_log.Level,
     log_file: ?[]const u8,
     log_format: vex_log.Format,
@@ -486,7 +486,7 @@ fn parseArgs(init: std.process.Init) Config {
     var tls_cert: ?[]const u8 = null;
     var tls_key: ?[]const u8 = null;
     var maxmemory: usize = 0;
-    var maxmemory_policy: @import("engine/kv.zig").EvictionPolicy = .noeviction;
+    var maxmemory_policy: @import("engine/kv/kv.zig").EvictionPolicy = .noeviction;
     var log_level: vex_log.Level = .info;
     var log_file: ?[]const u8 = null;
     var log_format: vex_log.Format = .text;
@@ -729,7 +729,7 @@ fn applyConfigFile(
     maxclients: *u32,
     max_client_buffer: *usize,
     maxmemory: *usize,
-    maxmemory_policy: *@import("engine/kv.zig").EvictionPolicy,
+    maxmemory_policy: *@import("engine/kv/kv.zig").EvictionPolicy,
     reactor: *bool,
     workers: *usize,
     log_level: *vex_log.Level,

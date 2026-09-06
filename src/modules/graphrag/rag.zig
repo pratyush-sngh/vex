@@ -1,12 +1,12 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const graph_mod = @import("graph.zig");
+const graph_mod = @import("../../engine/graph/graph.zig");
 const GraphEngine = graph_mod.GraphEngine;
 const NodeId = graph_mod.NodeId;
 const HnswIndex = graph_mod.HnswIndex;
 const VectorStore = graph_mod.VectorStore;
-const PropertyStore = @import("property_store.zig").PropertyStore;
-const query = @import("query.zig");
+const PropertyStore = @import("../../engine/graph/property_store.zig").PropertyStore;
+const query = @import("../../query/query.zig");
 
 pub const RagOptions = struct {
     depth: u32 = 1,

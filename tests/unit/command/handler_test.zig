@@ -13,10 +13,10 @@ const Allocator = std.mem.Allocator;
 const handler_mod = @import("../../../src/command/handler.zig");
 const CommandHandler = handler_mod.CommandHandler;
 
-const KVStore = @import("../../../src/engine/kv.zig").KVStore;
-const GraphEngine = @import("../../../src/engine/graph.zig").GraphEngine;
-const ListStore = @import("../../../src/engine/list.zig").ListStore;
-const HashStore = @import("../../../src/engine/hash.zig").HashStore;
+const KVStore = @import("../../../src/engine/kv/kv.zig").KVStore;
+const GraphEngine = @import("../../../src/engine/graph/graph.zig").GraphEngine;
+const ListStore = @import("../../../src/engine/types/list.zig").ListStore;
+const HashStore = @import("../../../src/engine/types/hash.zig").HashStore;
 
 // ─── Helper: execute one command, return the raw RESP response ─────────
 fn testExec(handler: *CommandHandler, allocator: Allocator, args: []const []const u8) ![]u8 {

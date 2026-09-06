@@ -1,8 +1,8 @@
-// Migrated unit tests for src/engine/rag.zig.
+// Migrated unit tests for src/modules/graphrag/rag.zig.
 
 const std = @import("std");
-const ragSearch = @import("../../../src/engine/rag.zig").ragSearch;
-const GraphEngine = @import("../../../src/engine/graph.zig").GraphEngine;
+const ragSearch = @import("../../../src/modules/graphrag/rag.zig").ragSearch;
+const GraphEngine = @import("../../../src/engine/graph/graph.zig").GraphEngine;
 
 test "rag basic search with expansion" {
     const allocator = std.testing.allocator;

@@ -1,8 +1,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const VectorStore = @import("vector_store.zig").VectorStore;
-const atomic_io = @import("../storage/atomic_io.zig");
-const vex_log = @import("../log.zig");
+const atomic_io = @import("../../storage/atomic_io.zig");
+const vex_log = @import("../../log.zig");
 
 // libc mmap/munmap for .vhi deserialization (matches vector_store.zig pattern)
 extern "c" fn mmap(addr: ?*anyopaque, len: usize, prot: c_int, flags: c_int, fd: c_int, offset: i64) ?*anyopaque;

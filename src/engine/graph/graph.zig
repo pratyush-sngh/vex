@@ -1,11 +1,11 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const string_intern = @import("string_intern.zig");
+const string_intern = @import("../string_intern.zig");
 const StringIntern = string_intern.StringIntern;
 const TypeMask = string_intern.TypeMask;
 const PropertyStore = @import("property_store.zig").PropertyStore;
-pub const VectorStore = @import("vector_store.zig").VectorStore;
-pub const HnswIndex = @import("hnsw.zig").HnswIndex;
+pub const VectorStore = @import("../vector/vector_store.zig").VectorStore;
+pub const HnswIndex = @import("../vector/hnsw.zig").HnswIndex;
 pub const ch_mod = @import("ch.zig");
 
 pub const NodeId = u32;

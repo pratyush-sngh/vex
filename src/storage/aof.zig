@@ -452,9 +452,9 @@ pub const AOF = struct {
     pub fn rewriteFromState(
         self: *AOF,
         allocator: Allocator,
-        kv_snapshot: []const @import("../engine/kv.zig").KVStore.SnapshotEntry,
+        kv_snapshot: []const @import("../engine/kv/kv.zig").KVStore.SnapshotEntry,
         now_ms: i64,
-        graph: *@import("../engine/graph.zig").GraphEngine,
+        graph: *@import("../engine/graph/graph.zig").GraphEngine,
     ) !void {
         const ev_span = event_stats.Span.begin();
         defer ev_span.end(.aof_rewrite);

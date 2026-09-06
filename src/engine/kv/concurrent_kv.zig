@@ -2,7 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const KVStore = @import("kv.zig").KVStore;
 const EvictionPolicy = @import("kv.zig").EvictionPolicy;
-const obs_stats = @import("../observability/stats.zig");
+const obs_stats = @import("../../observability/stats.zig");
 
 const STRIPE_COUNT = 256;
 const STRIPE_MASK = STRIPE_COUNT - 1;
